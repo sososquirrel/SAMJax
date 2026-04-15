@@ -210,8 +210,8 @@ def _compute_buoy_sgs(
     TABS:   jax.Array,     # (nz, ny, nx) K
     tabs0:  jax.Array,     # (nz,) K reference profile
     z:      jax.Array,     # (nz,) m cell-centre heights
-    g_cp:   float = 9.81 / 1004.0,
-    g:      float = 9.81,
+    g_cp:   float = 9.79764 / 1004.64,
+    g:      float = 9.79764,
 ) -> jax.Array:
     """
     gSAM-style SGS buoyancy frequency squared at cell centres, dry limit.

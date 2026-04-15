@@ -45,18 +45,21 @@ from jsam.core.state import ModelState
 
 
 # ---------------------------------------------------------------------------
-# Physical constants (matching gSAM SRC/consts.f90)
+# Physical constants (matching gSAM SRC/consts.f90 — lsub is a literal
+# 2.834e6 (NOT LV+LF))
 # ---------------------------------------------------------------------------
 
 G_GRAV   = 9.79764      # m/s²      gravity
 CP       = 1004.64      # J/(kg K)  specific heat of dry air
+CPV      = 1870.0       # J/(kg K)  specific heat of water vapour
+CPW      = 3991.86795711963  # J/(kg K)  specific heat of seawater
 RV       = 461.5        # J/(kg K)  gas constant for water vapour
 RGAS     = 287.04       # J/(kg K)  gas constant for dry air
 EPS      = RGAS / RV    # ≈ 0.6220  Rd/Rv
 
 LV       = 2.501e6      # J/kg      latent heat of vaporization (0°C)
 LF       = 0.337e6      # J/kg      latent heat of fusion
-LS       = LV + LF      # J/kg      latent heat of sublimation
+LS       = 2.834e6      # J/kg      latent heat of sublimation (literal, NOT LV+LF)
 
 FAC_COND = LV / CP      # K / (kg/kg)
 FAC_FUS  = LF / CP
@@ -65,6 +68,11 @@ FAC_SUB  = LS / CP
 THERCO   = 2.40e-2      # W/(m K)   thermal conductivity of air
 DIFFELQ  = 2.21e-5      # m²/s      water-vapour diffusivity
 MUELQ    = 1.717e-5     # kg/(m s)  dynamic viscosity of air
+
+RAD_EARTH  = 6371229.0    # m         radius of Earth
+SIGMA_SB   = 5.670373e-8  # W/(m² K⁴) Stefan-Boltzmann constant
+EMIS_WATER = 0.98         # -         emissivity of water
+PI         = float(np.pi)
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +152,7 @@ def _gamma_coefs(p: MicroParams) -> dict:
 
 def _esatw(tabs: jax.Array) -> jax.Array:
     """Saturation vapour pressure over liquid water (mb). Buck (1981)."""
-    return 6.1121 * jnp.exp(17.502 * (tabs - 273.16) / (tabs - 32.18))
+    return 6.1121 * jnp.exp(17.502 * (tabs - 273.16) / (tabs - 32.19))
 
 
 def _esati(tabs: jax.Array) -> jax.Array:
@@ -153,34 +161,36 @@ def _esati(tabs: jax.Array) -> jax.Array:
 
 
 def qsatw(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """Saturation mixing ratio over liquid water (kg/kg)."""
+    """Saturation mixing ratio over liquid water (kg/kg).
+
+    Matches gSAM sat.f90: qsatw = 0.622 * es / max(es, p - es). The max(es, ...)
+    flips behavior when es > p - es (low pressure / upper troposphere) so qsatw
+    tends to 0.622 instead of diverging.
+    """
     es = _esatw(tabs)
-    # Clamp denominator to avoid negative qsat when es >= pres (T >> 360 K).
-    # This only occurs during Newton-iteration overshoots; the result is never
-    # used physically at such temperatures.
-    return EPS * es / jnp.maximum(pres_mb - es, 1e-3)
+    return EPS * es / jnp.maximum(es, pres_mb - es)
 
 
 def qsati(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """Saturation mixing ratio over ice (kg/kg)."""
+    """Saturation mixing ratio over ice (kg/kg). Matches gSAM sat.f90."""
     es = _esati(tabs)
-    return EPS * es / jnp.maximum(pres_mb - es, 1e-3)
+    return EPS * es / jnp.maximum(es, pres_mb - es)
 
 
 def _dtqsatw(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """d(qsatw)/d(tabs). Used inside Newton iteration."""
-    es  = _esatw(tabs)
-    des = es * 17.502 * (273.16 - 32.18) / (tabs - 32.18) ** 2
-    denom = jnp.maximum(pres_mb - es, 1e-3)
-    return EPS * des * pres_mb / denom ** 2
+    """d(qsatw)/d(tabs). Port of gSAM sat.f90:124-137."""
+    es = _esatw(tabs)
+    a1, T0, T1 = 17.502, 273.16, 32.19
+    dtesatw = es * a1 * (T0 - T1) / (tabs - T1) ** 2
+    return 0.622 * dtesatw / (pres_mb - es) * (1.0 + es / (pres_mb - es))
 
 
 def _dtqsati(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """d(qsati)/d(tabs). Used inside Newton iteration."""
-    es  = _esati(tabs)
-    des = es * 22.587 * (273.16 + 0.7) / (tabs + 0.7) ** 2
-    denom = jnp.maximum(pres_mb - es, 1e-3)
-    return EPS * des * pres_mb / denom ** 2
+    """d(qsati)/d(tabs). Port of gSAM sat.f90:149-162."""
+    es = _esati(tabs)
+    a1, T0, T1 = 22.587, 273.16, -0.7
+    dtesati = es * a1 * (T0 - T1) / (tabs - T1) ** 2
+    return 0.622 * dtesati / (pres_mb - es) * (1.0 + es / (pres_mb - es))
 
 
 # ---------------------------------------------------------------------------

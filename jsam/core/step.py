@@ -109,7 +109,7 @@ class StepConfig:
     nrad:         int = 1                           # call RRTMG every nrad steps
     slm_params:   Optional[SLMParams]     = None    # scalar SLM constants;
                                                     # None → skip SLM (ocean only)
-    g:             float = 9.81
+    g:             float = 9.79764  # gSAM consts.f90 ggr
     epsv:          float = 0.61
     damping_u_cu:  float = 0.3    # U/V polar velocity limiter (gSAM damping_u_cu)
     damping_w_cu:  float = 0.3    # W Courant-number damping threshold (gSAM damping_w_cu)
@@ -122,6 +122,14 @@ class StepConfig:
                                   # where buoyancy feedback drives polar TABS instability.
     polar_avg_rows: int = 0       # number of polar rows to zonally average (each pole)
                                   # 0 = off; 1 = average j=0 and j=ny-1 only
+
+    # Calendar day + year for the RRTMG_SW orbital geometry.  Passed through
+    # compute_qrad_rrtmg as sw_aux["day_of_year"]/["iyear"] so the solar
+    # declination and eccentricity factor match gSAM's shr_orb_decl call.
+    # day0 is a fractional calendar day (1.xx .. 365.xx) at nstep=0, UT.
+    # Set rad_day0=None (default) to disable SW entirely (LW-only, legacy).
+    rad_day0:  Optional[float] = None
+    rad_iyear: int = 2017
 
 
 @jax.tree_util.register_pytree_node_class
@@ -152,6 +160,11 @@ class PhysicsForcing:
     """
     tabs0:      jax.Array | None             = None
     qv0:        jax.Array | None             = None
+    # qn0 = <qcl+qci>, qp0 = <qpl+qpi>  — gSAM diagnose.f90:45-46 rolling
+    # horizontal means.  Used only by _buoyancy_W for the
+    # (1+epsv*qv0 - qn0 - qp0) thermal factor.  Zero at ERA5 init.
+    qn0:        jax.Array | None             = None
+    qp0:        jax.Array | None             = None
     tabs_ref:   jax.Array | None             = None
     qv_ref:     jax.Array | None             = None
     rad_forcing: RadForcing | None           = None
@@ -179,6 +192,8 @@ class PhysicsForcing:
         return cls(
             tabs0       = jnp.full(nz, 300.0),
             qv0         = jnp.zeros(nz),
+            qn0         = jnp.zeros(nz),
+            qp0         = jnp.zeros(nz),
             tabs_ref    = None,
             qv_ref      = None,
             rad_forcing  = RadForcing.zeros(nz_prof=2),
@@ -187,7 +202,8 @@ class PhysicsForcing:
         )
 
     def tree_flatten(self):
-        children = (self.tabs0, self.qv0, self.tabs_ref, self.qv_ref,
+        children = (self.tabs0, self.qv0, self.qn0, self.qp0,
+                    self.tabs_ref, self.qv_ref,
                     self.rad_forcing, self.ls_forcing, self.sst, self.o3vmr_rrtmg,
                     self.qrad_rrtmg,
                     self.slm_static, self.slm_state, self.slm_rad, self.precip_ref)
@@ -195,12 +211,13 @@ class PhysicsForcing:
 
     @classmethod
     def tree_unflatten(cls, _aux, children):
-        (tabs0, qv0, tabs_ref, qv_ref,
+        (tabs0, qv0, qn0, qp0, tabs_ref, qv_ref,
          rad_forcing, ls_forcing, sst, o3vmr_rrtmg,
          qrad_rrtmg,
          slm_static, slm_state, slm_rad, precip_ref) = children
         return cls(
-            tabs0=tabs0, qv0=qv0, tabs_ref=tabs_ref, qv_ref=qv_ref,
+            tabs0=tabs0, qv0=qv0, qn0=qn0, qp0=qp0,
+            tabs_ref=tabs_ref, qv_ref=qv_ref,
             rad_forcing=rad_forcing, ls_forcing=ls_forcing, sst=sst,
             o3vmr_rrtmg=o3vmr_rrtmg, qrad_rrtmg=qrad_rrtmg,
             slm_static=slm_static, slm_state=slm_state,
@@ -219,25 +236,28 @@ def _buoyancy_W(
     dz:     jax.Array,      # (nz,) cell widths (m)
     g:      float,
     epsv:   float,
+    qn0:    jax.Array | None = None,    # (nz,) reference cloud water (kg/kg)
+    qp0:    jax.Array | None = None,    # (nz,) reference precip (kg/kg)
 ) -> jax.Array:
     """
     Compute buoyancy tendency on W-faces, shape (nz+1, ny, nx)  [m/s²].
 
-    Follows gSAM ``buoyancy.f90`` (Khairoutdinov & Randall 2003):
+    Exactly follows gSAM ``buoyancy.f90:48-53``:
 
-        b_cell[k] = (g/T0[k]) * {
-              (T[k] - T0[k]) * (1 + epsv*qv0[k] - qn0[k] - qp0[k])
-            + T0[k] * (epsv*(qv[k] - qv0[k]) - (qc+qi+qr+qs+qg)[k])
+        buo_cell[k] = (g/T0[k]) * {
+              T0[k]*(epsv*(qv[k]-qv0[k]) - (qn[k]-qn0[k]) - (qp[k]-qp0[k]))
+            + (T[k]-T0[k])*(1 + epsv*qv0[k] - qn0[k] - qp0[k])
         }
 
-    With qn0=0, qp0=0 (ERA5 initialisation — anomaly from dry reference):
-
-        b_cell[k] = g * ((T[k]-T0[k])/T0[k] + epsv*(qv[k]-qv0[k])
-                         - (QC+QI+QR+QS+QG)[k])
+    where qn = qcl+qci and qp = qpl+qpi.  With qn0=qp0=0 this reduces to a
+    pure virtual-temperature anomaly buoyancy.  The ``(1+epsv*qv0-qn0-qp0)``
+    factor on the thermal term is ~1.01 at the surface → 1.00 aloft and was
+    missing prior to 2026-04-15.
 
     Interpolated to W-faces with area-weighted averaging (non-uniform dz):
         b_w[k] = betu[k]*b_cell[k] + betd[k]*b_cell[k-1]
-    where betu = dz[k-1]/(dz[k]+dz[k-1]), betd = dz[k]/(dz[k]+dz[k-1]).
+    where betu = dz[k-1]/(dz[k]+dz[k-1]), betd = dz[k]/(dz[k]+dz[k-1])
+    (matches gSAM betu/betd in buoyancy.f90:41-42).
 
     Rigid-lid BCs: b_w[0] = b_w[nz] = 0.
     """
@@ -256,11 +276,34 @@ def _buoyancy_W(
     else:
         qv0_3d = qv0                      # (nz,ny,nx)
 
-    hydrometeors = state.QC + state.QI + state.QR + state.QS + state.QG
+    # qn0 = <QC+QI>, qp0 = <QR+QS+QG> — cos-lat horizontal means supplied
+    # by the diagnose block (step 14).  Default to zero if caller hasn't
+    # plumbed them (matches fresh ERA5 init; cloud/precip ≈ 0).
+    if qn0 is None:
+        qn0_3d = jnp.zeros_like(tabs0_3d)
+    else:
+        qn0_3d = qn0[:, None, None] if qn0.ndim == 1 else (
+            qn0[:, :, None] if qn0.ndim == 2 else qn0
+        )
+    if qp0 is None:
+        qp0_3d = jnp.zeros_like(tabs0_3d)
+    else:
+        qp0_3d = qp0[:, None, None] if qp0.ndim == 1 else (
+            qp0[:, :, None] if qp0.ndim == 2 else qp0
+        )
+
+    qn = state.QC + state.QI                           # gSAM qcl+qci
+    qp = state.QR + state.QS + state.QG                # gSAM qpl+qpi (SAM1MOM lumps)
+
+    thermal_factor = 1.0 + epsv * qv0_3d - qn0_3d - qp0_3d
 
     b = (g / tabs0_3d) * (
-        (state.TABS - tabs0_3d)
-        + tabs0_3d * (epsv * (state.QV - qv0_3d) - hydrometeors)
+        tabs0_3d * (
+            epsv * (state.QV - qv0_3d)
+            - (qn - qn0_3d)
+            - (qp - qp0_3d)
+        )
+        + (state.TABS - tabs0_3d) * thermal_factor
     )   # (nz, ny, nx)
 
     # Area-weighted interpolation to interior W-faces (k = 1..nz-1)
@@ -388,14 +431,27 @@ def step(
     # ------------------------------------------------------------------
     if config.rad_rrtmg is not None and forcing.sst is not None:
         if int(state.nstep) % config.nrad == 0:
+            # Build the SW orbital geometry payload (enabled whenever
+            # rad_day0 is set — matches gSAM doshortwave=.true.).
+            _sw_aux = None
+            if config.rad_day0 is not None:
+                _day_for_sw = float(config.rad_day0) + float(state.time) / 86400.0
+                _sw_aux = {
+                    "day_of_year": _day_for_sw,
+                    "iyear":       int(config.rad_iyear),
+                    "lat_rad":     metric["lat_rad"],
+                    "lon_rad":     metric["lon_rad"],
+                }
             # Recompute heating rates (gSAM: nradsteps >= nrad → new qrad)
             _new_qrad = compute_qrad_rrtmg(
                 state, metric, config.rad_rrtmg, forcing.sst,
                 o3vmr=(None if forcing.o3vmr_rrtmg is None
                        else jnp.asarray(forcing.o3vmr_rrtmg)),
+                sw_aux=_sw_aux,
             )
             forcing = PhysicsForcing(
                 tabs0=forcing.tabs0, qv0=forcing.qv0,
+                qn0=forcing.qn0, qp0=forcing.qp0,
                 tabs_ref=forcing.tabs_ref, qv_ref=forcing.qv_ref,
                 rad_forcing=forcing.rad_forcing, ls_forcing=forcing.ls_forcing,
                 sst=forcing.sst, o3vmr_rrtmg=forcing.o3vmr_rrtmg,
@@ -492,6 +548,7 @@ def step(
             new_sst = jnp.where(land_mask, new_slm_state.t_skin, forcing.sst)
             forcing = PhysicsForcing(
                 tabs0=forcing.tabs0, qv0=forcing.qv0,
+                qn0=forcing.qn0, qp0=forcing.qp0,
                 tabs_ref=forcing.tabs_ref, qv_ref=forcing.qv_ref,
                 rad_forcing=forcing.rad_forcing, ls_forcing=forcing.ls_forcing,
                 sst=new_sst, o3vmr_rrtmg=forcing.o3vmr_rrtmg,
@@ -503,6 +560,7 @@ def step(
             surface_fluxes = land_fluxes
             forcing = PhysicsForcing(
                 tabs0=forcing.tabs0, qv0=forcing.qv0,
+                qn0=forcing.qn0, qp0=forcing.qp0,
                 tabs_ref=forcing.tabs_ref, qv_ref=forcing.qv_ref,
                 rad_forcing=forcing.rad_forcing, ls_forcing=forcing.ls_forcing,
                 sst=forcing.sst, o3vmr_rrtmg=forcing.o3vmr_rrtmg,
@@ -555,7 +613,8 @@ def step(
     if forcing.tabs0 is not None:
         qv0 = forcing.qv0 if forcing.qv0 is not None else jnp.zeros_like(forcing.tabs0)
         _dW_buo = _buoyancy_W(state, forcing.tabs0, qv0,
-                               metric["dz"], config.g, config.epsv)
+                               metric["dz"], config.g, config.epsv,
+                               qn0=forcing.qn0, qp0=forcing.qp0)
         dW_extra = dW_extra + _dW_buo
         jax.debug.print(
             "  DIAG [{n:>3}] B_buoy    dW_buo_abs_max={m:.4e}  (dt*max={x:.4f})",
@@ -885,18 +944,31 @@ def step(
     #     creating an exponentially growing W instability.
     # ------------------------------------------------------------------
     if forcing.tabs0 is not None:
-        # Area-weighted horizontal mean: weight by cos(lat)
+        # gSAM diagnose.f90:27-86 — cos-lat-weighted horizontal means.
+        # Matches precisely:
+        #   tabs0(k) = <tabs(i,j,k)>
+        #   q0(k)    = <qv+qcl+qci>      qn0(k) = <qcl+qci>
+        #                                qp0(k) = <qpl+qpi>
+        #   qv0(k)   = q0(k) - qn0(k)     (diagnose.f90:86)
+        # For flat-ocean IRMA terra(i,j,k)≡1 so the terrain mask is a no-op.
         _cos_lat = metric["cos_lat"]   # (ny,)
         _wgt = _cos_lat / jnp.sum(_cos_lat)  # normalised weights (ny,)
-        # Mean over (ny, nx): sum over nx then weighted sum over ny
-        _tabs_mean = jnp.sum(
-            jnp.mean(state.TABS, axis=2) * _wgt[None, :], axis=1
-        )  # (nz,)
+
+        def _hmean(field):
+            # field: (nz, ny, nx) → (nz,)
+            return jnp.sum(jnp.mean(field, axis=2) * _wgt[None, :], axis=1)
+
+        _tabs_mean = _hmean(state.TABS)
+        _q0        = _hmean(state.QV + state.QC + state.QI)
+        _qn0       = _hmean(state.QC + state.QI)
+        _qp0       = _hmean(state.QR + state.QS + state.QG)
+        _qv0       = _q0 - _qn0
+
         forcing = PhysicsForcing(
             tabs0=_tabs_mean,
-            qv0=jnp.sum(
-                jnp.mean(state.QV, axis=2) * _wgt[None, :], axis=1
-            ),
+            qv0=_qv0,
+            qn0=_qn0,
+            qp0=_qp0,
             tabs_ref=forcing.tabs_ref,
             qv_ref=forcing.qv_ref,
             rad_forcing=forcing.rad_forcing,

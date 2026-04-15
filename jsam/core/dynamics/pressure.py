@@ -29,6 +29,7 @@ import jax.numpy as jnp
 
 from jsam.core.state import ModelState
 from jsam.core.grid.latlon import LatLonGrid, EARTH_RADIUS
+from jsam.core.physics.microphysics import G_GRAV, CP
 
 # ---------------------------------------------------------------------------
 # Grid precomputation helpers (called once, results passed to JIT functions)
@@ -56,6 +57,7 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
       rhow(k) = density at w-faces (level interfaces)
     """
     lat_rad = np.deg2rad(grid.lat)           # (ny,)
+    lon_rad = np.deg2rad(grid.lon)           # (nx,)
     dlon_rad = np.deg2rad(grid.dlon)
 
     # cos(lat) at mass-point latitudes
@@ -66,7 +68,7 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     # is the ratio dy_per_row[j] / dy_ref (see setgrid.f90:222-256).
     dy_per_row = np.array(grid.dy_per_row)        # (ny,)
     dy_ref     = float(grid.dy_ref)               # scalar (mid-latitude)
-    ady        = dy_per_row / dy_ref              # (ny,)   =1 uniform
+    ady        = np.array(grid.ady)               # (ny,) from LatLonGrid (gSAM setgrid.f90)
 
     # cos_v at v-faces.
     # Interior (1..ny-1): gSAM ady-weighted muv (setgrid.f90:255) —
@@ -89,18 +91,46 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     # imu(j) = 1/cos(lat_j)  (zonal metric, matches gSAM)
     imu = 1.0 / np.clip(cos_lat, 1e-6, None)   # (ny,) guard against poles
 
-    # Density at w-faces (vertical interfaces): interpolated from cell centres
-    rho = grid.rho           # (nz,)
-    dz  = grid.dz            # (nz,)
-    # Linear interpolation for interior faces; extrapolate at top/bottom
-    rhow = np.zeros(len(rho) + 1)
-    rhow[1:-1] = 0.5 * (rho[:-1] + rho[1:])
-    rhow[0]    = 2 * rhow[1]  - rhow[2]
-    rhow[-1]   = 2 * rhow[-2] - rhow[-3]
+    # Density at w-faces (vertical interfaces) — matches gSAM setdata.f90:473-484
+    # dolatlon branch exactly (non-uniform dz needs the adz cross-weighted form):
+    #
+    #   do k=2,nzm
+    #     rhow(k) = (rho(k-1)*adz(k) + rho(k)*adz(k-1)) / (adz(k)+adz(k-1))
+    #   end do
+    #   rhow(1)  = 2*rho(1)  - rhow(2)
+    #   rhow(nz) = 2*rho(nzm)- rhow(nzm)
+    #
+    # 1-indexed gSAM → 0-indexed Python: interior face k_f=1..nz-1 straddles
+    # mass cells k_f-1 (below) and k_f (above).
+    rho = grid.rho                                                    # (nz,)
+    dz  = grid.dz                                                     # (nz,)
+    nz  = len(rho)
+    # gSAM stretched-grid factors (setgrid.f90):
+    #   dz_ref    = zi[1] - zi[0]              (scalar, bottom layer thickness)
+    #   adz[k]    = dz[k] / dz_ref             (cell-thickness ratio, shape (nz,))
+    #   adzw[0]   = 1
+    #   adzw[k]   = (z[k]-z[k-1])/dz_ref       for k=1..nz-1
+    #   adzw[nz]  = adzw[nz-1]                 (wraparound)
+    zi   = np.asarray(grid.zi)                 # (nz+1,)
+    z1d  = np.asarray(grid.z)                  # (nz,)
+    dz_ref = float(zi[1] - zi[0])
+    adz    = np.asarray(dz, dtype=np.float64) / dz_ref
+    adzw   = np.empty(len(rho) + 1)
+    adzw[0]  = 1.0
+    adzw[1:-1] = (z1d[1:] - z1d[:-1]) / dz_ref
+    adzw[-1] = adzw[-2]
+    rhow = np.zeros(nz + 1)
+    # interior: k_f = 1..nz-1  →  rho_below=rho[k_f-1], rho_above=rho[k_f]
+    adz_below = adz[:-1]                                              # (nz-1,)  adz(k_f-1)
+    adz_above = adz[1:]                                               # (nz-1,)  adz(k_f)
+    rhow[1:-1] = (rho[:-1] * adz_above + rho[1:] * adz_below) \
+                 / (adz_below + adz_above)
+    # bottom / top linear extrapolation (gSAM lines 483-484)
+    rhow[0]  = 2.0 * rho[0]    - rhow[1]
+    rhow[-1] = 2.0 * rho[nz-1] - rhow[-2]
 
     # Hydrostatic base-state pressure (Pa) by integrating dp = -rho*g*dz from surface.
     # p_face[0] = p_surf (standard sea-level pressure).
-    G_GRAV = 9.79764    # m/s²  (matches gSAM consts.f90)
     p_surf = 101325.0   # Pa
     p_face = np.zeros(len(rho) + 1)
     p_face[0] = p_surf
@@ -109,8 +139,7 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     pres = 0.5 * (p_face[:-1] + p_face[1:])   # cell-centre pressure (nz,) Pa
 
     # gamaz[k] = g * z[k] / cp  (liquid-ice static energy height term)
-    CP_DRY = 1004.64  # J/(kg K)  matches gSAM
-    gamaz = G_GRAV * grid.z / CP_DRY   # (nz,) K
+    gamaz = G_GRAV * grid.z / CP   # (nz,) K
 
     # Coriolis + metric arrays (gSAM coriolis.f90)
     OMEGA = 7.2921e-5    # rad/s  (gSAM params.f90)
@@ -128,8 +157,12 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
         "rho":     jnp.array(rho),         # (nz,)
         "rhow":    jnp.array(rhow),        # (nz+1,)
         "dz":      jnp.array(dz),          # (nz,)
+        "adz":    jnp.array(adz),      # (nz,) gSAM adz(k) = dz(k)/dz_ref
+        "adzw":   jnp.array(adzw),     # (nz+1,) gSAM adzw(k) — normalized center spacing
+        "dz_ref": float(dz_ref),       # scalar — gSAM dz (bottom-layer thickness)
         "cos_lat": jnp.array(cos_lat),     # (ny,)
-        "lat_rad": jnp.array(lat_rad),     # (ny,)
+        "lat_rad": jnp.array(lat_rad),     # (ny,) mass-cell latitudes (rad)
+        "lon_rad": jnp.array(lon_rad),     # (nx,) mass-cell longitudes (rad)
         "dlon_rad": float(dlon_rad),
         "nx":       int(len(grid.lon)),    # actual zonal grid size (for FFT eigenvalues)
         "pres":    jnp.array(pres),        # (nz,) Pa  hydrostatic base-state pressure

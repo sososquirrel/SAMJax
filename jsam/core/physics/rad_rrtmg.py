@@ -1,10 +1,10 @@
 """
-RRTMG longwave radiation for jsam — batched-column wrapper around the
-f2py-built gSAM RRTMG_LW extension module.
+RRTMG radiation for jsam (LW + SW) — batched-column wrappers around the
+f2py-built gSAM RRTMG_LW and RRTMG_SW extension modules.
 
-Build artefact expected at ``/glade/work/sabramian/jsam_rrtmg_build/``
-(see ``jsam_rrtmg_build/build.sh`` and ``test_one_column.py`` for the
-Day 1 smoke test of the underlying ``.so``).
+Build artefacts expected at:
+  /glade/work/sabramian/jsam_rrtmg_build/     (LW — jsam_rrtmg_lw.*.so)
+  /glade/work/sabramian/jsam_rrtmg_sw_build/  (SW — jsam_rrtmg_sw.*.so)
 
 Design
 ------
@@ -13,14 +13,24 @@ RRTMG is column-independent, so we vectorize naively: flatten
 per radiation step with a (ncol, nlay) batch, then reshape back to
 (nz, ny, nx). JAX integration is via :func:`jax.pure_callback`.
 
-Clouds use RRTMG's default cloud optics (``inflglw=2, iceflglw=3,
-liqflglw=1``) with LWP/IWP and effective radii computed per layer
-from ``state.QC`` / ``state.QI``. Liquid Re is 14 µm over open ocean
+Clouds use RRTMG's default cloud optics (``inflg[lw/sw]=2, iceflg=3,
+liqflg=1``) with LWP/IWP and effective radii computed per layer
+from ``state.QC`` / ``state.QI``. Liquid Re is 14 um over open ocean
 (CAM default). Ice Re comes from the CAM hexagonal-column retab
-lookup table (180–274 K).
+lookup table (180-274 K).
 
-Surface temperature is per column (``ny, nx``). Ozone is still an
-analytic Gaussian profile — real gSAM ``o3file`` parsing is deferred.
+Surface temperature is per column (``ny, nx``). Ozone is read from
+the gSAM o3file (or falls back to an analytic Gaussian profile).
+
+Shortwave
+---------
+The SW driver mirrors the LW path: it calls ``rrtmg_sw_nomcica`` from
+the f2py extension, uses the gSAM CAM-style ocean/land albedo
+parameterization from ``albedo(..)`` (cam_rad_parameterizations.f90),
+and derives the solar zenith angle per column from the f2py-exported
+``shr_orb_params`` / ``shr_orb_decl`` / ``shr_orb_cosz`` (same code
+path as gSAM rad.f90 line 804).  The ``doseasons=.true.`` branch is
+used: ``dayForSW = day0 + nstep*dt/86400``.
 """
 from __future__ import annotations
 
@@ -37,29 +47,181 @@ from jsam.core.state import ModelState
 
 
 # ---------------------------------------------------------------------------
-# Locate the f2py-built extension (jsam_rrtmg_lw.*.so)
+# Locate the f2py-built extensions
+#   LW: /glade/work/sabramian/jsam_rrtmg_build/jsam_rrtmg_lw.*.so
+#   SW: /glade/work/sabramian/jsam_rrtmg_sw_build/jsam_rrtmg_sw.*.so
 # ---------------------------------------------------------------------------
 
-_RRTMG_BUILD_DIR = "/glade/work/sabramian/jsam_rrtmg_build"
+_RRTMG_LW_BUILD_DIR = "/glade/work/sabramian/jsam_rrtmg_build"
+_RRTMG_SW_BUILD_DIR = "/glade/work/sabramian/jsam_rrtmg_sw_build"
 
 def _import_rrtmg_lw():
-    if _RRTMG_BUILD_DIR not in sys.path:
-        sys.path.insert(0, _RRTMG_BUILD_DIR)
+    if _RRTMG_LW_BUILD_DIR not in sys.path:
+        sys.path.insert(0, _RRTMG_LW_BUILD_DIR)
     import jsam_rrtmg_lw  # noqa: F401
     return jsam_rrtmg_lw
 
+def _import_rrtmg_sw():
+    if _RRTMG_SW_BUILD_DIR not in sys.path:
+        sys.path.insert(0, _RRTMG_SW_BUILD_DIR)
+    import jsam_rrtmg_sw  # noqa: F401
+    return jsam_rrtmg_sw
+
 _LW = None
 _LW_INITIALIZED = False
+_SW = None
+_SW_INITIALIZED = False
 
 
 def _ensure_initialized(cpdair: float) -> None:
-    """One-time call to ``rrtmg_lw_ini`` — loads spectral k-distribution tables."""
+    """One-time init for RRTMG_LW (loads LW k-distribution tables)."""
     global _LW, _LW_INITIALIZED
     if _LW is None:
         _LW = _import_rrtmg_lw()
     if not _LW_INITIALIZED:
         _LW.rrtmg_lw_init.rrtmg_lw_ini(cpdair)
         _LW_INITIALIZED = True
+
+
+def _ensure_sw_initialized(cpdair: float):
+    """One-time init for RRTMG_SW (loads SW k-distribution tables).
+    Returns the loaded module so callers can cache it locally."""
+    global _SW, _SW_INITIALIZED
+    if _SW is None:
+        _SW = _import_rrtmg_sw()
+    if not _SW_INITIALIZED:
+        _SW.rrtmg_sw_init.rrtmg_sw_ini(cpdair)
+        _SW_INITIALIZED = True
+    return _SW
+
+
+# ---------------------------------------------------------------------------
+# Solar orbit parameters (lazily initialised from the f2py shr_orb_mod)
+# ---------------------------------------------------------------------------
+
+_ORBIT_CACHE: dict[int, tuple] = {}
+
+def _get_orbit_params(iyear: int) -> tuple:
+    """
+    Return ``(eccen, obliqr, lambm0, mvelpp)`` for calendar year ``iyear``.
+
+    Matches gSAM rad.f90 tracesini() line 1162:
+        call shr_orb_params(iyear, eccen, obliq, mvelp, obliqr, lambm0, mvelpp, .false.)
+
+    Cached by year so the lookup table in shr_orb_params is only evaluated once
+    per run.
+    """
+    if iyear in _ORBIT_CACHE:
+        return _ORBIT_CACHE[iyear]
+    sw = _ensure_sw_initialized(_CP_DAIR_DEFAULT)
+    eccen = np.array(0.0, dtype=np.float64)
+    obliq = np.array(0.0, dtype=np.float64)
+    mvelp = np.array(0.0, dtype=np.float64)
+    obliqr, lambm0, mvelpp = sw.shr_orb_mod.shr_orb_params(
+        int(iyear), eccen, obliq, mvelp, 0,
+    )
+    params = (float(eccen), float(obliqr), float(lambm0), float(mvelpp))
+    _ORBIT_CACHE[iyear] = params
+    return params
+
+
+def _solar_zenith_cos(day_of_year: float,
+                      lat_rad:     np.ndarray,
+                      lon_rad:     np.ndarray,
+                      iyear:       int) -> tuple[np.ndarray, float]:
+    """
+    Compute per-column ``cos(solar zenith)`` and the Earth-Sun eccentricity
+    factor at fractional calendar day ``day_of_year`` (UT).
+
+    Matches gSAM rad.f90 lines 804-807:
+        call shr_orb_decl(dayForSW, eccen, mvelpp, lambm0, obliqr, delta, eccf)
+        cosz = zenith(dayForSW, lat_rad, lon_rad)  ! = shr_orb_cosz(...)
+
+    Parameters
+    ----------
+    day_of_year : fractional calendar day (1.xx ... 365.xx), UT.  gSAM uses
+                  ``day = day0 + nstep*dt/86400`` with the ``doseasons=.true.``
+                  branch.
+    lat_rad     : (ny,)  mass-cell latitudes in radians
+    lon_rad     : (nx,)  mass-cell longitudes in radians
+    iyear       : calendar year for orbital parameter lookup
+
+    Returns
+    -------
+    coszen : (ny*nx,) cosine of solar zenith angle at each column, raveled
+             in (j, i) C-order to match the flatten used elsewhere.
+    eccf   : Earth-Sun distance factor (1/r^2).  Used to scale the solar
+             constant (gSAM passes adjes=eccf, scon=1367 to rrtmg_sw).
+    """
+    eccen, obliqr, lambm0, mvelpp = _get_orbit_params(int(iyear))
+    sw = _ensure_sw_initialized(_CP_DAIR_DEFAULT)
+    delta, eccf = sw.shr_orb_mod.shr_orb_decl(
+        float(day_of_year), eccen, mvelpp, lambm0, obliqr,
+    )
+    lat = np.asarray(lat_rad, dtype=np.float64)
+    lon = np.asarray(lon_rad, dtype=np.float64)
+    ny = lat.size
+    nx = lon.size
+    lat2 = np.broadcast_to(lat[:, None], (ny, nx)).ravel()
+    lon2 = np.broadcast_to(lon[None, :], (ny, nx)).ravel()
+    coszen = np.sin(lat2) * np.sin(delta) \
+           - np.cos(lat2) * np.cos(delta) * np.cos(float(day_of_year) * 2.0 * np.pi + lon2)
+    return coszen.astype(np.float64), float(eccf)
+
+
+def _cam_ocean_albedo(
+    coszen: np.ndarray,    # (ncol,)
+    ts:     np.ndarray,    # (ncol,) K, surface temperature
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Port of gSAM ``albedo(ocean=.true., ...)`` from cam_rad_parameterizations.f90
+    lines 218-240.
+
+    Ice-free ocean direct albedo as a function of solar zenith angle:
+        aldir = 0.026 / (coszen^1.7 + 0.065)
+              + 0.15*(coszen-0.1)*(coszen-0.5)*(coszen-1.0)
+        asdir = aldir
+        aldif = asdif = adif = 0.07  (Briegleb / RCEMIP value)
+
+    Where ``coszen <= 0`` (sun below horizon) all four are set to 0.
+    Where ``ts < 271 K`` (sea-ice proxy) fixed values 0.45/0.75 are used.
+
+    Returns (asdir, asdif, aldir, aldif), each shape (ncol,).
+    """
+    cz = np.asarray(coszen, dtype=np.float64)
+    ts = np.asarray(ts,     dtype=np.float64)
+    ADIF = 0.07
+
+    # Default: all zero (night).
+    asdir = np.zeros_like(cz)
+    asdif = np.zeros_like(cz)
+    aldir = np.zeros_like(cz)
+    aldif = np.zeros_like(cz)
+
+    # Daylit columns
+    day = cz > 0.0
+
+    # Ice-free ocean (ts > 271)
+    icefree = day & (ts > 271.0)
+    cz_if = np.clip(cz, 1e-6, 1.0)
+    ald = (0.026 / (cz_if ** 1.7 + 0.065)
+           + 0.15 * (cz_if - 0.10) * (cz_if - 0.50) * (cz_if - 1.00))
+    aldir = np.where(icefree, ald,   aldir)
+    asdir = np.where(icefree, ald,   asdir)
+    aldif = np.where(icefree, ADIF,  aldif)
+    asdif = np.where(icefree, ADIF,  asdif)
+
+    # Sea-ice proxy (day, ts <= 271)
+    seaice = day & (ts <= 271.0)
+    aldir = np.where(seaice, 0.45, aldir)
+    asdir = np.where(seaice, 0.75, asdir)
+    aldif = np.where(seaice, 0.45, aldif)
+    asdif = np.where(seaice, 0.75, asdif)
+
+    return asdir, asdif, aldir, aldif
+
+
+_CP_DAIR_DEFAULT = 1004.64
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +239,9 @@ class RadRRTMGConfig:
     """
     cpdair:    float = 1004.64   # J/(kg·K)  matches gSAM consts.f90
     emis:      float = 0.98      # band-independent surface emissivity (gSAM emis_water)
-    co2_vmr:   float = 400e-6
+    # gSAM IRMA CASES/IRMA/prm: nxco2=1., docurrentco2 default (.false.)
+    # → rad_full.f90:323  co2vmr = 3.670e-4 * nxco2 = 3.670e-4  (≡ 367 ppm)
+    co2_vmr:   float = 3.670e-4
     ch4_vmr:   float = 1.8e-6
     n2o_vmr:   float = 320e-9
     o2_vmr:    float = 0.209
@@ -339,6 +503,97 @@ def _rrtmg_lw_numpy(
 
 
 # ---------------------------------------------------------------------------
+# RRTMG_SW batched-column driver
+# ---------------------------------------------------------------------------
+
+_NBNDSW = 14      # RRTMG_SW number of bands
+_NAERSW = 6       # RRTMG_SW aerosol bands (iaer=0 path)
+
+def _rrtmg_sw_numpy(
+    play_hpa:  np.ndarray,   # (ncol, nlay)
+    plev_hpa:  np.ndarray,   # (ncol, nlay+1)
+    tlay:      np.ndarray,   # (ncol, nlay)
+    tlev:      np.ndarray,   # (ncol, nlay+1)
+    tsfc:      np.ndarray,   # (ncol,)
+    h2ovmr:    np.ndarray,   # (ncol, nlay)
+    o3vmr:     np.ndarray,   # (ncol, nlay)
+    asdir:     np.ndarray,   # (ncol,)  UV-Vis direct albedo
+    asdif:     np.ndarray,   # (ncol,)  UV-Vis diffuse albedo
+    aldir:     np.ndarray,   # (ncol,)  IR direct albedo
+    aldif:     np.ndarray,   # (ncol,)  IR diffuse albedo
+    coszen:    np.ndarray,   # (ncol,)  cosine of solar zenith
+    eccf:      float,        # Earth-Sun distance factor (1/r^2)
+    cldfr:     np.ndarray,   # (ncol, nlay)
+    cicewp:    np.ndarray,   # (ncol, nlay)  g/m^2
+    cliqwp:    np.ndarray,   # (ncol, nlay)  g/m^2
+    reice:     np.ndarray,   # (ncol, nlay)  um
+    reliq:     np.ndarray,   # (ncol, nlay)  um
+    cfg:       RadRRTMGConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Call the f2py-built RRTMG_SW for one batch of columns.
+
+    Mirrors the gSAM call in rad.f90 lines 893-904, with:
+      overlap = 1 (maximum-random, no partial cloudiness)
+      inflgsw=2, iceflgsw=3, liqflgsw=1 (compute optics from cwp & re)
+      scon = 1367.0 W/m^2
+      adjes = eccf (Earth-Sun distance factor, from shr_orb_decl)
+      dyofyr = 0  (eccf-only path, gSAM line 885 passes 0)
+    """
+    sw = _ensure_sw_initialized(cfg.cpdair)
+    ncol, nlay = play_hpa.shape
+
+    def _f(val):
+        return np.full((ncol, nlay), float(val), dtype=np.float64)
+
+    co2 = _f(cfg.co2_vmr)
+    ch4 = _f(cfg.ch4_vmr)
+    n2o = _f(cfg.n2o_vmr)
+    o2  = _f(cfg.o2_vmr)
+
+    # Sky-condition placeholders (RRTMG ignores when inflgsw=2).
+    taucld = np.zeros((_NBNDSW, ncol, nlay), dtype=np.float64)
+    ssacld = np.ones ((_NBNDSW, ncol, nlay), dtype=np.float64)
+    asmcld = np.zeros((_NBNDSW, ncol, nlay), dtype=np.float64)
+    fsfcld = np.zeros((_NBNDSW, ncol, nlay), dtype=np.float64)
+
+    # Aerosol placeholders — iaer=0 path (no aerosols) as in gSAM IRMA prm.
+    tauaer = np.zeros((ncol, nlay, _NBNDSW), dtype=np.float64)
+    ssaaer = np.zeros((ncol, nlay, _NBNDSW), dtype=np.float64)
+    asmaer = np.zeros((ncol, nlay, _NBNDSW), dtype=np.float64)
+    ecaer  = np.zeros((ncol, nlay, _NAERSW), dtype=np.float64)
+
+    icld     = np.array(1, dtype=np.int32)    # in/out scratch (maximum-random)
+    inflgsw  = 2
+    iceflgsw = 3
+    liqflgsw = 1
+
+    (swuflx, swdflx, swhr,
+     swuflxc, swdflxc, swhrc,
+     _dirdnuv, _difdnuv, _dirdnir, _difdnir) = sw.rrtmg_sw_rad_nomcica.rrtmg_sw(
+        ncol, nlay, icld,
+        np.ascontiguousarray(play_hpa), np.ascontiguousarray(plev_hpa),
+        np.ascontiguousarray(tlay),     np.ascontiguousarray(tlev),
+        np.ascontiguousarray(tsfc),
+        np.ascontiguousarray(h2ovmr),   np.ascontiguousarray(o3vmr),
+        co2, ch4, n2o, o2,
+        np.ascontiguousarray(asdir), np.ascontiguousarray(asdif),
+        np.ascontiguousarray(aldir), np.ascontiguousarray(aldif),
+        np.ascontiguousarray(coszen), float(eccf), 0, 1367.0,
+        inflgsw, iceflgsw, liqflgsw,
+        np.ascontiguousarray(cldfr),
+        taucld, ssacld, asmcld, fsfcld,
+        np.ascontiguousarray(cicewp), np.ascontiguousarray(cliqwp),
+        np.ascontiguousarray(reice),  np.ascontiguousarray(reliq),
+        tauaer, ssaaer, asmaer, ecaer,
+    )
+
+    return (
+        np.asarray(swhr,   dtype=np.float64),   # (ncol, nlay)  K/day
+        np.asarray(swdflx, dtype=np.float64),   # (ncol, nlay+1) W/m^2  downwelling
+    )
+
+
+# ---------------------------------------------------------------------------
 # Host-side tendency: state → dTABS_dt (K/s)
 # ---------------------------------------------------------------------------
 
@@ -355,7 +610,17 @@ def _compute_dTABS_dt_host(
     plev_hpa:   np.ndarray,     # (nz+1,) interface pressure (hPa) sfc→TOA
     o3vmr:      np.ndarray,     # (nz,) or (ncol, nz)
     cfg:        RadRRTMGConfig,
-) -> np.ndarray:                # (nz, ny, nx) K/s
+    sw_inputs:  Optional[dict] = None,
+) -> tuple[np.ndarray, np.ndarray]:  # (nz, ny, nx) K/s, (ny, nx) W/m^2 lwds
+    """
+    Compute LW+SW radiative heating tendency and surface LW down-welling flux.
+
+    ``sw_inputs`` is either None (LW-only, matches historical behaviour) or a
+    dict with keys ``coszen`` (ncol,), ``eccf`` (scalar), ``asdir, asdif,
+    aldir, aldif`` (each ncol,).  When provided, RRTMG_SW is called for each
+    column chunk and its heating rate is added to the LW heating rate
+    (matches gSAM rad.f90:935 ``qrad = lwHeatingRate + swHeatingRate``).
+    """
     nz, ny, nx = TABS_host.shape
     ncol = ny * nx
 
@@ -458,6 +723,16 @@ def _compute_dTABS_dt_host(
     lwds_col = np.empty((ncol,), dtype=np.float64)
     tsfc64 = tsfc_col.astype(np.float64)
 
+    # SW auxiliary arrays (broadcast to the extended vertical grid).
+    do_sw = sw_inputs is not None
+    if do_sw:
+        coszen_col = np.asarray(sw_inputs["coszen"], dtype=np.float64)
+        eccf       = float(sw_inputs["eccf"])
+        asdir_col  = np.asarray(sw_inputs["asdir"], dtype=np.float64)
+        asdif_col  = np.asarray(sw_inputs["asdif"], dtype=np.float64)
+        aldir_col  = np.asarray(sw_inputs["aldir"], dtype=np.float64)
+        aldif_col  = np.asarray(sw_inputs["aldif"], dtype=np.float64)
+
     for i0 in range(0, ncol, _CHUNK_NCOL):
         i1 = min(i0 + _CHUNK_NCOL, ncol)
         hr_ext, dflx_ext = _rrtmg_lw_numpy(
@@ -475,11 +750,27 @@ def _compute_dTABS_dt_host(
         # Surface down-welling LW = dflx at sfc interface (index 0).
         lwds_col[i0:i1] = dflx_ext[:, 0]
 
-    # Safety clip: physically-realised LW heating should be within ±50 K/day
-    # (stratospheric emission can reach ~-12 K/d, tropospheric cloud tops ~-25).
-    # Coarser than ~1° grid boxes can produce unphysically concentrated
-    # LWP/IWP + tiny effective radii that drive RRTMG into nonsense; cap
-    # before it destabilises the dynamics. No-op on realistic native grids.
+        if do_sw:
+            sw_hr_ext, _sw_dflx_ext = _rrtmg_sw_numpy(
+                play_hpa=play_ext[i0:i1], plev_hpa=plev_ext[i0:i1],
+                tlay=tlay_ext[i0:i1],     tlev=tlev_ext[i0:i1],
+                tsfc=tsfc64[i0:i1],
+                h2ovmr=h2o_ext[i0:i1], o3vmr=o3_ext[i0:i1],
+                asdir=asdir_col[i0:i1], asdif=asdif_col[i0:i1],
+                aldir=aldir_col[i0:i1], aldif=aldif_col[i0:i1],
+                coszen=coszen_col[i0:i1], eccf=eccf,
+                cldfr=cldfr_ext[i0:i1],
+                cicewp=cicewp_ext[i0:i1], cliqwp=cliqwp_ext[i0:i1],
+                reice=reice_ext[i0:i1],   reliq=reliq_ext[i0:i1],
+                cfg=cfg,
+            )
+            # gSAM combines LW+SW heating in a single qrad buffer
+            # (rad.f90:935 ``qrad = lwHeatingRate + swHeatingRate``).
+            hr_K_per_day[i0:i1] += sw_hr_ext[:, :nz]
+
+    # Safety clip: physically-realised heating should be within ±50 K/day.
+    # SW peaks near ~5 K/day in cloud tops, LW around -25 K/d at the top of
+    # a deep cloud, so ±50 is a generous guardrail for coarse/edge cases.
     np.clip(hr_K_per_day, -50.0, 50.0, out=hr_K_per_day)
 
     dTABS_dt_col = hr_K_per_day / 86400.0
@@ -491,6 +782,46 @@ def _compute_dTABS_dt_only_host(*args, **kwargs):
     """Back-compat wrapper: returns heating rates only (drops lwds)."""
     dTABS_dt, _ = _compute_dTABS_dt_host(*args, **kwargs)
     return dTABS_dt
+
+
+def _build_sw_inputs_host(
+    TABS_host: np.ndarray,     # (nz, ny, nx)
+    sst_host:  np.ndarray,     # (ny, nx)
+    lat_rad:   np.ndarray,     # (ny,)
+    lon_rad:   np.ndarray,     # (nx,)
+    day_of_year: float,        # UT fractional day (gSAM dayForSW)
+    iyear: int,                # calendar year for shr_orb_params
+) -> dict:
+    """
+    Build the per-column SW inputs consumed by :func:`_rrtmg_sw_numpy`:
+      coszen, eccf, asdir/asdif/aldir/aldif.
+
+    Matches gSAM rad.f90 lines 804-832: orbital decl -> per-column cosine
+    zenith -> CAM ocean albedo.  ``sst`` is used as surface skin T for
+    the albedo branch (gSAM passes surfaceT which equals SST over ocean).
+    """
+    nz, ny, nx = TABS_host.shape
+    ncol = ny * nx
+
+    coszen, eccf = _solar_zenith_cos(day_of_year, lat_rad, lon_rad, iyear)
+
+    # Surface T per column (SST over ocean; lowest-layer TABS on NaN/land).
+    tsfc_col = sst_host.reshape(ncol).astype(np.float64)
+    nan_sfc = ~np.isfinite(tsfc_col)
+    if nan_sfc.any():
+        TABS_bot = TABS_host[0].reshape(ncol)
+        tsfc_col = np.where(nan_sfc, TABS_bot, tsfc_col)
+
+    asdir, asdif, aldir, aldif = _cam_ocean_albedo(coszen, tsfc_col)
+
+    return {
+        "coszen": coszen,
+        "eccf":   eccf,
+        "asdir":  asdir,
+        "asdif":  asdif,
+        "aldir":  aldir,
+        "aldif":  aldif,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -535,9 +866,11 @@ def compute_qrad_rrtmg(
     config:  RadRRTMGConfig,
     sst:     jax.Array,          # (ny, nx)  K — per-column surface temperature
     o3vmr:   Optional[np.ndarray] = None,
+    sw_aux:  Optional[dict] = None,
 ) -> jax.Array:                  # (nz, ny, nx) K/s heating rate
     """
-    Compute RRTMG_LW radiative heating rates without applying them.
+    Compute RRTMG radiative heating rates (LW, and LW+SW when ``sw_aux`` is
+    supplied) without applying them.
 
     Returns ``dTABS/dt`` in K/s — call ``TABS += dt * qrad`` every step to
     apply, matching gSAM's ``t(i,j,k) = t(i,j,k) + qrad(i,j,k)*dtn`` pattern
@@ -547,6 +880,14 @@ def compute_qrad_rrtmg(
     Surface temperature is per-column. ``o3vmr`` may be a ``(nz,)`` column
     profile or a ``(ncol, nz)`` per-column field; if ``None`` it falls back
     to the analytic Gaussian.
+
+    ``sw_aux`` enables the RRTMG_SW call (matching gSAM dolongwave+doshortwave).
+    It must carry:
+      - ``day_of_year`` (float, UT fractional calendar day)
+      - ``iyear``       (int)
+      - ``lat_rad``     (ny,) mass-cell latitudes in radians
+      - ``lon_rad``     (nx,) mass-cell longitudes in radians
+    If omitted, only the LW call is performed (legacy behaviour).
     """
     plev_hpa = build_plev_hpa(metric)                               # (nz+1,)
     play_hpa = 0.5 * (plev_hpa[:-1] + plev_hpa[1:])                 # (nz,)
@@ -557,18 +898,32 @@ def compute_qrad_rrtmg(
 
     nz, ny, nx = state.TABS.shape
 
+    _sw_day   = None if sw_aux is None else float(sw_aux["day_of_year"])
+    _sw_year  = None if sw_aux is None else int(sw_aux["iyear"])
+    _sw_lat   = None if sw_aux is None else np.asarray(sw_aux["lat_rad"], dtype=np.float64)
+    _sw_lon   = None if sw_aux is None else np.asarray(sw_aux["lon_rad"], dtype=np.float64)
+
     def _host_callback(TABS_np, QV_np, QC_np, QI_np, sst_np):
-        return _compute_dTABS_dt_only_host(
-            TABS_host=np.asarray(TABS_np, dtype=np.float64),
-            QV_host  =np.asarray(QV_np,   dtype=np.float64),
-            QC_host  =np.asarray(QC_np,   dtype=np.float64),
-            QI_host  =np.asarray(QI_np,   dtype=np.float64),
-            sst_host =np.asarray(sst_np,  dtype=np.float64),
+        TABS_h = np.asarray(TABS_np, dtype=np.float64)
+        sst_h  = np.asarray(sst_np,  dtype=np.float64)
+        sw_in = None
+        if _sw_day is not None:
+            sw_in = _build_sw_inputs_host(
+                TABS_h, sst_h, _sw_lat, _sw_lon, _sw_day, _sw_year,
+            )
+        dTABS_dt, _lwds = _compute_dTABS_dt_host(
+            TABS_host=TABS_h,
+            QV_host  =np.asarray(QV_np, dtype=np.float64),
+            QC_host  =np.asarray(QC_np, dtype=np.float64),
+            QI_host  =np.asarray(QI_np, dtype=np.float64),
+            sst_host =sst_h,
             play_hpa =play_hpa.astype(np.float64),
             plev_hpa =plev_hpa.astype(np.float64),
             o3vmr    =o3vmr_arr,
             cfg=config,
-        ).astype(np.float32)
+            sw_inputs=sw_in,
+        )
+        return dTABS_dt.astype(np.float32)
 
     out_shape = jax.ShapeDtypeStruct((nz, ny, nx), jnp.float32)
     return jax.pure_callback(

@@ -1,15 +1,36 @@
 """
 Adaptive timestep CFL check.
 
-Matches gSAM SRC/kurant.f90.  Per-cell advective Courant number is
+Matches gSAM SRC/kurant.f90 lines 19-47 exactly.  The Fortran kernel is
+
+    do k = 1,nzm
+     idz = dtn/(dz*adzw(k))              ! dz scalar ref, adzw(k) per-level stretch
+     do j=1,ny
+      idx = imu(j)*dtn/dx                ! imu(j) = 1/cos(lat_j)
+      idy = YES3D*dtn/(dy*ady(j))        ! dy scalar ref, ady(j) per-row stretch
+      do i=1,nx
+       cflz1    = abs(w(i,j,k))*idz
+       cflh1_sq = (u(i,j,k)*idx)**2 + (v(i,j,k)*idy)**2
+       cfll     = sqrt(cflh1_sq + cflz1**2)
+       cfl      = max(cfl, cfll)
+      end do
+     end do
+    end do
+
+i.e. the per-cell advective Courant number is
 
     cfl_cell = sqrt(
         (|u|*dt / (dx*cos(lat)))**2
-      + (|v|*dt / dy_lat)**2
-      + (|w|*dt / dz)**2
+      + (|v|*dt / (dy_ref*ady(j)))**2
+      + (|w|*dt / (dz_ref*adzw(k)))**2
     )
 
-and the reduced timestep is
+Note `dz_ref*adzw(k)` is the W-face center-to-center spacing
+(z(k)-z(k-1)), NOT the mass-cell thickness zi(k+1)-zi(k); these
+coincide only on a uniform vertical grid.  Likewise `dy_ref*ady(j)`
+equals jsam's per-row `dy_lat[j]` by construction.
+
+The reduced timestep is
 
     dtn = min(dt_ref, dt_ref * cfl_max / (cfl_adv + eps))
 
@@ -41,18 +62,19 @@ def compute_cfl(
     grid spacing to form the cell Courant number.
     """
     dx      = metric["dx_lon"]     # scalar (m) — equatorial zonal spacing
-    dy      = metric["dy_lat"]     # (ny,)  — per-row meridional spacing
-    dz      = metric["dz"]         # (nz,)
+    dy      = metric["dy_lat"]     # (ny,)  — per-row meridional spacing (= dy_ref*ady)
     cos_lat = metric["cos_lat"]    # (ny,)
+    dz_ref  = metric["dz_ref"]     # scalar — reference vertical spacing
+    adzw    = metric["adzw"]       # (nz+1,) — per-level stretched factor (use first nz)
 
     U_abs = jnp.maximum(jnp.abs(U[:, :, :-1]), jnp.abs(U[:, :, 1:]))   # (nz,ny,nx)
     V_abs = jnp.maximum(jnp.abs(V[:, :-1, :]), jnp.abs(V[:, 1:, :]))   # (nz,ny,nx)
     W_abs = jnp.maximum(jnp.abs(W[:-1, :, :]), jnp.abs(W[1:, :, :]))   # (nz,ny,nx)
 
-    dx_j = dx * jnp.maximum(cos_lat, 1e-6)   # guard against cos=0 at poles
-    idx  = dt / dx_j                         # (ny,)
-    idy  = dt / dy                           # (ny,)
-    idz  = dt / dz                           # (nz,)
+    dx_j = dx * jnp.maximum(cos_lat, 1e-6)             # guard against cos=0 at poles
+    idx  = dt / dx_j                                   # (ny,)
+    idy  = dt / dy                                     # (ny,)
+    idz  = dt / (dz_ref * adzw[:U_abs.shape[0]])       # (nz,) — dz*adzw(k), k=1..nzm
 
     cfl_u = U_abs * idx[None, :, None]
     cfl_v = V_abs * idy[None, :, None]

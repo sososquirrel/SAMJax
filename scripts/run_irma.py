@@ -124,15 +124,6 @@ def _parse_args():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_zi(z: np.ndarray, dz: np.ndarray) -> np.ndarray:
-    """Reconstruct nz+1 interface heights from cell centres and thicknesses."""
-    zi = np.empty(len(z) + 1)
-    zi[0]  = z[0] - 0.5 * dz[0]
-    zi[1:] = zi[0] + np.cumsum(dz)
-    return zi
-
-
-
 def _prescribed_rad_forcing(z: np.ndarray) -> np.ndarray:
     """
     Tropical prescribed radiative cooling profile (K/s).
@@ -173,7 +164,9 @@ def main():
     g = loader.grid
     z   = g["z"]
     dz  = g["dz"]
-    zi  = _build_zi(z, dz)
+    zi  = g["zi"]
+    assert len(zi) == len(z) + 1, f"zi/z length mismatch: {len(zi)} vs {len(z)+1}"
+    assert np.allclose(0.5*(zi[:-1]+zi[1:]), z, atol=1.0), "z is not the midpoint of zi — gSAM grd file drift"
 
     if args.dlat is not None:
         # Coarsened horizontal grid — ERA5 init interpolates to whatever lat/lon we pass.
@@ -293,12 +286,28 @@ def main():
     # each step via the diagnose block (step 14).
     cos_lat = np.cos(np.deg2rad(lat))           # (ny,)
     wgt = cos_lat / cos_lat.sum()               # normalised area weights
-    tabs0 = jnp.array(
-        np.sum(np.mean(np.array(state.TABS), axis=2) * wgt[None, :], axis=1)
-    )  # (nz,)
-    qv0 = jnp.array(
-        np.sum(np.mean(np.array(state.QV), axis=2) * wgt[None, :], axis=1)
-    )  # (nz,)
+
+    def _hmean_init(field3d_np):
+        return np.sum(np.mean(field3d_np, axis=2) * wgt[None, :], axis=1)
+
+    # gSAM diagnose.f90:27-86 exact recipe:
+    #   tabs0(k) = <tabs>  ;  q0(k) = <qv+qcl+qci>  ;
+    #   qn0(k)   = <qcl+qci> ; qp0(k) = <qpl+qpi>   ;  qv0 = q0 - qn0
+    TABS_np = np.array(state.TABS)
+    QV_np   = np.array(state.QV)
+    QC_np   = np.array(state.QC)
+    QI_np   = np.array(state.QI)
+    QR_np   = np.array(state.QR)
+    QS_np   = np.array(state.QS)
+    QG_np   = np.array(state.QG)
+
+    tabs0 = jnp.array(_hmean_init(TABS_np))
+    qn0_init = _hmean_init(QC_np + QI_np)          # <qcl+qci>
+    qp0_init = _hmean_init(QR_np + QS_np + QG_np)  # <qpl+qpi>
+    q0_init  = _hmean_init(QV_np + QC_np + QI_np)
+    qv0      = jnp.array(q0_init - qn0_init)        # gSAM qv0 = q0 - qn0
+    qn0      = jnp.array(qn0_init)
+    qp0      = jnp.array(qp0_init)
 
     # Frozen t=0 reference profiles for scalar nudging (gSAM nudging.f90).
     # These are identical to tabs0/qv0 at init, but tabs0/qv0 are rolling
@@ -337,6 +346,8 @@ def main():
     forcing = PhysicsForcing(
         tabs0=tabs0,
         qv0=qv0,
+        qn0=qn0,
+        qp0=qp0,
         tabs_ref=tabs_ref,
         qv_ref=qv_ref,
         rad_forcing=rad_forcing,
@@ -363,6 +374,14 @@ def main():
         if args.nudge_strato else None
     )
 
+    # Calendar day of year (1-based, fractional UT) at nstep=0, for the
+    # RRTMG_SW solar-geometry call.  Matches gSAM dayForSW = day0 + ...
+    # with doseasons=.true. (rad.f90 line 778).
+    _day0_frac = (START_TIME.timetuple().tm_yday
+                  + (START_TIME.hour * 3600
+                     + START_TIME.minute * 60
+                     + START_TIME.second) / 86400.0)
+
     config = StepConfig(
         sgs_params=SGSParams(),
         micro_params=MicroParams(),
@@ -370,6 +389,8 @@ def main():
         nudging_params=_nudging,
         rad_rrtmg=rad_rrtmg_cfg,
         nrad=args.nrad,
+        rad_day0=_day0_frac if args.rad == "rrtmg" else None,
+        rad_iyear=START_TIME.year,
         slm_params=slm_params,
         g=9.81,
         epsv=0.61,
@@ -485,6 +506,7 @@ def main():
                 )
                 forcing = PhysicsForcing(
                     tabs0=forcing.tabs0, qv0=forcing.qv0,
+                    qn0=forcing.qn0, qp0=forcing.qp0,
                     tabs_ref=forcing.tabs_ref, qv_ref=forcing.qv_ref,
                     rad_forcing=forcing.rad_forcing,
                     ls_forcing=forcing.ls_forcing,

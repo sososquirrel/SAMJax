@@ -43,6 +43,7 @@ import jax.numpy as jnp
 
 from jsam.core.state import ModelState
 from jsam.core.physics.sgs import SurfaceFluxes
+from jsam.core.physics.microphysics import qsatw as _qsatw_micro
 
 
 # ---------------------------------------------------------------------------
@@ -51,38 +52,16 @@ from jsam.core.physics.sgs import SurfaceFluxes
 
 @dataclass(frozen=True)
 class BulkParams:
-    """Bulk-flux tuning parameters (gSAM/CESM1 defaults)."""
-    umin:        float = 1.0     # minimum wind speed (m/s)
-    karman:      float = 0.4     # von Kármán constant
-    epsv:        float = 0.61    # (Rv/Rd − 1); virtual temp correction
-    salt_factor: float = 0.98    # ocean salinity reduction of qs
-    p00:         float = 1.0e5   # reference pressure (Pa)
-    Rd:          float = 287.0   # dry air gas constant (J/kg/K)
-    Rv:          float = 461.5   # water vapour gas constant (J/kg/K)
-    cp:          float = 1004.0  # specific heat of dry air (J/kg/K)
-    g:           float = 9.81    # gravitational acceleration (m/s²)
-
-
-# ---------------------------------------------------------------------------
-# Thermodynamic helpers
-# ---------------------------------------------------------------------------
-
-def _qsat_w(T: jax.Array, p: jax.Array) -> jax.Array:
-    """
-    Saturation specific humidity over liquid water (Bolton 1980).
-
-    Parameters
-    ----------
-    T : temperature (K)
-    p : pressure (Pa)
-
-    Returns
-    -------
-    qsat : specific humidity (kg/kg)
-    """
-    es  = 611.2 * jnp.exp(17.67 * (T - 273.15) / (T - 29.65))   # Pa
-    eps = 0.6219   # Rd/Rv
-    return eps * es / (p - (1.0 - eps) * es)
+    """Bulk-flux tuning parameters (matches gSAM consts.f90 / params.f90)."""
+    umin:        float = 1.0       # minimum wind speed (m/s)
+    karman:      float = 0.4       # von Kármán constant
+    epsv:        float = 0.61      # (Rv/Rd − 1); virtual temp correction
+    salt_factor: float = 0.98      # ocean salinity reduction of qs
+    p00:         float = 1.0e5     # reference pressure (Pa)
+    Rd:          float = 287.04    # dry air gas constant (J/kg/K)
+    Rv:          float = 461.5     # water vapour gas constant (J/kg/K)
+    cp:          float = 1004.64   # specific heat of dry air (J/kg/K)
+    g:           float = 9.79764   # gravitational acceleration (m/s²)
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +231,9 @@ def bulk_surface_fluxes(
 
     delt  = thbot - ts                # (ny, nx)
 
-    # Surface saturation humidity (with salt factor)
-    qs_sfc = params.salt_factor * _qsat_w(sst_safe, pres_sfc)
+    # Surface saturation humidity (with salt factor).
+    # qsatw matches gSAM sat.f90 (Buck 1981 / IFS) exactly; pressure in mb.
+    qs_sfc = params.salt_factor * _qsatw_micro(sst_safe, pres_sfc / 100.0)
     delq   = QV0 - qs_sfc             # (ny, nx)
 
     # --- neutral coefficients (first guess) ---

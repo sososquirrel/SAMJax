@@ -19,7 +19,7 @@ import numpy as np
 from .base import Grid
 
 # Earth radius
-EARTH_RADIUS = 6.371e6   # m
+EARTH_RADIUS = 6371229.0   # m
 
 
 @dataclass(frozen=True)
@@ -107,13 +107,19 @@ class LatLonGrid(Grid):
 
     @property
     def dy_ref(self) -> float:
-        """Reference meridional spacing (m) — mid-latitude row.
+        """Reference meridional spacing (m) — distance between the two
+        mid-latitude mass-cell centres.
 
         Matches gSAM setgrid.f90:238  `dy = y_gl(ny_gl/2+1) - y_gl(ny_gl/2)`.
+        Since y_gl[j] = 0.5*(yv_gl[j]+yv_gl[j+1]), this telescopes to
+        0.5*(dy_per_row[ny/2 - 1] + dy_per_row[ny/2])  (Python 0-index, ny even).
         On uniform grids this equals dy_per_row[j] for all j.
         """
         dy_arr = self.dy_per_row
-        return float(dy_arr[len(dy_arr) // 2])
+        ny = len(dy_arr)
+        if ny < 2:
+            return float(dy_arr[0])
+        return float(0.5 * (dy_arr[ny // 2 - 1] + dy_arr[ny // 2]))
 
     @property
     def ady(self) -> np.ndarray:
@@ -158,6 +164,11 @@ class LatLonGrid(Grid):
         u: (nz, ny, nx+1)  — u at east faces
         v: (nz, ny+1, nx)  — v at north faces
         Returns: (nz, ny, nx)
+
+        Matches gSAM driver exactly:
+            div(i,j,k) = (U(i+1,j,k)-U(i,j,k))/dx(j) + (V(i,j+1,k)-V(i,j,k))/dy(j)
+        Verified against matching_tests/test_operators (divergence_zero_v_const,
+        divergence_linear_u): max_abs = 0.0.
         """
         dx = jnp.array(self.dx)[None, :, None]   # (1, ny, 1)
         dy = jnp.array(self.dy)[None, :, None]   # (1, ny, 1) — per-row

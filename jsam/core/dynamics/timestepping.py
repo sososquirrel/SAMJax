@@ -93,23 +93,54 @@ def ab_coefs(
 
         phi_{n+1} = phi_n + dt_curr * (at*F_n + bt*F_{n-1} + ct*F_{n-2})
 
-    nstep == 0 or dt_prev is None            →  Euler (1, 0, 0)
-    nstep == 1 or dt_pprev is None           →  AB2   (variable-dt)
-    nstep >= 2                               →  AB3   (variable-dt)
+    This implements the gSAM nadams=3 semantics (the default; nadams=2 is a
+    legacy CRM option not used by IRMA).  See gSAM SRC/abcoefs.f90 lines 14-30:
+
+        if (nadams==3 .or. nadams==23) .and. (at/=0 .and. bt/=0 ...) then
+            ! AB3 branch — both at and bt are nonzero from prior call
+            alpha = dt3(nb)/dt3(na)        ! dt_{n-1}/dt_n
+            beta  = dt3(nc)/dt3(na)        ! dt_{n-2}/dt_n
+            ct = (2.+3.*alpha)/(6.*(alpha+beta)*beta)
+            bt = -(1.+2.*(alpha+beta)*ct)/(2.*alpha)
+            at = 1. - bt - ct
+        else if (nadams==2 .and. ...) .or. (at/=0 .and. bt==0) then
+            ! AB2 branch — bt was zero on entry (i.e. just past Euler)
+            alpha = dt3(nb)/dt3(na)
+            at = (1.+2*alpha)/(2.*alpha)
+            bt = -1./(2.*alpha)
+            ct = 0.
+        else
+            at = 1.; bt = 0.; ct = 0.       ! Euler bootstrap
+        end if
+
+    gSAM uses the (at, bt) globals as a state machine to decide the branch.
+    jsam translates this into nstep-indexed semantics (nstep=0 is the very
+    first call, buffers rotate AFTER the call):
+
+        nstep == 0  (or dt_prev  is None)  →  Euler  (1, 0, 0)
+        nstep == 1  (or dt_pprev is None)  →  AB2    (variable-dt)
+        nstep >= 2                          →  AB3    (variable-dt)
+
+    Note: gSAM's state machine would actually take the AB2 branch on the very
+    first call (since at=1, bt=0 globals match the second branch), with
+    dt_prev defaulting to dt3 initial value.  jsam returns Euler on nstep==0
+    instead — a defensible simplification because no prior tendency exists,
+    so falling back to Euler is safe and matches gSAM's behavior in the
+    nrestart==0 cold-start path where F_{n-1} is uninitialized.
 
     gSAM convention:
         alpha = dt_prev / dt_curr    ( = dt3(nb)/dt3(na) )
         beta  = dt_pprev / dt_curr   ( = dt3(nc)/dt3(na) )
 
-    AB2 (nadams=2):
-        at = (1 + 2α) / (2α),   bt = -1/(2α)
+    AB2 (bootstrap, second call):
+        at = (1 + 2α) / (2α),   bt = -1/(2α),   ct = 0
 
-    AB3 (nadams=3):
+    AB3 (steady state, third call onward):
         ct = (2 + 3α) / (6 (α+β) β)
         bt = -(1 + 2(α+β) ct) / (2α)
         at = 1 - bt - ct
 
-    Constant-dt (α=β=1) → AB3 = (23/12, -16/12, 5/12).
+    Constant-dt (α=β=1) → AB3 = (23/12, -16/12, 5/12) ≈ (1.9167, -1.3333, 0.4167).
     """
     if nstep == 0 or dt_prev is None or dt_curr is None:
         return 1.0, 0.0, 0.0
@@ -132,6 +163,9 @@ def ab_coefs(
 # ---------------------------------------------------------------------------
 
 # Back-compat shims — existing unit tests import ab2_coefs/ab2_step.
+# NOTE: only valid for nstep <= 1 (Euler or AB2). For nstep >= 2 use ab_coefs
+# directly with dt_pprev set — ab2_coefs passes dt_pprev=None which forces the
+# AB2 branch and silently drops the AB3 ct term, giving wrong coefficients.
 def ab2_coefs(nstep, dt_curr=None, dt_prev=None):
     at, bt, _ = ab_coefs(nstep, dt_curr, dt_prev, None)
     return at, bt
