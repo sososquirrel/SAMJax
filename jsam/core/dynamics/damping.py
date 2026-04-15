@@ -39,7 +39,6 @@ def pole_damping(
     cu: float = 0.3,     # Courant-number cap (gSAM damping_u_cu default)
     pres: jax.Array | None = None,  # (nz,) pressure (Pa) for upper-level damping
     p_upper: float = 7000.0,        # threshold (Pa): full damping above this (gSAM: 70 hPa = 7000 Pa)
-    u_max_phys: float = 150.0,      # physical velocity cap (m/s) — umax = min(CFL_limit, u_max_phys)
 ) -> tuple[jax.Array, jax.Array]:
     """
     Apply gSAM-style polar + upper-level velocity damping to U and V.
@@ -68,11 +67,6 @@ def pole_damping(
     cu      : Courant-number threshold (default 0.3, matches gSAM damping_u_cu)
     pres    : (nz,) pressure (Pa) at cell centres — enables dodamping_u
     p_upper : pressure threshold (Pa) below which full damping is applied (default 7000 = 70 hPa)
-    u_max_phys : physical velocity cap (m/s) — bounds umax independently of grid
-                 resolution.  At coarse resolution (e.g. 2°), the CFL-based limit
-                 (cu*dx*cos(lat)/dt) can be thousands of m/s, making the clip
-                 useless.  u_max_phys provides a resolution-independent bound.
-                 Default 150 m/s (no real atmospheric wind exceeds this).
 
     Returns
     -------
@@ -84,10 +78,8 @@ def pole_damping(
     # tau_lat(j) = (sin²(lat))^200  — effectively zero away from poles, ~1 at poles
     tau_lat = sin2 ** 200                  # (ny,)
 
-    # umax(j) = min(cu * dx * cos(lat) / dt,  u_max_phys)
-    # CFL-based limit scales with local cell width; physical cap prevents
-    # the limit from becoming useless at coarse resolution.
-    umax = jnp.minimum(cu * dx * cos_lat / dt, u_max_phys)   # (ny,)   [m/s]
+    # umax(j) = cu * dx * cos(lat) / dt  — gSAM damping.f90:76
+    umax = cu * dx * cos_lat / dt                          # (ny,)   [m/s]
 
     # Upper-level damping: tau = 1.0 where pres < p_upper  (gSAM dodamping_u)
     if pres is not None:
@@ -108,7 +100,7 @@ def pole_damping(
     cos_v_int = jnp.cos(lat_v_int)                    # (ny-1,)
     sin2_v    = 1.0 - cos_v_int ** 2
     tau_v_lat = sin2_v ** 200                          # (ny-1,)
-    umax_v_int = jnp.minimum(cu * dx * cos_v_int / dt, u_max_phys)   # (ny-1,)
+    umax_v_int = cu * dx * cos_v_int / dt              # (ny-1,)
 
     # Build full (ny+1,) tau and umax for V rows (poles → 1 and 0 respectively)
     tau_v_1d = jnp.concatenate([jnp.ones(1), tau_v_lat, jnp.ones(1)])    # (ny+1,)
@@ -123,13 +115,6 @@ def pole_damping(
     umax_v3 = umax_v[None, :, None]   # (1, ny+1, 1)
     V_clipped = jnp.clip(V, -umax_v3, umax_v3)        # (nz, ny+1, nx)
     V_new = (V + V_clipped * tau_v3) / (1.0 + tau_v3)  # (nz, ny+1, nx)
-
-    # Hard clip: safety valve for coarse grids where the implicit relaxation
-    # has tau ≈ 0 at mid-high latitudes (the CFL-based umax becomes useless
-    # at low resolution).  At 0.25° native resolution, winds never reach
-    # u_max_phys so this has no effect.
-    U_new = jnp.clip(U_new, -u_max_phys, u_max_phys)
-    V_new = jnp.clip(V_new, -u_max_phys, u_max_phys)
 
     return U_new, V_new
 

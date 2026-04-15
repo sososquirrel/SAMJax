@@ -6,8 +6,8 @@
 #   2. Fortran driver reads inputs.bin → fortran_out.bin (gSAM formula)
 #   3. common/compare.py diffs them at 4 decimal places
 #
-# Note: u_max_phys=1e9 is passed to jsam so the physical cap never fires
-# — both sides implement the same pure gSAM CFL-based umax formula.
+# jsam now uses the pure gSAM CFL-based umax formula (no physical cap,
+# no post-damping hard clip) — matches gSAM damping.f90 exactly.
 
 set -euo pipefail
 

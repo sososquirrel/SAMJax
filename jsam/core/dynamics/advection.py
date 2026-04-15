@@ -451,7 +451,14 @@ def _mom_adv_tend(
     #        advecting v1 = 0.5*(v1(i) + v1(i-1)) at v-face j+1.
     v1_face_all = 0.5 * (v1 + jnp.roll(v1, +1, axis=-1))   # (nz, ny+1, nx)
     v_adv_U_n   = v1_face_all[:, 1:ny+1, :]                # (nz, ny, nx)
-    U_py = jnp.pad(U_c, ((0, 0), (1, 2), (0, 0)), mode='edge')   # (nz, ny+3, nx)
+    # U is a scalar-like field in y; gSAM boundaries.f90:103-104,114-115 uses a
+    # symmetric wall mirror:   u(:,0,:)=u(:,1,:);  u(:,-1,:)=u(:,2,:)  (low)
+    #                          u(:,ny+1,:)=u(:,ny,:); u(:,ny+2,:)=u(:,ny-1,:)
+    # For a (1,2) pad: low halo = U[0] (equivalent to edge), high halo rows
+    # are U[-1] and U[-2] respectively.
+    U_py = jnp.concatenate(
+        [U_c[:, :1, :], U_c, U_c[:, -1:, :], U_c[:, -2:-1, :]], axis=1,
+    )                                                                         # (nz, ny+3, nx)
     fy_n_U = _flux3(U_py[:, 0:ny, :],   U_py[:, 1:ny+1, :],
                     U_py[:, 2:ny+2, :], U_py[:, 3:ny+3, :], v_adv_U_n)
     fy_s_U = jnp.concatenate([jnp.zeros_like(fy_n_U[:, :1, :]),
@@ -494,7 +501,9 @@ def _mom_adv_tend(
     #        Advecting v1 = 0.5*(v1(j+1)+v1(j)) at mass row j.
     #        For prognostic V indices jp=0..ny-2 (v-face j_v=jp+1) the north
     #        face of V-CV is at mass row j_v, i.e., uses v1(j_v+1)+v1(j_v).
-    V_ext = jnp.concatenate([V, jnp.zeros_like(V[:, :1, :])], axis=1)  # (nz, ny+2, nx)
+    # V high halo: gSAM boundaries.f90:126-129 antisymmetric wall mirror:
+    #     v(:,ny+2,:) = -v(:,ny,:)    →   Python: halo = -V[:,ny-1,:]
+    V_ext = jnp.concatenate([V, -V[:, -2:-1, :]], axis=1)             # (nz, ny+2, nx)
     v1_V_n_a = v1[:, 1:ny,   :]       # v1(j_v)   for j_v=1..ny-1
     v1_V_n_b = v1[:, 2:ny+1, :]       # v1(j_v+1) for j_v=1..ny-1
     v_adv_V_n = 0.5 * (v1_V_n_a + v1_V_n_b)                  # (nz, ny-1, nx)
@@ -538,7 +547,10 @@ def _mom_adv_tend(
     v1_Wy_b = v1[1:nz,   :, :]
     v1_W    = 0.5 * (v1_Wy_a + v1_Wy_b)                     # (nz-1, ny+1, nx)
     v_adv_W_n = v1_W[:, 1:ny+1, :]                           # (nz-1, ny, nx)
-    W_py = jnp.pad(W_core, ((0, 0), (1, 2), (0, 0)), mode='edge')  # (nz-1, ny+3, nx)
+    # W uses the symmetric wall mirror (same as scalars).
+    W_py = jnp.concatenate(
+        [W_core[:, :1, :], W_core, W_core[:, -1:, :], W_core[:, -2:-1, :]], axis=1,
+    )                                                                         # (nz-1, ny+3, nx)
     fy_n_W = _flux3(W_py[:, 0:ny, :],   W_py[:, 1:ny+1, :],
                     W_py[:, 2:ny+2, :], W_py[:, 3:ny+3, :], v_adv_W_n)
     fy_s_W = jnp.concatenate([jnp.zeros_like(fy_n_W[:, :1, :]),

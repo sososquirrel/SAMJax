@@ -12,7 +12,7 @@ unset XLA_FLAGS
 
 PYTHON=/glade/u/home/sabramian/.conda/envs/jsam/bin/python
 SAMJAX=/glade/u/home/sabramian/SAMJax
-OUTDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500/snapshots
+OUTDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500_2/snapshots
 DEBUGDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug
 O3FILE=/glade/u/home/sabramian/gSAM1.8.7/GLOBAL_DATA/BIN_D/ozone_era5_monthly_201709-201709_GLOBAL.bin
 
@@ -30,8 +30,8 @@ echo "Host: $(hostname)"
 echo "GPUs: $(nvidia-smi -L 2>/dev/null || echo 'none')"
 
 $PYTHON -u scripts/run_irma.py \
-    --nsteps          500 \
-    --output-interval 500 \
+    --nsteps          50 \
+    --output-interval 50 \
     --out-dir         "$OUTDIR" \
     --casename        jsam_IRMA_debug500 \
     --rad             rrtmg \

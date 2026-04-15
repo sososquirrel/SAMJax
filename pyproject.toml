@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jsam"
+version = "0.1.0"
+description = "JAX port of gSAM — global System for Atmospheric Modeling"
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.4.25",
+    "jaxlib>=0.4.25",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "netCDF4>=1.6",
+    "xarray>=2024.1",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "equinox>=0.11",       # pytree-based nn/model structure
+    "optax>=0.2",          # for future ML components
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",   # parallel test execution
+    "pytest-benchmark>=4.0",
+]
+dev = ["ruff", "mypy"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jsam*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast analytical tests, no data needed",
+    "integration: short model runs",
+    "validation: compare against IRMA reference output",
+    "slow: marks tests as slow",
+]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100

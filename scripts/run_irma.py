@@ -124,6 +124,14 @@ def _parse_args():
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _build_zi(z: np.ndarray, dz: np.ndarray) -> np.ndarray:
+    """Reconstruct the nz+1 interface heights from cell centres + thicknesses."""
+    zi = np.empty(len(z) + 1)
+    zi[0]  = z[0] - 0.5 * dz[0]
+    zi[1:] = zi[0] + np.cumsum(dz)
+    return zi
+
+
 def _prescribed_rad_forcing(z: np.ndarray) -> np.ndarray:
     """
     Tropical prescribed radiative cooling profile (K/s).
@@ -164,7 +172,15 @@ def main():
     g = loader.grid
     z   = g["z"]
     dz  = g["dz"]
-    zi  = g["zi"]
+    zi_raw = g["zi"]
+    # gSAM 3D_atm NetCDF writes only nz=74 interface heights (the top face
+    # of each cell), so len(zi_raw) == len(z).  Reconstruct the full
+    # nz+1 interface array from z and dz; gSAM setgrid guarantees
+    # z[k] = 0.5*(zi[k]+zi[k+1]), so this recovers the original exactly.
+    if len(zi_raw) == len(z):
+        zi = _build_zi(z, dz)
+    else:
+        zi = zi_raw
     assert len(zi) == len(z) + 1, f"zi/z length mismatch: {len(zi)} vs {len(z)+1}"
     assert np.allclose(0.5*(zi[:-1]+zi[1:]), z, atol=1.0), "z is not the midpoint of zi — gSAM grd file drift"
 

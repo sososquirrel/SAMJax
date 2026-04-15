@@ -8,10 +8,12 @@
 !   1. compute_cfl   — gSAM SRC/kurant.f90 cell-Courant kernel:
 !                        cfll = sqrt((u*idx)^2 + (v*idy)^2 + (w*idz)^2)
 !                        idx = dt/(dx*cos_lat),  idy = dt/dy,  idz = dt/dz
-!   2. ab2_coefs     — variable-dt Adams-Bashforth(2) coefficients:
-!                        nstep == 0      → (1, 0)             ! Euler
-!                        else            → at = 1 + r/2,  bt = -r/2
-!                        with r = dt_curr / dt_prev
+!   2. ab2_coefs     — variable-dt Adams-Bashforth coefficients (now AB3,
+!                       matching gSAM SRC/abcoefs.f90 lines 15-30):
+!                         nstep == 0  → Euler  (1, 0, 0)
+!                         nstep == 1  → AB2    (at, bt, 0) bootstrap
+!                         nstep >= 2  → AB3    (at, bt, ct)
+!                       Output is (at, bt, ct) triples → length 3*nrec.
 !
 ! For (1) we read the staggered (U, V, W) arrays directly. The python harness
 ! takes max over the two adjacent faces on its side and dumps a (nz, ny, nx)
@@ -85,32 +87,42 @@ contains
   end subroutine run_cfl
 
   subroutine run_ab2()
+    ! gSAM SRC/abcoefs.f90 lines 15-30 — full AB3 state machine.
     integer :: nstep, nrec, k
-    real :: dt_curr, dt_prev, at, bt, r
+    real :: dt_curr, dt_prev, dt_pprev, at, bt, ct, alpha, beta
     real, allocatable :: out(:)
     integer :: u_in, u_out
 
     open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    ! Layout: int32 nrec; then nrec records of (int32 nstep, float32 dt_curr, float32 dt_prev)
+    ! Layout: int32 nrec; then nrec records of
+    !   (int32 nstep, float32 dt_curr, float32 dt_prev, float32 dt_pprev)
     read(u_in) nrec
-    allocate(out(2 * nrec))
+    allocate(out(3 * nrec))
     do k = 1, nrec
-      read(u_in) nstep, dt_curr, dt_prev
-      if (nstep == 0) then
-        at = 1.0;  bt = 0.0
-      else
-        r  = dt_curr / dt_prev
-        at = 1.0 + 0.5 * r
-        bt = -0.5 * r
+      read(u_in) nstep, dt_curr, dt_prev, dt_pprev
+      if (nstep == 0) then                       ! Euler bootstrap
+        at = 1.0;  bt = 0.0;  ct = 0.0
+      else if (nstep == 1) then                  ! AB2 bootstrap
+        alpha = dt_prev / dt_curr
+        at = (1.0 + 2.0*alpha) / (2.0*alpha)
+        bt = -1.0 / (2.0*alpha)
+        ct = 0.0
+      else                                        ! AB3 (gSAM abcoefs.f90:15-20)
+        alpha = dt_prev  / dt_curr
+        beta  = dt_pprev / dt_curr
+        ct    = (2.0 + 3.0*alpha) / (6.0*(alpha + beta)*beta)
+        bt    = -(1.0 + 2.0*(alpha + beta)*ct) / (2.0*alpha)
+        at    = 1.0 - bt - ct
       end if
-      out(2 * k - 1) = at
-      out(2 * k    ) = bt
+      out(3*k - 2) = at
+      out(3*k - 1) = bt
+      out(3*k    ) = ct
     end do
     close(u_in)
 
     open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
     write(u_out) 1_4
-    write(u_out) int(2 * nrec, 4)
+    write(u_out) int(3 * nrec, 4)
     write(u_out) out
     close(u_out)
   end subroutine run_ab2

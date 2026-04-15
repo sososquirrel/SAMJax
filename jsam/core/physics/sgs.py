@@ -497,8 +497,16 @@ def diffuse_momentum(
             * (V_xp[:, :, 1:] - V_xp[:, :, :-1]))                        # (nz,ny+1,nx+1)
     dVdt = -(fx_V[:, :, 1:] - fx_V[:, :, :-1])                           # (nz,ny+1,nx)
 
-    # y: second-difference of V in y (Neumann via double edge pad)
-    V_yp  = jnp.pad(V, ((0, 0), (1, 1), (0, 0)), mode='edge')             # (nz,ny+3,nx)
+    # y: second-difference of V in y.  gSAM boundaries.f90:101-129 applies an
+    # antisymmetric wall mirror to V at the polar walls:
+    #     v(:,0,:) = -v(:,2,:)  (low halo)     v(:,ny+2,:) = -v(:,ny,:)  (high halo)
+    # In Python V is (nz, ny+1, nx) with V[:,0,:] and V[:,ny,:] the pole walls,
+    # so the halo-low row = -V[:,1,:] and halo-high row = -V[:,ny-1,:].
+    # Scalars (tk_at_V) use the symmetric mirror, which for a 1-row halo is
+    # identical to mode='edge'.
+    V_yp = jnp.concatenate(
+        [-V[:, 1:2, :], V, -V[:, -2:-1, :]], axis=1,
+    )                                                                      # (nz,ny+3,nx)
     tkV_yp = jnp.pad(tk_at_V, ((0, 0), (1, 1), (0, 0)), mode='edge')     # (nz,ny+3,nx)
     fy_V = (-rdy2 * 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])
             * (V_yp[:, 1:, :] - V_yp[:, :-1, :]))                        # (nz,ny+2,nx)
@@ -618,7 +626,10 @@ def diffuse_momentum_horiz(
             * (V_xp[:, :, 1:] - V_xp[:, :, :-1]))
     dVdt = -(fx_V[:, :, 1:] - fx_V[:, :, :-1])
 
-    V_yp  = jnp.pad(V, ((0, 0), (1, 1), (0, 0)), mode='edge')
+    # Antisymmetric wall mirror for V (gSAM boundaries.f90:101-129).
+    V_yp = jnp.concatenate(
+        [-V[:, 1:2, :], V, -V[:, -2:-1, :]], axis=1,
+    )
     tkV_yp = jnp.pad(tk_at_V, ((0, 0), (1, 1), (0, 0)), mode='edge')
     fy_V = (-rdy2 * 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])
             * (V_yp[:, 1:, :] - V_yp[:, :-1, :]))
@@ -784,7 +795,12 @@ def diffuse_damping_mom_z(
     b_u = 1.0 + dt * tau_vel_u - a_u - c_u
     d_u = U + dt * tau_vel_u * vel0_u
 
-    # Surface flux BC at k=0
+    # Surface flux BC at k = k_terrau(i,j).  jsam is flat-only so
+    # k_terrau ≡ 0 everywhere, matching gSAM diffuse_damping_mom_z.f90:121-138
+    # for the flat-terrain limit:
+    #     d(i,j,k_terrau) += dtn*rhow(k)/(dz*adz(k)*rho(k))*fluxbu(i,j)
+    # In jsam the metric dz[0] already equals dz_ref*adz(0), so the flux
+    # coefficient is rhow[0] / (rho[0] * dz[0]).
     if fluxbu is not None:
         d_u = d_u.at[0].add(dt * rhow[0] / (rho[0] * dz[0]) * fluxbu)
 
@@ -829,6 +845,8 @@ def diffuse_damping_mom_z(
     b_v = 1.0 + dt * tau_vel_v - a_v - c_v
     d_v = V + dt * tau_vel_v * vel0_v
 
+    # Surface flux BC at k = k_terrav(i,j) ≡ 0 for flat-only jsam.
+    # Matches gSAM diffuse_damping_mom_z.f90:243-260 in the flat limit.
     if fluxbv is not None:
         d_v = d_v.at[0].add(dt * rhow[0] / (rho[0] * dz[0]) * fluxbv)
 

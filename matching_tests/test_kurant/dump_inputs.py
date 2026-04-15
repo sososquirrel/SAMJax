@@ -29,7 +29,7 @@ from common.bin_io import write_bin  # noqa: E402
 # Re-use the existing python test's helpers verbatim.
 from tests.unit.test_kurant import _mock_metric, _zero_velocity  # noqa: E402
 from jsam.core.dynamics.kurant import compute_cfl                # noqa: E402
-from jsam.core.dynamics.timestepping import ab2_coefs            # noqa: E402
+from jsam.core.dynamics.timestepping import ab_coefs             # noqa: E402
 
 
 def _mass_centred(U, V, W):
@@ -121,23 +121,33 @@ def main() -> int:
         return 0
 
     if mode == "ab2_coefs":
-        # Cover every (nstep, dt_curr, dt_prev) the python test asserts on.
+        # Records: (nstep, dt_curr, dt_prev, dt_pprev). Covers Euler,
+        # AB2 bootstrap, AB3 steady state (constant + variable dt).
         cases = [
-            (1, 10.0, 10.0),    # constant dt → (1.5, -0.5)
-            (5, 10.0, 10.0),
-            (0, 10.0, 10.0),    # Euler
-            (0, 3.0, 10.0),     # Euler regardless of dt
-            (1, 5.0, 10.0),     # r=0.5  → (1.25, -0.25)
-            (1, 20.0, 10.0),    # r=2.0  → (2.0, -1.0)
+            # nstep=0 → Euler
+            (0, 10.0, 10.0, 10.0),
+            (0,  3.0, 10.0,  7.0),
+            # nstep=1 → AB2 bootstrap
+            (1, 10.0, 10.0, 10.0),    # constant dt → (1.5, -0.5, 0)
+            (1,  5.0, 10.0, 10.0),    # alpha=2     → (1.25, -0.25, 0)
+            (1, 20.0, 10.0, 10.0),    # alpha=0.5   → (2.0, -1.0, 0)
+            # nstep>=2 → AB3
+            (2, 10.0, 10.0, 10.0),    # constant dt → (23/12, -16/12, 5/12)
+            (3, 10.0, 10.0, 10.0),
+            (5, 10.0, 10.0, 10.0),
+            # variable-dt AB3
+            (4, 10.0,  8.0,  6.0),
+            (6,  4.0,  5.0,  6.0),
+            (7,  9.0,  3.0,  2.0),
         ]
         with open(workdir / "inputs.bin", "wb") as f:
             f.write(struct.pack("i", len(cases)))
-            for nstep, dc, dp in cases:
-                f.write(struct.pack("iff", nstep, float(dc), float(dp)))
+            for nstep, dc, dp, dpp in cases:
+                f.write(struct.pack("ifff", nstep, float(dc), float(dp), float(dpp)))
         out = []
-        for nstep, dc, dp in cases:
-            at, bt = ab2_coefs(nstep=nstep, dt_curr=dc, dt_prev=dp)
-            out.extend([float(at), float(bt)])
+        for nstep, dc, dp, dpp in cases:
+            at, bt, ct = ab_coefs(nstep=nstep, dt_curr=dc, dt_prev=dp, dt_pprev=dpp)
+            out.extend([float(at), float(bt), float(ct)])
         write_bin(workdir / "jsam_out.bin", np.array(out, dtype=np.float32))
         return 0
 

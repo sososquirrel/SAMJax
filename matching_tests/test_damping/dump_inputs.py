@@ -3,9 +3,9 @@ Dump inputs and jsam outputs for test_damping matching tests.
 
 Cases covered:
   pole_u.polar_face_halved   — ny=12, nz=4, nx=16, lat=linspace(-85,85,12),
-                               U uniform, no u_max_phys trigger
+                               U uniform
   pole_u.equatorial_no_damp  — near-equator grid (±5°), U unchanged
-  pole_u.high_lat_clip       — 85°, U > umax_cfl but < u_max_phys
+  pole_u.high_lat_clip       — 85°, U > umax_cfl
   pole_v.polar_face_halved   — same grid, V[:,0,:] and V[:,ny,:] halved
 
 Called from run.sh:
@@ -54,23 +54,20 @@ def _write_inputs_v(nz, ny, nx, V, lat_rad, dx, dt, cu):
 
 def _jsam_pole_u(U, V, lat_rad, dx, dt, cu):
     """Run jsam pole_damping and return U_new only (no u_max_phys trigger)."""
-    # Pass u_max_phys=1e9 so the physical cap never activates
     U_new, _ = pole_damping(
         U, V, jnp.array(lat_rad, dtype=jnp.float32),
         dx=float(dx), dy=jnp.ones(len(lat_rad)) * 1e5,
         dt=float(dt), cu=float(cu),
-        u_max_phys=1e9,
     )
     return np.asarray(U_new, dtype=np.float32)
 
 
 def _jsam_pole_v(U, V, lat_rad, dx, dt, cu):
-    """Run jsam pole_damping and return V_new only (no u_max_phys trigger)."""
+    """Run jsam pole_damping and return V_new only."""
     _, V_new = pole_damping(
         U, V, jnp.array(lat_rad, dtype=jnp.float32),
         dx=float(dx), dy=jnp.ones(len(lat_rad)) * 1e5,
         dt=float(dt), cu=float(cu),
-        u_max_phys=1e9,
     )
     return np.asarray(V_new, dtype=np.float32)
 
