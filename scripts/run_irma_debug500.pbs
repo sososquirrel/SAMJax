@@ -12,7 +12,8 @@ unset XLA_FLAGS
 
 PYTHON=/glade/u/home/sabramian/.conda/envs/jsam/bin/python
 SAMJAX=/glade/u/home/sabramian/SAMJax
-OUTDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500_2/snapshots
+# Use unique output directory per job to avoid concurrent file write conflicts
+OUTDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500_$(date +%s)/snapshots
 DEBUGDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug
 O3FILE=/glade/u/home/sabramian/gSAM1.8.7/GLOBAL_DATA/BIN_D/ozone_era5_monthly_201709-201709_GLOBAL.bin
 
@@ -20,9 +21,8 @@ mkdir -p "$OUTDIR" "$DEBUGDIR"
 cd "$SAMJAX"
 
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export JAX_COMPILATION_CACHE_DIR=/glade/work/sabramian/jax_cache
-export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
-export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1
+# Fresh compile cache using temp directory - avoid persistent cache
+export JAX_COMPILATION_CACHE_DIR=/tmp/jax_$$_$(date +%s%N)
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 echo "=== jsam IRMA debug500 (Casper A100): $(date) ==="

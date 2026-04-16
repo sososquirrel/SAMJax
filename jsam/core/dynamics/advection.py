@@ -40,17 +40,21 @@ def _adv_cn(cn_left: jax.Array, cn_right: jax.Array) -> jax.Array:
     )
 
 
-@jax.jit
-def advect_scalar(
+@jax.jit(static_argnums=(6,))
+def _advect_scalar_jit(
     phi:    jax.Array,
     U:      jax.Array,
     V:      jax.Array,
     W:      jax.Array,
     metric: dict,
     dt:     float,
-    nstep:  int = 0,
+    macho_order: int = 0,
 ) -> jax.Array:
-    """One timestep of 5th-order MACHO scalar advection with Zalesak FCT."""
+    """Core scalar advection logic with static macho_order parameter.
+
+    The macho_order parameter (index 6) is declared as static via jax.jit,
+    so Python conditionals work correctly despite being in a traced function.
+    """
     nz, ny, _ = phi.shape
 
     dx    = metric["dx_lon"]
@@ -121,10 +125,10 @@ def advect_scalar(
         return fadv_in + _adv_cn(cw_b, cw_t) * (fz_b_in - fz_t_in), fz_b_in
 
     fadv = phi
-    macho_order = (nstep - 1) % 6
 
     # Execute the 6 MACHO orderings.
     # Each ordering: dir1 (face+update), dir2 (face+update), dir3 (face only).
+    # Use Python conditionals since macho_order is now a static int (not traced)
     if macho_order == 0:    # z → x → y
         fz_t = _face_z(fadv);         fadv, fz_b = _adv_update_z(fadv, fz_t)
         fx   = _face_x(fadv);         fadv, fx_e = _adv_update_x(fadv, fx)
@@ -258,6 +262,24 @@ def advect_scalar(
 
     return jnp.maximum(0.0, f_up
         + (afx_w - afx_e) - (afy_n - afy_s) - (afz_t - afz_b))
+
+
+def advect_scalar(
+    phi:    jax.Array,
+    U:      jax.Array,
+    V:      jax.Array,
+    W:      jax.Array,
+    metric: dict,
+    dt:     float,
+    nstep:  int = 0,
+) -> jax.Array:
+    """One timestep of 5th-order MACHO scalar advection with Zalesak FCT.
+
+    Wrapper that computes macho_order from nstep (statically) and dispatches
+    to the JIT-compiled kernel.
+    """
+    macho_order = (nstep - 1) % 6
+    return _advect_scalar_jit(phi, U, V, W, metric, dt, macho_order)
 
 
 def _flux3(

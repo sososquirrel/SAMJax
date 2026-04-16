@@ -196,22 +196,26 @@ def slm_proc(
     # gSAM's run_slm is called from SRC/surface.f90 with reference level
     # fields already interpolated to cell centres; jsam does the same at
     # the bulk flux path. Units: TABS[K], QV[kg/kg], U/V[m/s].
+    #
+    # U is staggered in x: (ny, nx+1) → interpolate to scalar grid (ny, nx)
+    # V is staggered in y: (ny+1, nx) → interpolate to scalar grid (ny, nx)
     # ------------------------------------------------------------------
-    ur = state.U[0]
-    vr = state.V[0]
     tr = state.TABS[0]
     qr = state.QV[0]
+
+    # Interpolate staggered velocities to scalar grid (matching Fortran surface.f90)
+    ur = 0.5 * (state.U[0, :, :-1] + state.U[0, :, 1:])  # interpolate U in x
+    vr = 0.5 * (state.V[0, :-1, :] + state.V[0, 1:, :])  # interpolate V in y
 
     z0_ref = jnp.asarray(metric["z"])[0]
     pref_pa = jnp.asarray(metric["pres"])[0]
     pref_mb = pref_pa / 100.0                      # → hPa/mbar
     rhosf = jnp.asarray(metric["rho"])[0]
-    # zr broadcast to (ny,nx). pressf ≡ pref for the bulk path (no
-    # separate surface pressure diagnostic in jsam today).
-    zr = jnp.broadcast_to(z0_ref, ur.shape)
-    pref = jnp.broadcast_to(pref_mb, ur.shape)
+    # zr, pref, pressf broadcast to (ny,nx) scalar grid
+    zr = jnp.broadcast_to(z0_ref, tr.shape)
+    pref = jnp.broadcast_to(pref_mb, tr.shape)
     pressf = pref
-    rhosf_2d = jnp.broadcast_to(rhosf, ur.shape)
+    rhosf_2d = jnp.broadcast_to(rhosf, tr.shape)
 
     tfriz = jnp.float32(params.tfriz)
     cp_water = jnp.float32(params.cp_water)

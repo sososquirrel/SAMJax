@@ -485,15 +485,24 @@ def diffuse_momentum(
     dzw_ = _dzw(dz)        # (nz+1,)
 
     # C8 fix: apply imu(j)^2 = 1/cos(lat)^2 metric to x-direction
+    # Match gSAM diffuse_mom3D.f90: use different metrics for each staggered grid
     cos_lat = metric.get("cos_lat", None)
+    cos_v_metric = metric.get("cos_v", None)
     rdx2_base = (1.0 / dx)**2
     if cos_lat is not None:
         imu2 = (1.0 / cos_lat[None, :, None]) ** 2   # (1, ny, 1)
     else:
         imu2 = 1.0
-    rdx2u = rdx2_base * imu2   # for U grid (ny rows)
-    rdx2v = rdx2_base * imu2   # for V grid (approximate; uses mass-row cos)
-    rdx2w = rdx2_base * imu2   # for W grid
+
+    # For V (ny+1 rows): use cos_v from metric (computed in build_metric),
+    # matching Fortran's use of imuv(j) for V grid (differ from imu for U/W)
+    if cos_v_metric is not None:
+        imuv2 = (1.0 / cos_v_metric[None, :, None]) ** 2     # (1, ny+1, 1)
+    else:
+        imuv2 = imu2  # fallback if cos_v not available
+    rdx2u = rdx2_base * imu2                         # for U grid (ny rows)
+    rdx2v = rdx2_base * imuv2                        # for V grid (ny+1 rows) — match Fortran imuv(j)
+    rdx2w = rdx2_base * imu2                         # for W grid (ny rows)
     rdy2  = 1.0 / dy_ref**2
 
     # Helper: interpolate cell-centre tk to U x-faces (periodic in x)
