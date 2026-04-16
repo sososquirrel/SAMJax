@@ -218,8 +218,14 @@ def step(
     forcing:        PhysicsForcing,
     dt_prev:        float | None = None,
     dt_pprev:       float | None = None,
+    dump_nstep:     int | None = None,
 ) -> tuple[ModelState, MomentumTendencies, Tendencies, PhysicsForcing]:
-    """Advance model one timestep. Operator-split following gSAM main.f90."""
+    """Advance model one timestep. Operator-split following gSAM main.f90.
+
+    dump_nstep: if not None, use this as the nstep value for all oracle stage
+        dumps in this call.  Pass the outer-loop step counter (i) to align
+        jsam's debug dump nstep with gSAM's outer-step nstep convention.
+    """
 
     p_prev_for_adamsb  = state.p_prev
     p_pprev_for_adamsb = state.p_pprev
@@ -236,7 +242,7 @@ def step(
         nstep=state.nstep + 1, time=state.time,
     )
 
-    _dump_nstep = int(state.nstep)
+    _dump_nstep = dump_nstep if dump_nstep is not None else int(state.nstep)
     _stage_dump(state, 0, dt, force_nstep=_dump_nstep)
 
     if forcing.ls_forcing is not None:
@@ -562,12 +568,14 @@ def step(
     _stage_dump(state, 13, dt, force_nstep=_dump_nstep)
 
     _TABS_before_adv = state.TABS
+    _omp_f11 = None
+    _qp_f11 = None
     if config.micro_params is not None:
         _gamaz_3d_f11 = metric["gamaz"][:, None, None]
         _a_pr_f11 = 1.0 / (config.micro_params.tprmax - config.micro_params.tprmin)
-        _omp_f11  = jnp.clip((state.TABS - config.micro_params.tprmin) * _a_pr_f11, 0.0, 1.0)
+        _omp_f11  = jnp.clip((_TABS_before_adv - config.micro_params.tprmin) * _a_pr_f11, 0.0, 1.0)
         _qp_f11   = state.QR + state.QS + state.QG
-        _t_static = (state.TABS + _gamaz_3d_f11
+        _t_static = (_TABS_before_adv + _gamaz_3d_f11
                      - FAC_COND * (state.QC + _qp_f11 * _omp_f11)
                      - FAC_SUB  * (state.QI + _qp_f11 * (1.0 - _omp_f11)))
         state = ModelState(
@@ -583,6 +591,21 @@ def step(
         dt_prev=dt_prev, dt_pprev=dt_pprev,
         U_old=_U_old, V_old=_V_old, W_old=_W_old,
     )
+
+    # F11 mode: convert advected static energy back to absolute temperature
+    if config.micro_params is not None and _omp_f11 is not None:
+        _gamaz_3d_f11 = metric["gamaz"][:, None, None]
+        _TABS_phys = (state.TABS - _gamaz_3d_f11
+                      + FAC_COND * (state.QC + _qp_f11 * _omp_f11)
+                      + FAC_SUB  * (state.QI + _qp_f11 * (1.0 - _omp_f11)))
+        state = ModelState(
+            U=state.U, V=state.V, W=state.W,
+            TABS=_TABS_phys, QV=state.QV, QC=state.QC,
+            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+            nstep=state.nstep, time=state.time,
+        )
+
     jax.debug.print(
         "  DIAG [{n:>3}] H_advsc   W=[{wn:.3f},{wx:.3f}] T=[{tn:.2f},{tx:.2f}]",
         n=state.nstep, wn=jnp.min(state.W), wx=jnp.max(state.W),

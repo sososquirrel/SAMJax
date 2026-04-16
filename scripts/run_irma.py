@@ -540,6 +540,7 @@ def main():
                 metric, grid, dtn_j, config, forcing,
                 dt_prev=dt_prev_arg,
                 dt_pprev=dt_pprev_arg,
+                dump_nstep=i,   # align debug dump nstep with gSAM outer-step convention
             )
 
             # Rotate AB3 tendency buffers: nm2 ← nm1, nm1 ← n
