@@ -60,8 +60,6 @@ def coriolis_tend(
     q_row = _q(U_left) + _q(U_right)
     q_n = q_row[:, 1:ny,     :]
     q_s = q_row[:, 0:ny - 1, :]
-    q_s = q_s.at[:, 0, :].set(q_n[:, 0, :])
-    q_n = q_n.at[:, -1, :].set(q_s[:, -1, :])
 
     imuv_int = imuv[None, 1:ny, None]
     dV_int = -0.25 * imuv_int * (q_n + q_s)
