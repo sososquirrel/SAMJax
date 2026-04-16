@@ -53,9 +53,19 @@ def _jsam_stagger(nz, ny, nx, U_mass, V_mass, W_mass):
     import jax.numpy as jnp
 
     # This is what jsam does in state.py:114-116
-    U_stag = jnp.zeros((nz, ny, nx + 1)).at[:, :, :-1].set(jnp.asarray(U_mass))
-    V_stag = jnp.zeros((nz, ny + 1, nx)).at[:, :-1, :].set(jnp.asarray(V_mass))
-    W_stag = jnp.zeros((nz + 1, ny, nx)).at[:-1, :, :].set(jnp.asarray(W_mass))
+    U_stag = (jnp.zeros((nz, ny, nx + 1))
+              .at[:, :, :-1].set(jnp.asarray(U_mass))
+              .at[:, :, -1].set(jnp.asarray(U_mass[:, :, 0])))
+    # V interior faces: V_stag[:, j, :] = 0.5*(V_mass[:,j-1,:] + V_mass[:,j,:])
+    # V[:,0,:]=0 (south wall) and V[:,ny,:]=0 (north wall) from zeros init
+    V_m = jnp.asarray(V_mass)
+    V_stag = (jnp.zeros((nz, ny + 1, nx))
+              .at[:, 1:-1, :].set(0.5 * (V_m[:, :-1, :] + V_m[:, 1:, :])))
+    # W interior faces: W_stag[k,:,:] = 0.5*(W_mass[k-1,:,:] + W_mass[k,:,:])
+    # W[0,:,:]=0 (ground) and W[nz,:,:]=0 (rigid lid) from zeros init
+    W_m = jnp.asarray(W_mass)
+    W_stag = (jnp.zeros((nz + 1, ny, nx))
+              .at[1:-1, :, :].set(0.5 * (W_m[:-1, :, :] + W_m[1:, :, :])))
 
     return (np.asarray(U_stag, dtype=np.float32),
             np.asarray(V_stag, dtype=np.float32),

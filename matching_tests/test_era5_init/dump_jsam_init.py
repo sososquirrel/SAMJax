@@ -4,8 +4,9 @@ Run jsam ERA5 initialization and dump the IRMA sub-region tensors.
 Writes one binary per field to work/jsam_{field}.bin using the
 common bin_io wire format.
 
-This reproduces the same init pipeline as run_irma.py but only
-runs the initialization (no time stepping).
+This reproduces the same init pipeline as run_irma_debug500.pbs:
+    --float32 --no-polar-filter --sponge-tau 0 --slm --rad rrtmg
+    --nsteps 500 --nrad 90 --co2 400.0
 
 Usage
 -----
@@ -33,15 +34,29 @@ IRMA_LAT_MAX = 35.0
 IRMA_LON_MIN = 260.0
 IRMA_LON_MAX = 340.0
 
+# Paths matching run_irma_debug500.pbs
+SLM_DATA_ROOT = "/glade/u/home/sabramian/gSAM1.8.7/GLOBAL_DATA/BIN_D"
+
 FIELDS = ["U", "V", "W", "TABS", "QC", "QV", "QI"]
+START_TIME = datetime(2017, 9, 5, 0)
+
+
+def _build_zi(z, dz):
+    zi = np.empty(len(z) + 1)
+    zi[0]  = z[0] - 0.5 * dz[0]
+    zi[1:] = zi[0] + np.cumsum(dz)
+    return zi
 
 
 def main() -> int:
     import jax
+    import jax.numpy as jnp
+    # float32 — matches --float32 in run_irma_debug500.pbs
     jax.config.update("jax_enable_x64", False)
 
     from jsam.utils.IRMALoader import IRMALoader
     from jsam.io.era5 import era5_init
+    from jsam.core.state import ModelState
 
     workdir = HERE / "work"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -52,31 +67,50 @@ def main() -> int:
     lat = np.asarray(g["lat"])      # (720,)
     lon = np.asarray(g["lon"])      # (1440,)
     z   = np.asarray(g["z"])        # (74,)
-    zi  = np.asarray(g["zi"])       # (74,) — gSAM convention (bottom interface)
+    dz  = np.asarray(g["dz"])
+    zi_raw = np.asarray(g["zi"])
 
-    # Build zi with nz+1 entries if needed (jsam expects nz+1 interfaces)
-    if zi.shape[0] == z.shape[0]:
-        # zi from gSAM netCDF has nz entries (bottom interfaces); add top
-        dz = np.asarray(g["dz"])
-        zi_full = np.zeros(len(z) + 1)
-        zi_full[0] = 0.0
-        for k in range(len(z)):
-            zi_full[k + 1] = zi_full[k] + dz[k]
-        zi = zi_full
+    # Reconstruct nz+1 interface heights (same logic as run_irma.py:_build_zi)
+    if len(zi_raw) == len(z):
+        zi = _build_zi(z, dz)
+    else:
+        zi = zi_raw
+    assert len(zi) == len(z) + 1
 
     print(f"[dump_jsam_init] Grid: lat={lat.shape} lon={lon.shape} "
           f"z={z.shape} zi={zi.shape}")
     print(f"[dump_jsam_init] Running era5_init for 2017-09-05 00UTC ...")
 
-    # ── Run ERA5 init (same settings as run_irma_debug500.pbs) ──
+    # ── Run ERA5 init — matches run_irma_debug500.pbs flags ──
+    # --no-polar-filter  → polar_filter=False
+    # --float32          → float64 init then downcast (era5_init always float64)
     out = era5_init(
         lat=lat, lon=lon, z=z, zi=zi,
-        dt=datetime(2017, 9, 5, 0),
-        polar_filter=False,  # --no-polar-filter in PBS script
+        dt=START_TIME,
+        polar_filter=False,
     )
     state = out["state"]
     grid  = out["grid"]
+    metric = out["metric"]
 
+    # Downcast to float32, matching run_irma.py --float32 logic
+    state = ModelState(
+        U    =state.U.astype(jnp.float32),
+        V    =state.V.astype(jnp.float32),
+        W    =state.W.astype(jnp.float32),
+        TABS =state.TABS.astype(jnp.float32),
+        QV   =state.QV.astype(jnp.float32),
+        QC   =state.QC.astype(jnp.float32),
+        QI   =state.QI.astype(jnp.float32),
+        QR   =state.QR.astype(jnp.float32),
+        QS   =state.QS.astype(jnp.float32),
+        QG   =state.QG.astype(jnp.float32),
+        TKE  =state.TKE.astype(jnp.float32),
+        p_prev =state.p_prev.astype(jnp.float32),
+        p_pprev=state.p_pprev.astype(jnp.float32),
+        nstep=state.nstep,
+        time =state.time,
+    )
     print(f"[dump_jsam_init] Init done. Extracting IRMA sub-region ...")
 
     # ── IRMA box indices (0-based) ──

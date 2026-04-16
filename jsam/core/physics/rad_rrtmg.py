@@ -1,37 +1,6 @@
-"""
-RRTMG radiation for jsam (LW + SW) — batched-column wrappers around the
-f2py-built gSAM RRTMG_LW and RRTMG_SW extension modules.
-
-Build artefacts expected at:
-  /glade/work/sabramian/jsam_rrtmg_build/     (LW — jsam_rrtmg_lw.*.so)
-  /glade/work/sabramian/jsam_rrtmg_sw_build/  (SW — jsam_rrtmg_sw.*.so)
-
-Design
-------
-RRTMG is column-independent, so we vectorize naively: flatten
-(ny, nx) into a single ``ncol`` axis, call the Fortran wrapper once
-per radiation step with a (ncol, nlay) batch, then reshape back to
-(nz, ny, nx). JAX integration is via :func:`jax.pure_callback`.
-
-Clouds use RRTMG's default cloud optics (``inflg[lw/sw]=2, iceflg=3,
-liqflg=1``) with LWP/IWP and effective radii computed per layer
-from ``state.QC`` / ``state.QI``. Liquid Re is 14 um over open ocean
-(CAM default). Ice Re comes from the CAM hexagonal-column retab
-lookup table (180-274 K).
-
-Surface temperature is per column (``ny, nx``). Ozone is read from
-the gSAM o3file (or falls back to an analytic Gaussian profile).
-
-Shortwave
----------
-The SW driver mirrors the LW path: it calls ``rrtmg_sw_nomcica`` from
-the f2py extension, uses the gSAM CAM-style ocean/land albedo
-parameterization from ``albedo(..)`` (cam_rad_parameterizations.f90),
-and derives the solar zenith angle per column from the f2py-exported
-``shr_orb_params`` / ``shr_orb_decl`` / ``shr_orb_cosz`` (same code
-path as gSAM rad.f90 line 804).  The ``doseasons=.true.`` branch is
-used: ``dayForSW = day0 + nstep*dt/86400``.
-"""
+"""RRTMG (LW+SW) batched-column wrappers around f2py-built gSAM modules.
+Flattens (ny,nx) to ncol, calls Fortran, reshapes back. Clouds use QC/QI;
+ozone from file or analytic fallback. Returns heating rates + fluxes."""
 from __future__ import annotations
 
 import struct
@@ -46,11 +15,7 @@ import numpy as np
 from jsam.core.state import ModelState
 
 
-# ---------------------------------------------------------------------------
-# Locate the f2py-built extensions
-#   LW: /glade/work/sabramian/jsam_rrtmg_build/jsam_rrtmg_lw.*.so
-#   SW: /glade/work/sabramian/jsam_rrtmg_sw_build/jsam_rrtmg_sw.*.so
-# ---------------------------------------------------------------------------
+# Load f2py-built extensions
 
 _RRTMG_LW_BUILD_DIR = "/glade/work/sabramian/jsam_rrtmg_build"
 _RRTMG_SW_BUILD_DIR = "/glade/work/sabramian/jsam_rrtmg_sw_build"
@@ -129,30 +94,7 @@ def _solar_zenith_cos(day_of_year: float,
                       lat_rad:     np.ndarray,
                       lon_rad:     np.ndarray,
                       iyear:       int) -> tuple[np.ndarray, float]:
-    """
-    Compute per-column ``cos(solar zenith)`` and the Earth-Sun eccentricity
-    factor at fractional calendar day ``day_of_year`` (UT).
-
-    Matches gSAM rad.f90 lines 804-807:
-        call shr_orb_decl(dayForSW, eccen, mvelpp, lambm0, obliqr, delta, eccf)
-        cosz = zenith(dayForSW, lat_rad, lon_rad)  ! = shr_orb_cosz(...)
-
-    Parameters
-    ----------
-    day_of_year : fractional calendar day (1.xx ... 365.xx), UT.  gSAM uses
-                  ``day = day0 + nstep*dt/86400`` with the ``doseasons=.true.``
-                  branch.
-    lat_rad     : (ny,)  mass-cell latitudes in radians
-    lon_rad     : (nx,)  mass-cell longitudes in radians
-    iyear       : calendar year for orbital parameter lookup
-
-    Returns
-    -------
-    coszen : (ny*nx,) cosine of solar zenith angle at each column, raveled
-             in (j, i) C-order to match the flatten used elsewhere.
-    eccf   : Earth-Sun distance factor (1/r^2).  Used to scale the solar
-             constant (gSAM passes adjes=eccf, scon=1367 to rrtmg_sw).
-    """
+    """Compute cos(zenith) and Earth-Sun distance factor; day_of_year is fractional UT day."""
     eccen, obliqr, lambm0, mvelpp = _get_orbit_params(int(iyear))
     sw = _ensure_sw_initialized(_CP_DAIR_DEFAULT)
     delta, eccf = sw.shr_orb_mod.shr_orb_decl(
@@ -169,39 +111,18 @@ def _solar_zenith_cos(day_of_year: float,
     return coszen.astype(np.float64), float(eccf)
 
 
-def _cam_ocean_albedo(
-    coszen: np.ndarray,    # (ncol,)
-    ts:     np.ndarray,    # (ncol,) K, surface temperature
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Port of gSAM ``albedo(ocean=.true., ...)`` from cam_rad_parameterizations.f90
-    lines 218-240.
-
-    Ice-free ocean direct albedo as a function of solar zenith angle:
-        aldir = 0.026 / (coszen^1.7 + 0.065)
-              + 0.15*(coszen-0.1)*(coszen-0.5)*(coszen-1.0)
-        asdir = aldir
-        aldif = asdif = adif = 0.07  (Briegleb / RCEMIP value)
-
-    Where ``coszen <= 0`` (sun below horizon) all four are set to 0.
-    Where ``ts < 271 K`` (sea-ice proxy) fixed values 0.45/0.75 are used.
-
-    Returns (asdir, asdif, aldir, aldif), each shape (ncol,).
-    """
+def _cam_ocean_albedo(coszen: np.ndarray, ts: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute ocean albedos (asdir, asdif, aldir, aldif) from coszen and surface temp."""
     cz = np.asarray(coszen, dtype=np.float64)
     ts = np.asarray(ts,     dtype=np.float64)
     ADIF = 0.06   # Taylor (1996); matches gSAM cam_rad_parameterizations.f90:130
 
-    # Default: all zero (night).
     asdir = np.zeros_like(cz)
     asdif = np.zeros_like(cz)
     aldir = np.zeros_like(cz)
     aldif = np.zeros_like(cz)
 
-    # Daylit columns
     day = cz > 0.0
-
-    # Ice-free ocean (ts > 271)
     icefree = day & (ts > 271.0)
     cz_if = np.clip(cz, 1e-6, 1.0)
     ald = (0.026 / (cz_if ** 1.7 + 0.065)
@@ -211,7 +132,6 @@ def _cam_ocean_albedo(
     aldif = np.where(icefree, ADIF,  aldif)
     asdif = np.where(icefree, ADIF,  asdif)
 
-    # Sea-ice proxy (day, ts <= 271)
     seaice = day & (ts <= 271.0)
     aldir = np.where(seaice, 0.45, aldir)
     asdir = np.where(seaice, 0.75, asdir)
@@ -230,17 +150,10 @@ _CP_DAIR_DEFAULT = 1004.64
 
 @dataclass(frozen=True)
 class RadRRTMGConfig:
-    """
-    Static (non-JAX) configuration for the RRTMG_LW driver.
-
-    Trace gas VMRs are uniform in space/time for now. Clouds use
-    RRTMG's built-in parameterization (``inflglw=2``) with per-column
-    LWP/IWP and effective radii derived from QC/QI.
-    """
-    cpdair:    float = 1004.64   # J/(kg·K)  matches gSAM consts.f90
-    emis:      float = 0.98      # band-independent surface emissivity (gSAM emis_water)
-    # gSAM IRMA CASES/IRMA/prm: nxco2=1., docurrentco2 default (.false.)
-    # → rad_full.f90:323  co2vmr = 3.670e-4 * nxco2 = 3.670e-4  (≡ 367 ppm)
+    """RRTMG config: cpdair, emissivity, trace gas VMRs (space/time-uniform)."""
+    cpdair:    float = 1004.64
+    emis:      float = 0.98
+    land_emis: float = 1.0
     co2_vmr:   float = 3.670e-4
     ch4_vmr:   float = 1.8e-6
     n2o_vmr:   float = 320e-9
@@ -284,18 +197,14 @@ _LIQ_RE_LAND_MAX = 14.0                      # µm, CAM land maximum
 
 
 def _liq_re_land(tlay: np.ndarray) -> np.ndarray:
-    """C10 fix: T-dependent liquid Re over land (gSAM cam_rad_parameterizations.f90:38-60).
-
-    Linear ramp from 14 um at T >= 263.16 K to 8 um at T <= 243.16 K.
-    Over ocean, Re is always 14 um (handled by the caller via landmask).
-    """
+    """T-dependent liquid Re over land: 14um at T>=263K, 8um at T<=243K; linear ramp."""
     t = np.asarray(tlay, dtype=np.float64)
     frac = np.clip((t - 243.16) / (263.16 - 243.16), 0.0, 1.0)
     return _LIQ_RE_LAND_MIN + frac * (_LIQ_RE_LAND_MAX - _LIQ_RE_LAND_MIN)
 
 
 def build_plev_hpa(metric: dict, p_surf_Pa: float = _P_SURF_DEFAULT) -> np.ndarray:
-    """Hydrostatic interface pressures (hPa), shape (nz+1,), sfc → TOA."""
+    """Interface pressures (hPa), shape (nz+1,), sfc → TOA."""
     rho = np.asarray(metric["rho"])
     dz  = np.asarray(metric["dz"])
     nz  = rho.shape[0]

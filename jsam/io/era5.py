@@ -777,9 +777,11 @@ def era5_init(
     """
     from jsam.core.dynamics.pressure import build_metric
 
+    from jsam.io.gsam_era5_init import era5_state_gsam
+
     grid   = era5_grid(lat, lon, z, zi, dt, rda_root)
     metric = build_metric(grid, polar_filter=polar_filter)
-    state  = era5_state(grid, metric, dt, rda_root)
+    state  = era5_state_gsam(grid, metric, dt, rda_root)
     sst    = era5_sst(grid, dt, rda_root)
 
     ls_forcing = None

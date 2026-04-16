@@ -200,13 +200,26 @@ class DebugDumper:
                      stage 14).
         """
         nz = self.nzm
+        # C-grid staggering: U(nz,ny,nx+1), V(nz,ny+1,nx), W(nz+1,ny,nx), scalars(nz,ny,nx)
+        # Slice to cell centers (nz, ny, nx) for all fields.
+        # Important: U and V have staggered x/y dimensions; must slice them BEFORE
+        # putting in the fields tuple to avoid shape mismatches in jnp.stack.
         U_full    = state.U[:nz, :, :-1]                # (nz, ny, nx)
         V_full    = state.V[:nz, :-1, :]                # (nz, ny, nx)
-        W_full    = state.W[:nz, :, :]                  # (nz, ny, nx)   (drop top half-level)
+        W_full    = state.W[:nz, :, :]                  # (nz, ny, nx)
         TABS_full = state.TABS
         QC_full   = state.QC
         QV_full   = state.QV
         QI_full   = state.QI
+
+        # Debug: check actual shapes before stacking
+        shapes = [U_full.shape, V_full.shape, W_full.shape, TABS_full.shape,
+                  QC_full.shape, QV_full.shape, QI_full.shape]
+        names = ["U_full", "V_full", "W_full", "TABS", "QC", "QV", "QI"]
+        if not all(s == shapes[0] for s in shapes):
+            raise ValueError(
+                f"Shape mismatch in debug dump: {list(zip(names, shapes))}"
+            )
 
         fields = (U_full, V_full, W_full, TABS_full, QC_full, QV_full, QI_full)
 
@@ -217,6 +230,7 @@ class DebugDumper:
         # Slice IRMA box on device, stack into (7, nz, nj, ni) for bit-compatible
         # memory order (i fastest, then j, then k, then field-slow — matches
         # Fortran (ni, nj, nzm, 7) in gSAM debug_dump.f90).
+        # All fields now have consistent shape (nz, ny, nx) after the slicing above.
         boxes = jnp.stack([
             F[:, self._j_lo:self._j_hi, self._i_lo:self._i_hi] for F in fields
         ])

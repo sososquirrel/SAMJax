@@ -1,36 +1,5 @@
-"""
-SAM 1-moment bulk microphysics for jsam.
-
-Port of gSAM MICRO_SAM1MOM (Khairoutdinov 2006) with simplifications for
-differentiable JAX use:
-  - Flat terrain (no k_terra)
-  - Default namelist values (doKKauto=False, dowarmcloud=False, donograupel=False)
-  - Saturation adjustment: 20-iteration Newton (jax.lax.scan, always runs)
-  - Precipitation processes: implicit Kessler autoconversion + accretion + evaporation
-  - Precipitation fall: upwind sedimentation (1 sub-step; add subcycling if CFL>1 needed)
-  - Cloud-ice sedimentation: Heymsfield (2003) vt + MC flux limiter (ice_fall.f90)
-
-Variable mapping (jsam ↔ gSAM SAM1MOM):
-  jsam                   gSAM
-  TABS                   tabs  (prognostic in jsam; diagnostic in gSAM)
-  QV + QC + QI   =   q   (total non-precipitating water)
-  QR + QS + QG   =   qp  (total precipitating water)
-  t = TABS + gamaz - fac_cond*(QC+QR) - fac_sub*(QI+QS+QG)   (static energy, conserved)
-
-Phase partitioning by temperature-dependent omega weights:
-  omn = clip((T-tbgmin)/(tbgmax-tbgmin), 0, 1)   QC = qn*omn, QI = qn*(1-omn)
-  omp = clip((T-tprmin)/(tprmax-tprmin), 0, 1)   QR = qp*omp
-  omg = clip((T-tgrmin)/(tgrmax-tgrmin), 0, 1)   QG = qp*(1-omp)*omg, QS = qp*(1-omp)*(1-omg)
-
-References
-----------
-  MICRO_SAM1MOM/cloud.f90      — saturation adjustment (Newton iteration)
-  MICRO_SAM1MOM/precip_proc.f90 — autoconversion, accretion, evaporation
-  MICRO_SAM1MOM/precip_fall.f90 — upwind sedimentation with anti-diffusion
-  MICRO_SAM1MOM/precip_init.f90 — accretion/evaporation coefficient tables
-  MICRO_SAM1MOM/micro_params.f90 — default constants
-  gSAM SRC/consts.f90           — physical constants
-"""
+"""1-moment bulk microphysics: saturation adjustment, precipitation processes (Kessler),
+upwind sedimentation with FCT limiter. Phase partition by T-dependent weights."""
 from __future__ import annotations
 
 import functools
@@ -44,92 +13,62 @@ from scipy.special import gamma as _scipy_gamma
 from jsam.core.state import ModelState
 
 
-# ---------------------------------------------------------------------------
-# Physical constants (matching gSAM SRC/consts.f90 — lsub is a literal
-# 2.834e6 (NOT LV+LF))
-# ---------------------------------------------------------------------------
-
-G_GRAV   = 9.79764      # m/s²      gravity
-CP       = 1004.64      # J/(kg K)  specific heat of dry air
-CPV      = 1870.0       # J/(kg K)  specific heat of water vapour
-CPW      = 3991.86795711963  # J/(kg K)  specific heat of seawater
-RV       = 461.5        # J/(kg K)  gas constant for water vapour
-RGAS     = 287.04       # J/(kg K)  gas constant for dry air
-EPS      = 0.622        # gSAM sat.f90 uses literal 0.622, not Rd/Rv
-
-LV       = 2.501e6      # J/kg      latent heat of vaporization (0°C)
-LF       = 0.337e6      # J/kg      latent heat of fusion
-LS       = 2.834e6      # J/kg      latent heat of sublimation (literal, NOT LV+LF)
-
-FAC_COND = LV / CP      # K / (kg/kg)
+# Constants (gSAM)
+G_GRAV   = 9.79764
+CP       = 1004.64
+CPV      = 1870.0
+CPW      = 3991.86795711963
+RV       = 461.5
+RGAS     = 287.04
+EPS      = 0.622
+LV       = 2.501e6
+LF       = 0.337e6
+LS       = 2.834e6
+FAC_COND = LV / CP
 FAC_FUS  = LF / CP
 FAC_SUB  = LS / CP
-
-THERCO   = 2.40e-2      # W/(m K)   thermal conductivity of air
-DIFFELQ  = 2.21e-5      # m²/s      water-vapour diffusivity
-MUELQ    = 1.717e-5     # kg/(m s)  dynamic viscosity of air
-
-RAD_EARTH  = 6371229.0    # m         radius of Earth
-SIGMA_SB   = 5.670373e-8  # W/(m² K⁴) Stefan-Boltzmann constant
-EMIS_WATER = 0.98         # -         emissivity of water
+THERCO   = 2.40e-2
+DIFFELQ  = 2.21e-5
+MUELQ    = 1.717e-5
+RAD_EARTH  = 6371229.0
+SIGMA_SB   = 5.670373e-8
+EMIS_WATER = 0.98
 PI         = float(np.pi)
 
 
-# ---------------------------------------------------------------------------
-# Default SAM1MOM parameters  (micro_params.f90 defaults)
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class MicroParams:
-    """Adjustable SAM1MOM parameters.  All values are gSAM defaults."""
-
-    # Temperature limits for phase partitioning
-    tbgmin: float = 253.16   # K  min T for cloud water (below → all ice)
-    tbgmax: float = 273.16   # K  max T for cloud ice   (above → all liquid)
-    tprmin: float = 268.16   # K  min T for rain        (below → all snow/graupel)
-    tprmax: float = 283.16   # K  max T for snow+graupel (above → all rain)
-    tgrmin: float = 223.16   # K  min T for graupel
-    tgrmax: float = 283.16   # K  max T for graupel     (above → no graupel)
-
-    # Autoconversion thresholds and rates
-    qcw0:     float = 1.0e-3   # kg/kg  threshold for cloud water autoconversion
-    qci0:     float = 1.0e-4   # kg/kg  threshold for cloud ice autoconversion
-    alphaelq: float = 1.0e-3   # s⁻¹   Kessler cloud-water autoconversion rate
-    betaelq:  float = 1.0e-3   # s⁻¹   cloud-ice autoconversion rate
-
-    # Hydrometeor densities
-    rhor: float = 1000.0   # kg/m³  liquid water
-    rhos: float = 100.0    # kg/m³  snow
-    rhog: float = 400.0    # kg/m³  graupel
-
-    # Marshall-Palmer intercept parameters (m⁻⁴)
+    """SAM1MOM parameters (gSAM defaults)."""
+    tbgmin: float = 253.16
+    tbgmax: float = 273.16
+    tprmin: float = 268.16
+    tprmax: float = 283.16
+    tgrmin: float = 223.16
+    tgrmax: float = 283.16
+    qcw0:     float = 1.0e-3
+    qci0:     float = 1.0e-4
+    alphaelq: float = 1.0e-3
+    betaelq:  float = 1.0e-3
+    rhor: float = 1000.0
+    rhos: float = 100.0
+    rhog: float = 400.0
     nzeror: float = 8.0e6
     nzeros: float = 3.0e6
     nzerog: float = 4.0e6
-
-    # Terminal-velocity coefficients  vt = a * (rho*q/(pi*rho_hyd*N0))^(b/4) * sqrt(1.29/rho)
-    a_rain: float = 842.0    # m^(1-b)/s
+    a_rain: float = 842.0
     b_rain: float = 0.8
     a_snow: float = 4.84
     b_snow: float = 0.25
     a_grau: float = 94.5
     b_grau: float = 0.5
-
-    # Collection efficiencies
-    erccoef: float = 1.0   # rain / cloud water
-    esccoef: float = 1.0   # snow / cloud water
-    esicoef: float = 0.1   # snow / cloud ice
-    egccoef: float = 1.0   # graupel / cloud water
-    egicoef: float = 0.1   # graupel / cloud ice
-
-    # Minimum precipitating water for evaporation
-    qp_threshold: float = 1.0e-12   # kg/kg
-
-    # Cloud-ice sedimentation (ice_fall.f90)
-    icefall_fudge: float = 1.0   # vt tuning factor; ~0.2 for 25-km grids
-    gamma_rave:    float = 1.0   # anvil sedimentation slowdown
-
-    # Options
+    erccoef: float = 1.0
+    esccoef: float = 1.0
+    esicoef: float = 0.1
+    egccoef: float = 1.0
+    egicoef: float = 0.1
+    qp_threshold: float = 1.0e-12
+    icefall_fudge: float = 1.0
+    gamma_rave:    float = 1.0
     donograupel: bool = False
     do_ice_fall: bool = True
 
@@ -153,47 +92,33 @@ def _gamma_coefs(p: MicroParams) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Saturation vapour pressure functions (Buck 1981, matching gSAM atmosphere.f90)
-# ---------------------------------------------------------------------------
-
 def _esatw(tabs: jax.Array) -> jax.Array:
-    """Saturation vapour pressure over liquid water (mb). Buck (1981)."""
+    """Saturation vapor pressure over water (mb, Buck 1981)."""
     return 6.1121 * jnp.exp(17.502 * (tabs - 273.16) / (tabs - 32.19))
 
-
 def _esati(tabs: jax.Array) -> jax.Array:
-    """Saturation vapour pressure over ice (mb). Buck (1981)."""
+    """Saturation vapor pressure over ice (mb, Buck 1981)."""
     return 6.1121 * jnp.exp(22.587 * (tabs - 273.16) / (tabs + 0.7))
 
-
 def qsatw(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """Saturation mixing ratio over liquid water (kg/kg).
-
-    Matches gSAM sat.f90: qsatw = 0.622 * es / max(es, p - es). The max(es, ...)
-    flips behavior when es > p - es (low pressure / upper troposphere) so qsatw
-    tends to 0.622 instead of diverging.
-    """
+    """Saturation mixing ratio over water (kg/kg)."""
     es = _esatw(tabs)
     return EPS * es / jnp.maximum(es, pres_mb - es)
 
-
 def qsati(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """Saturation mixing ratio over ice (kg/kg). Matches gSAM sat.f90."""
+    """Saturation mixing ratio over ice (kg/kg)."""
     es = _esati(tabs)
     return EPS * es / jnp.maximum(es, pres_mb - es)
 
-
 def _dtqsatw(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """d(qsatw)/d(tabs). Port of gSAM sat.f90:124-137."""
+    """d(qsatw)/d(tabs)."""
     es = _esatw(tabs)
     a1, T0, T1 = 17.502, 273.16, 32.19
     dtesatw = es * a1 * (T0 - T1) / (tabs - T1) ** 2
     return 0.622 * dtesatw / (pres_mb - es) * (1.0 + es / (pres_mb - es))
 
-
 def _dtqsati(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
-    """d(qsati)/d(tabs). Port of gSAM sat.f90:149-162."""
+    """d(qsati)/d(tabs)."""
     es = _esati(tabs)
     a1, T0, T1 = 22.587, 273.16, -0.7
     dtesati = es * a1 * (T0 - T1) / (tabs - T1) ** 2
@@ -205,35 +130,14 @@ def _dtqsati(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
 # ---------------------------------------------------------------------------
 
 @functools.partial(jax.jit, static_argnames=("params", "n_iter"))
-def satadj(
-    TABS: jax.Array,   # (nz, ny, nx)  K
-    QV:   jax.Array,   # (nz, ny, nx)  kg/kg
-    QC:   jax.Array,   # (nz, ny, nx)
-    QI:   jax.Array,   # (nz, ny, nx)
-    QR:   jax.Array,   # (nz, ny, nx)
-    QS:   jax.Array,   # (nz, ny, nx)
-    QG:   jax.Array,   # (nz, ny, nx)
-    metric: dict,
-    params: MicroParams,
-    n_iter: int = 20,
-) -> tuple:  # (TABS_new, QV_new, QC_new, QI_new)
-    """
-    Moist saturation adjustment.
-
-    Finds the temperature tabs1 and condensate qn that satisfy:
-        tabs1 = tabs_dry + lstarn * (q - qsat(tabs1)) + lstarp * qp
-    where tabs_dry = t - gamaz is the dry static-energy temperature.
-
-    Precip fields (QR, QS, QG) are not changed here — only the phase
-    partitioning of the non-precipitating water (QV, QC, QI) is adjusted.
-
-    The Newton iteration always runs (n_iter fixed steps) so the function is
-    JIT-compilable without data-dependent branching.
-    """
-    pres_mb  = metric["pres"][:, None, None] / 100.0   # Pa → mb, (nz,1,1)
-    # D21: gSAM uses full 3D pressure pp(i,j,k) for qsat; jsam uses 1D mean.
-    # When 3D p' is available, add: pres_mb = pres_mb + pp_3d / 100.0
-    gamaz_3d = metric["gamaz"][:, None, None]            # (nz,1,1) K
+def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
+           QR: jax.Array, QS: jax.Array, QG: jax.Array, metric: dict,
+           params: MicroParams, n_iter: int = 20,
+           tabs_dry_override: "jax.Array | None" = None,
+           tabs_guess: "jax.Array | None" = None) -> tuple:
+    """Newton-iteration saturation adjustment; returns (TABS_new, QV_new, QC_new, QI_new)."""
+    pres_mb  = metric["pres"][:, None, None] / 100.0
+    gamaz_3d = metric["gamaz"][:, None, None]
 
     a_bg = 1.0 / (params.tbgmax - params.tbgmin)
     b_bg = params.tbgmin * a_bg
@@ -241,30 +145,26 @@ def satadj(
     b_pr = params.tprmin * a_pr
     a_gr = 0.0 if params.donograupel else 1.0 / (params.tgrmax - params.tgrmin)
 
-    # Phase partition of existing precip (needed to compute t conserved variable)
-    omp0 = jnp.clip((TABS - params.tprmin) * a_pr, 0.0, 1.0)
-    qp_liq = (QR + QS + QG) * omp0       # liquid precip fraction
-    qp_ice = (QR + QS + QG) * (1.0 - omp0)
-
-    # Liquid-ice static energy temperature: tabs_dry = t - gamaz
-    #   t = TABS + gamaz - fac_cond*(QC + qp_liq) - fac_sub*(QI + qp_ice)
-    tabs_dry = TABS - FAC_COND * (QC + qp_liq) - FAC_SUB * (QI + qp_ice)
+    if tabs_dry_override is not None:
+        tabs_dry = tabs_dry_override
+    else:
+        omp0 = jnp.clip((TABS - params.tprmin) * a_pr, 0.0, 1.0)
+        qp_liq = (QR + QS + QG) * omp0
+        qp_ice = (QR + QS + QG) * (1.0 - omp0)
+        tabs_dry = TABS - FAC_COND * (QC + qp_liq) - FAC_SUB * (QI + qp_ice)
 
     q  = QV + QC + QI   # total non-precip water
     qp = QR + QS + QG   # total precip water
 
-    # Newton iteration: find tabs1 such that residual fff = 0
     def _newton(tabs1):
         om = jnp.clip(a_bg * tabs1 - b_bg, 0.0, 1.0)    # cloud liquid fraction
 
-        # Latent heat coefficient for non-precip condensate
         lstarn  = FAC_COND + (1.0 - om) * FAC_FUS
         dlstarn = jnp.where(
             (tabs1 > params.tbgmin) & (tabs1 < params.tbgmax),
             a_bg * FAC_FUS, 0.0,
         )
 
-        # Latent heat coefficient for precipitating water
         omp_ = jnp.clip(a_pr * tabs1 - b_pr, 0.0, 1.0)
         lstarp  = FAC_COND + (1.0 - omp_) * FAC_FUS
         dlstarp = jnp.where(
@@ -272,16 +172,12 @@ def satadj(
             a_pr * FAC_FUS, 0.0,
         )
 
-        # C12 fix: homogeneous freezing supersaturation (gSAM cloud.f90:48-52)
-        # At T<235K with negligible existing ice, ice nucleation requires
-        # supersaturation rh_homo = 2.583 - T/207.8 (IFS parameterization).
         rh_homo = jnp.where(
             (tabs1 < 235.0) & (QI < 1.0e-8),
             2.583 - tabs1 / 207.8,
             1.0,
         )
 
-        # Mixed-phase saturation mixing ratio (with rh_homo on ice component)
         qsati_homo = qsati(tabs1, pres_mb) * rh_homo
         qsat = jnp.where(
             tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
@@ -290,8 +186,6 @@ def satadj(
                 om * qsatw(tabs1, pres_mb) + (1.0 - om) * qsati_homo,
             ),
         )
-        # Derivative: d(qsati*rh_homo)/dT = dqsati/dT * rh_homo + qsati * drh_homo/dT
-        # drh_homo/dT = -1/207.8 when active, else 0
         drh_homo = jnp.where(
             (tabs1 < 235.0) & (QI < 1.0e-8),
             -1.0 / 207.8,
@@ -317,7 +211,9 @@ def satadj(
     # where es >> pres and the Newton step is O(0.001 K) — never converges
     # in 20 iterations.  Starting from TABS itself (near the true root) avoids
     # the ill-conditioned high-T regime entirely.
-    tabs1 = TABS + 0.0  # copy; keep as jax array
+    # F11: when tabs_guess is provided (= physical TABS from previous satadj),
+    # use it as the Newton start, matching gSAM cloud.f90: tabs1 = tabs2.
+    tabs1 = (tabs_guess if tabs_guess is not None else TABS) + 0.0
 
     # Fixed Newton iterations (unrolled at trace time → no Python control-flow overhead)
     for _ in range(n_iter):
@@ -356,6 +252,72 @@ def satadj(
 
 
 # ---------------------------------------------------------------------------
+# Evaporation coefficients  (the TABS-dependent part of precip_init.f90)
+# ---------------------------------------------------------------------------
+
+@functools.partial(jax.jit, static_argnames=("params",))
+def _compute_evap_coefs(
+    TABS:   jax.Array,   # (nz, ny, nx)
+    metric: dict,
+    params: MicroParams,
+) -> tuple:
+    """
+    Compute the six evaporation coefficient arrays that depend on TABS.
+
+    gSAM computes these inside precip_init() which is called every 10 steps
+    (microphysics.f90:328).  Returning them as a plain tuple lets micro_proc
+    cache and reuse them for the intervening 9 steps.
+
+    Returns: (evapr1, evapr2, evaps1, evaps2, evapg1, evapg2)  each (nz,ny,nx)
+    """
+    rho     = metric["rho"][:, None, None]
+    pres_mb = metric["pres"][:, None, None] / 100.0
+    p = params
+
+    gcoefs = _gamma_coefs(p)
+    gamr2  = gcoefs["gamr2"]
+    gams2  = gcoefs["gams2"]
+    gamg2  = gcoefs["gamg2"]
+
+    pratio = jnp.sqrt(1.29 / rho)
+
+    rrr1 = 393.0 / (TABS + 120.0) * (TABS / 273.0) ** 1.5
+    rrr2 = (TABS / 273.0) ** 1.94 * (1000.0 / pres_mb)
+    estw = 100.0 * _esatw(TABS)
+    esti = 100.0 * _esati(TABS)
+
+    c1r = (LV / (TABS * RV) - 1.0) * LV / (THERCO * rrr1 * TABS)
+    c2r = RV * TABS / (DIFFELQ * rrr2 * estw)
+    evapr1 = (0.78 * 2.0 * np.pi * p.nzeror / jnp.sqrt(np.pi * p.rhor * p.nzeror * rho)
+              / (c1r + c2r))
+    evapr2 = (0.31 * 2.0 * np.pi * p.nzeror * gamr2 * 0.89
+              * jnp.sqrt(p.a_rain / (MUELQ * rrr1))
+              / (np.pi * p.rhor * p.nzeror) ** ((5 + p.b_rain) / 8.0) / (c1r + c2r)
+              * rho ** ((1 + p.b_rain) / 8.0) * jnp.sqrt(pratio))
+
+    c1s = (LS / (TABS * RV) - 1.0) * LS / (THERCO * rrr1 * TABS)
+    c2s = RV * TABS / (DIFFELQ * rrr2 * esti)
+    evaps1 = (0.65 * 4.0 * p.nzeros / jnp.sqrt(np.pi * p.rhos * p.nzeros * rho)
+              / (c1s + c2s))
+    evaps2 = (0.49 * 4.0 * p.nzeros * gams2 * jnp.sqrt(p.a_snow / (MUELQ * rrr1))
+              / (np.pi * p.rhos * p.nzeros) ** ((5 + p.b_snow) / 8.0) / (c1s + c2s)
+              * rho ** ((1 + p.b_snow) / 8.0) * jnp.sqrt(pratio))
+
+    evapg1 = (0.65 * 4.0 * p.nzerog / jnp.sqrt(np.pi * p.rhog * p.nzerog * rho)
+              / (c1s + c2s))
+    evapg2 = (0.49 * 4.0 * p.nzerog * gamg2 * jnp.sqrt(p.a_grau / (MUELQ * rrr1))
+              / (np.pi * p.rhog * p.nzerog) ** ((5 + p.b_grau) / 8.0) / (c1s + c2s)
+              * rho ** ((1 + p.b_grau) / 8.0) * jnp.sqrt(pratio))
+
+    return evapr1, evapr2, evaps1, evaps2, evapg1, evapg2
+
+
+# Module-level cache: stores evap coefs and the nstep they were computed at.
+# Refreshed every 10 steps to match gSAM's precip_init call frequency.
+_evap_coef_cache: dict = {"nstep": -999, "coefs": None}
+
+
+# ---------------------------------------------------------------------------
 # Precipitation processes  (port of precip_proc.f90)
 # ---------------------------------------------------------------------------
 
@@ -371,6 +333,7 @@ def precip_proc(
     metric: dict,
     params: MicroParams,
     dt: float,
+    evap_coefs: tuple | None = None,  # pre-computed (evapr1,evapr2,evaps1,evaps2,evapg1,evapg2)
 ) -> tuple:  # (TABS_new, QV_new, QC_new, QI_new, QR_new, QS_new, QG_new)
     """
     Microphysical source/sink terms: autoconversion, accretion, and evaporation.
@@ -415,9 +378,9 @@ def precip_proc(
     powg2 = (5.0 + p.b_grau) / 8.0
 
     gcoefs = _gamma_coefs(p)
-    gamr1, gamr2 = gcoefs["gamr1"], gcoefs["gamr2"]
-    gams1, gams2 = gcoefs["gams1"], gcoefs["gams2"]
-    gamg1, gamg2 = gcoefs["gamg1"], gcoefs["gamg2"]
+    gamr1 = gcoefs["gamr1"]
+    gams1 = gcoefs["gams1"]
+    gamg1 = gcoefs["gamg1"]
 
     # ── Accretion coefficients (precip_init.f90) ──────────────────────────────
     # Rain
@@ -438,34 +401,15 @@ def precip_proc(
     # coefice = exp(0.025*(T-273.15)) for T < 273.15, else 0
     coefice = jnp.where(TABS < 273.15, jnp.exp(0.025 * (TABS - 273.15)), 0.0)
 
-    # ── Evaporation coefficients (precip_init.f90, computed on-the-fly) ──────
-    rrr1 = 393.0 / (TABS + 120.0) * (TABS / 273.0) ** 1.5
-    rrr2 = (TABS / 273.0) ** 1.94 * (1000.0 / pres_mb)
-    estw = 100.0 * _esatw(TABS)   # Pa
-    esti = 100.0 * _esati(TABS)   # Pa
-
-    c1r = (LV / (TABS * RV) - 1.0) * LV / (THERCO * rrr1 * TABS)
-    c2r = RV * TABS / (DIFFELQ * rrr2 * estw)
-    evapr1 = (0.78  * 2.0 * np.pi * p.nzeror / jnp.sqrt(np.pi * p.rhor * p.nzeror * rho)
-              / (c1r + c2r))
-    evapr2 = (0.31  * 2.0 * np.pi * p.nzeror * gamr2 * 0.89
-              * jnp.sqrt(p.a_rain / (MUELQ * rrr1))
-              / (np.pi * p.rhor * p.nzeror) ** ((5 + p.b_rain) / 8.0) / (c1r + c2r)
-              * rho ** ((1 + p.b_rain) / 8.0) * jnp.sqrt(pratio))
-
-    c1s = (LS / (TABS * RV) - 1.0) * LS / (THERCO * rrr1 * TABS)
-    c2s = RV * TABS / (DIFFELQ * rrr2 * esti)
-    evaps1 = (0.65 * 4.0 * p.nzeros / jnp.sqrt(np.pi * p.rhos * p.nzeros * rho)
-              / (c1s + c2s))
-    evaps2 = (0.49 * 4.0 * p.nzeros * gams2 * jnp.sqrt(p.a_snow / (MUELQ * rrr1))
-              / (np.pi * p.rhos * p.nzeros) ** ((5 + p.b_snow) / 8.0) / (c1s + c2s)
-              * rho ** ((1 + p.b_snow) / 8.0) * jnp.sqrt(pratio))
-
-    evapg1 = (0.65 * 4.0 * p.nzerog / jnp.sqrt(np.pi * p.rhog * p.nzerog * rho)
-              / (c1s + c2s))
-    evapg2 = (0.49 * 4.0 * p.nzerog * gamg2 * jnp.sqrt(p.a_grau / (MUELQ * rrr1))
-              / (np.pi * p.rhog * p.nzerog) ** ((5 + p.b_grau) / 8.0) / (c1s + c2s)
-              * rho ** ((1 + p.b_grau) / 8.0) * jnp.sqrt(pratio))
+    # ── Evaporation coefficients (precip_init.f90) ───────────────────────────
+    # Use cached coefs if provided (recomputed every 10 steps by micro_proc,
+    # matching gSAM's mod(nstep,10).eq.0 call to precip_init).
+    if evap_coefs is not None:
+        evapr1, evapr2, evaps1, evaps2, evapg1, evapg2 = evap_coefs
+    else:
+        evapr1, evapr2, evaps1, evaps2, evapg1, evapg2 = _compute_evap_coefs(
+            TABS, metric, params,
+        )
 
     qn = qcc + qii   # total cloud condensate
 
@@ -803,6 +747,7 @@ def micro_proc(
     metric: dict,
     params: MicroParams,
     dt: float,
+    tabs_phys: "jax.Array | None" = None,   # F11: physical TABS from previous satadj
 ) -> ModelState:
     """
     One microphysics step matching gSAM operator order.
@@ -814,33 +759,78 @@ def micro_proc(
     So: sedimentation → saturation adjustment → precipitation processes.
 
     Args:
-        state  : current ModelState
-        metric : dict from build_metric (must include 'pres' and 'gamaz')
-        params : MicroParams (use MicroParams() for gSAM defaults)
-        dt     : physics timestep (seconds)
+        state     : current ModelState; state.TABS = t (static energy) in F11
+                    mode, physical TABS otherwise
+        metric    : dict from build_metric (must include 'pres' and 'gamaz')
+        params    : MicroParams (use MicroParams() for gSAM defaults)
+        dt        : physics timestep (seconds)
+        tabs_phys : F11 mode — physical TABS from the previous satadj call
+                    (= the TABS saved before advance_scalars in step.py).
+                    When set, state.TABS is treated as the advected liquid-ice
+                    static energy t.  tabs_phys is used for precip phase
+                    fractions (omp) and as the Newton initial guess for satadj,
+                    matching gSAM cloud.f90: ``tabs2=tabs; tabs1=tabs2``.
 
     Returns:
-        new ModelState with updated TABS, QV, QC, QI, QR, QS, QG
+        new ModelState with updated TABS (physical temperature), QV, QC, QI,
+        QR, QS, QG
     """
+    # In F11 mode, TABS holds t (advected static energy); in standard mode it
+    # holds physical temperature.  local variable name is kept as TABS for
+    # brevity but the meaning differs between the two branches below.
     TABS = state.TABS
     QV, QC, QI = state.QV, state.QC, state.QI
     QR, QS, QG = state.QR, state.QS, state.QG
 
     # 1. Precipitation sedimentation (inside advect_all_scalars in gSAM)
-    QR, QS, QG, TABS = precip_fall(QR, QS, QG, TABS, metric, params, dt)
+    if tabs_phys is not None:
+        # F11 mode: use physical TABS (tabs_phys) for omp phase fractions so
+        # the rain/ice split is not distorted by the gamaz offset in t.
+        # Accumulate the latent-heat delta into t (= TABS) rather than into
+        # tabs_phys, matching gSAM where precip_fall updates t but not tabs.
+        QR, QS, QG, _tabs_fall_out = precip_fall(QR, QS, QG, tabs_phys, metric, params, dt)
+        TABS = TABS + (_tabs_fall_out - tabs_phys)   # t += latent-heat delta
+    else:
+        QR, QS, QG, TABS = precip_fall(QR, QS, QG, TABS, metric, params, dt)
 
     # 2. Cloud-ice sedimentation (inside advect_all_scalars in gSAM)
     if params.do_ice_fall:
-        QI, TABS = ice_fall(QI, TABS, metric, params, dt)
+        if tabs_phys is not None:
+            # Same pattern: use tabs_phys for the latent-heat bookkeeping;
+            # ice_fall's ΔT = -FAC_SUB*ΔQI does not depend on the temperature
+            # level, so passing tabs_phys only affects the addend's base value.
+            QI, _tabs_ice_out = ice_fall(QI, tabs_phys, metric, params, dt)
+            TABS = TABS + (_tabs_ice_out - tabs_phys)   # t += latent-heat delta
+        else:
+            QI, TABS = ice_fall(QI, TABS, metric, params, dt)
 
     # 3. Saturation adjustment (cloud() in gSAM micro_proc)
-    TABS, QV, QC, QI = satadj(
-        TABS, QV, QC, QI, QR, QS, QG, metric, params,
-    )
+    if tabs_phys is not None:
+        # F11 mode: TABS now holds t_after_fall_and_ice.
+        # tabs_dry = t - gamaz  (exact: gSAM cloud.f90 ``tabs = t - gamaz``).
+        # Newton initial guess = tabs_phys (physical TABS from previous satadj),
+        # matching gSAM cloud.f90: ``tabs2=tabs; tabs(k)=t(k)-gamaz(k); tabs1=tabs2``.
+        _gamaz_3d = metric["gamaz"][:, None, None]
+        TABS, QV, QC, QI = satadj(
+            tabs_phys, QV, QC, QI, QR, QS, QG, metric, params,
+            tabs_dry_override=TABS - _gamaz_3d,
+            tabs_guess=tabs_phys,
+        )
+    else:
+        TABS, QV, QC, QI = satadj(
+            TABS, QV, QC, QI, QR, QS, QG, metric, params,
+        )
 
     # 4. Precipitation processes (precip_proc() in gSAM micro_proc)
+    # Evaporation coefficients are recomputed every 10 steps, matching gSAM's
+    # precip_init call frequency: mod(nstep,10).eq.0.and.icycle.eq.1
+    nstep = int(state.nstep)
+    if _evap_coef_cache["nstep"] < 0 or nstep % 10 == 0:
+        _evap_coef_cache["coefs"] = _compute_evap_coefs(TABS, metric, params)
+        _evap_coef_cache["nstep"] = nstep
     TABS, QV, QC, QI, QR, QS, QG = precip_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
+        evap_coefs=_evap_coef_cache["coefs"],
     )
 
     return ModelState(
@@ -866,6 +856,7 @@ def micro_proc_with_precip(
     metric: dict,
     params: MicroParams,
     dt: float,
+    tabs_phys: "jax.Array | None" = None,   # F11: physical TABS from previous satadj
 ) -> tuple[ModelState, jax.Array]:
     """Same as :func:`micro_proc` but also returns the surface precipitation
     flux at the reference (lowest) level in mm/s (= kg/m²/s), shape
@@ -876,6 +867,8 @@ def micro_proc_with_precip(
     ((QR+QS+QG)_before - (QR+QS+QG)_after) / dt``.
 
     Operator order matches gSAM: sedimentation first, then satadj + precip_proc.
+
+    tabs_phys : F11 mode — physical TABS from previous satadj (see micro_proc).
     """
     rho = jnp.asarray(metric["rho"])
     dz  = jnp.asarray(metric["dz"])
@@ -886,7 +879,11 @@ def micro_proc_with_precip(
 
     # 1. Precipitation sedimentation (inside advect_all_scalars in gSAM)
     qp_pre_fall = QR + QS + QG
-    QR, QS, QG, TABS = precip_fall(QR, QS, QG, TABS, metric, params, dt)
+    if tabs_phys is not None:
+        QR, QS, QG, _tabs_fall_out = precip_fall(QR, QS, QG, tabs_phys, metric, params, dt)
+        TABS = TABS + (_tabs_fall_out - tabs_phys)   # accumulate latent-heat delta into t
+    else:
+        QR, QS, QG, TABS = precip_fall(QR, QS, QG, TABS, metric, params, dt)
     qp_post_fall = QR + QS + QG
 
     # Mass lost to the surface during sedimentation (kg/m²):
@@ -896,15 +893,32 @@ def micro_proc_with_precip(
 
     # 2. Cloud-ice sedimentation
     if params.do_ice_fall:
-        QI, TABS = ice_fall(QI, TABS, metric, params, dt)
+        if tabs_phys is not None:
+            QI, _tabs_ice_out = ice_fall(QI, tabs_phys, metric, params, dt)
+            TABS = TABS + (_tabs_ice_out - tabs_phys)
+        else:
+            QI, TABS = ice_fall(QI, TABS, metric, params, dt)
 
     # 3. Saturation adjustment
-    TABS, QV, QC, QI = satadj(
-        TABS, QV, QC, QI, QR, QS, QG, metric, params,
-    )
-    # 4. Precip processes
+    if tabs_phys is not None:
+        _gamaz_3d = metric["gamaz"][:, None, None]
+        TABS, QV, QC, QI = satadj(
+            tabs_phys, QV, QC, QI, QR, QS, QG, metric, params,
+            tabs_dry_override=TABS - _gamaz_3d,
+            tabs_guess=tabs_phys,
+        )
+    else:
+        TABS, QV, QC, QI = satadj(
+            TABS, QV, QC, QI, QR, QS, QG, metric, params,
+        )
+    # 4. Precip processes (same cache logic as micro_proc)
+    nstep = int(state.nstep)
+    if _evap_coef_cache["nstep"] < 0 or nstep % 10 == 0:
+        _evap_coef_cache["coefs"] = _compute_evap_coefs(TABS, metric, params)
+        _evap_coef_cache["nstep"] = nstep
     TABS, QV, QC, QI, QR, QS, QG = precip_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
+        evap_coefs=_evap_coef_cache["coefs"],
     )
 
     new_state = ModelState(

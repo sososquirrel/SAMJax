@@ -24,10 +24,10 @@ sys.path.insert(0, str(MT_ROOT))
 from common.bin_io import read_bin  # noqa: E402
 
 FIELDS = ["U", "V", "W", "TABS", "QC", "QV", "QI"]
-# IRMA box dimensions from the debug dump header
-NZM = 74
-NJ_IRMA = 150   # j_max_gl - j_min_gl + 1 = 510 - 361 + 1
-NI_IRMA = 320   # i_max_gl - i_min_gl + 1 = 1361 - 1042 + 1
+# IRMA box dimensions — auto-detected from bin size, or use defaults
+NZM_DEFAULT    = 74
+NJ_IRMA_DEFAULT = 150   # 510 - 361 + 1
+NI_IRMA_DEFAULT = 320   # 1361 - 1042 + 1
 
 
 def diagnose_field(name: str, gsam: np.ndarray, jsam: np.ndarray) -> dict:
@@ -80,10 +80,25 @@ def main() -> int:
 
     workdir = Path(sys.argv[1])
 
+    # Auto-detect grid shape from first available bin file
+    nzm, nj_irma, ni_irma = NZM_DEFAULT, NJ_IRMA_DEFAULT, NI_IRMA_DEFAULT
+    for name in FIELDS:
+        p = workdir / f"gsam_{name}.bin"
+        if p.exists():
+            total = read_bin(p).size
+            # total = nzm * nj * ni; use defaults for nzm, solve for nj*ni
+            nj_ni = total // nzm
+            if total == nzm * nj_irma * ni_irma:
+                break   # defaults match
+            # Try to factor nj_ni using default ni
+            if nj_ni % ni_irma == 0:
+                nj_irma = nj_ni // ni_irma
+            break
+
     print("=" * 80)
     print("ERA5 INIT TENSOR COMPARISON — DETAILED DIAGNOSTICS")
     print("=" * 80)
-    print(f"Grid: {NZM} levels x {NJ_IRMA} lat x {NI_IRMA} lon (IRMA sub-region)")
+    print(f"Grid: {nzm} levels x {nj_irma} lat x {ni_irma} lon (IRMA sub-region)")
     print()
 
     all_results = []
@@ -97,17 +112,14 @@ def main() -> int:
         gsam_flat = read_bin(gsam_path)
         jsam_flat = read_bin(jsam_path)
 
-        expected_size = NZM * NJ_IRMA * NI_IRMA
-        if gsam_flat.size != expected_size:
-            print(f"  [WARN] {name}: gsam size={gsam_flat.size}, expected={expected_size}")
-            # Try to infer shape
-            nz = NZM
-            total = gsam_flat.size
-            nj_ni = total // nz
-            print(f"         Inferring nj*ni={nj_ni}")
+        expected_size = nzm * nj_irma * ni_irma
+        if gsam_flat.size != expected_size or jsam_flat.size != expected_size:
+            print(f"  [WARN] {name}: gsam size={gsam_flat.size}, "
+                  f"jsam size={jsam_flat.size}, expected={expected_size}")
+            continue
 
-        gsam = gsam_flat.reshape(NZM, NJ_IRMA, NI_IRMA)
-        jsam = jsam_flat.reshape(NZM, NJ_IRMA, NI_IRMA)
+        gsam = gsam_flat.reshape(nzm, nj_irma, ni_irma)
+        jsam = jsam_flat.reshape(nzm, nj_irma, ni_irma)
 
         r = diagnose_field(name, gsam, jsam)
         all_results.append(r)
@@ -126,7 +138,10 @@ def main() -> int:
               f"rmse={r['worst_level_rmse']:.6e})")
         # Show top-5 worst levels
         top5 = np.argsort(r["level_max_abs"])[::-1][:5]
-        print(f"  Top-5 levels: {', '.join(f'k={k}(err={r[\"level_max_abs\"][k]:.3e})' for k in top5)}")
+        top5_str = ", ".join(
+            f"k={k}(err={r['level_max_abs'][k]:.3e})" for k in top5
+        )
+        print(f"  Top-5 levels: {top5_str}")
         print()
 
     # Summary table

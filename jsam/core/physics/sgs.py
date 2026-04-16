@@ -1,28 +1,5 @@
-"""
-Smagorinsky SGS turbulence for jsam.
-
-Port of gSAM SGS_TKE (Khairoutdinov 2012), Smagorinsky branch only
-(dosmagor=True).  No prognostic TKE equation, no DNS, no terrain.
-
-Eddy viscosity:
-    tk  = Cs² · smix² · sqrt(max(0, def2))       (m²/s)
-    tkh = Pr · tk                                  (m²/s)
-
-where smix = (dz · dx_eff · dy_eff)^(1/3) is the filter length scale
-and def2 = 2 S_ij S_ij is the strain-rate invariant from shear_prod().
-
-Diffusion is explicit in time (forward Euler applied to the tendency).
-Anelastic vertical diffusion uses rho/rhow weighting.
-Horizontal diffusion uses imu = 1/cos(lat) for x only (Cartesian y approx).
-Zero-flux BCs at all walls (bottom, top, y-walls).
-
-References
-----------
-  SGS_TKE/tke_full.f90       — Smagorinsky viscosity computation
-  SGS_TKE/shear_prod3D.f90   — strain-rate tensor
-  SGS_TKE/diffuse_scalar3D.f90
-  SGS_TKE/diffuse_mom3D.f90
-"""
+"""Smagorinsky SGS: tk=Cs²·smix²·√def2, tkh=Pr·tk. Explicit diffusion, anelastic vertical.
+Zero-flux BCs at walls. No prognostic TKE, no DNS, no terrain."""
 from __future__ import annotations
 
 import functools
@@ -40,28 +17,16 @@ from jsam.core.state import ModelState
 
 @dataclass(frozen=True)
 class SGSParams:
-    """Smagorinsky SGS closure parameters (gSAM defaults)."""
-    Cs:        float = 0.19     # Smagorinsky constant
-    Ck:        float = 0.1      # (for reference; not used in pure Smagorinsky)
-    Pr:        float = 1.0      # turbulent Prandtl number (tkh = Pr * tk)
-    delta_max: float = 1000.0   # max horizontal length scale (m)
-
+    """Smagorinsky params: Cs (const), Pr (Prandtl), delta_max (m)."""
+    Cs:        float = 0.19
+    Ck:        float = 0.1
+    Pr:        float = 1.0
+    delta_max: float = 1000.0
 
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class SurfaceFluxes:
-    """
-    Bottom-boundary (surface) flux fields, all shape (ny, nx).
-
-    Sign convention: positive = upward flux from surface into atmosphere.
-
-    Fields
-    ------
-    shf   : sensible heat flux  (K·m/s)
-    lhf   : latent heat flux    (kg/kg·m/s)
-    tau_x : x-momentum stress   (m²/s²) on cell-centre grid
-    tau_y : y-momentum stress   (m²/s²) on cell-centre grid
-    """
+    """Surface fluxes (ny,nx): shf, lhf, tau_x, tau_y (positive upward)."""
     shf:   jax.Array
     lhf:   jax.Array
     tau_x: jax.Array
@@ -85,17 +50,8 @@ class SurfaceFluxes:
 # ---------------------------------------------------------------------------
 
 def _dzw(dz: jax.Array) -> jax.Array:
-    """
-    Distance between cell centres at each w-face, shape (nz+1,).
-    dzw[0]  = dz[0]/2      (surface half-cell)
-    dzw[k]  = (dz[k-1]+dz[k])/2   for k=1..nz-1
-    dzw[nz] = dz[nz-1]/2  (top half-cell)
-    """
-    return jnp.concatenate([
-        dz[:1] * 0.5,
-        0.5 * (dz[:-1] + dz[1:]),
-        dz[-1:] * 0.5,
-    ])
+    """Distance between cell centres at w-faces; shape (nz+1,)."""
+    return jnp.concatenate([dz[:1] * 0.5, 0.5 * (dz[:-1] + dz[1:]), dz[-1:] * 0.5])
 
 
 # ---------------------------------------------------------------------------
@@ -103,53 +59,32 @@ def _dzw(dz: jax.Array) -> jax.Array:
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def shear_prod(
-    U: jax.Array,   # (nz, ny, nx+1)  u at x-faces
-    V: jax.Array,   # (nz, ny+1, nx)  v at y-faces
-    W: jax.Array,   # (nz+1, ny, nx)  w at z-faces
-    metric: dict,
-) -> jax.Array:     # def2 (nz, ny, nx)  s⁻²
-    """
-    Compute 2·S_ij·S_ij at cell centres.  Follows shear_prod3D.f90.
-    Cartesian approximation for y (ady=adyv=1).
-    """
-    dx  = metric["dx_lon"]   # scalar (m)
-    dy  = metric["dy_lat"]   # (ny,) per-row
-    dz  = metric["dz"]       # (nz,)
-    rdx = 1.0 / dx    # scalar — Cartesian (no cos(lat))
-    # Per-row 1/dy for y-differences.  Strain-rate corner terms at j+½
-    # faces should in principle use dy_v[j+½] = 0.5*(dy[j]+dy[j+1]); we
-    # broadcast the mass-row dy for all (nz, ny, ·) tensors (matches gSAM
-    # ady(j) — one factor per mass row).  On strongly non-uniform rows
-    # the residual error is absorbed into the Cs calibration.
-    rdy  = (1.0 / dy)[None, :, None]               # (1, ny, 1)
-    dzw_ = _dzw(dz)                   # (nz+1,)
+def shear_prod(U: jax.Array, V: jax.Array, W: jax.Array, metric: dict) -> jax.Array:
+    """Compute 2·S_ij·S_ij at cell centres; Cartesian approx for y."""
+    dx  = metric["dx_lon"]
+    dy  = metric["dy_lat"]
+    dz  = metric["dz"]
+    rdx = 1.0 / dx
+    rdy  = (1.0 / dy)[None, :, None]
+    dzw_ = _dzw(dz)
 
-    # ---- Diagonal terms: 2*(S11² + S22² + S33²) ----
-    # S11 = du/dx  at cell (k,j,i) using U[k,j,i] (left face) and U[k,j,i+1] (right face)
-    S11 = (U[:, :, 1:] - U[:, :, :-1]) * rdx          # (nz,ny,nx)
-    # S22 = dv/dy
-    S22 = (V[:, 1:, :] - V[:, :-1, :]) * rdy           # (nz,ny,nx)
-    # S33 = dw/dz
-    S33 = (W[1:, :, :] - W[:-1, :, :]) / dz[:, None, None]   # (nz,ny,nx)
+    S11 = (U[:, :, 1:] - U[:, :, :-1]) * rdx
+    S22 = (V[:, 1:, :] - V[:, :-1, :]) * rdy
+    S33 = (W[1:, :, :] - W[:-1, :, :]) / dz[:, None, None]
 
     diag = 2.0 * (S11**2 + S22**2 + S33**2)
 
-    # ---- U-V cross terms: (du/dy + dv/dx)² averaged over 4 corners ----
-    # Pad U in y (Neumann), V in x (periodic)
-    Up = jnp.pad(U, ((0, 0), (1, 1), (0, 0)), mode='edge')   # (nz,ny+2,nx+1)
-    Vx = jnp.concatenate([V[:, :, -1:], V, V[:, :, :1]], axis=2)  # (nz,ny+1,nx+2)
 
-    # Corner NE (i+½, j+½):
+    # ---- U-V cross terms: (du/dy + dv/dx)² averaged over 4 corners ----
+    Up = jnp.pad(U, ((0, 0), (1, 1), (0, 0)), mode='edge')
+    Vx = jnp.concatenate([V[:, :, -1:], V, V[:, :, :1]], axis=2)
+
     dudy_NE = (Up[:, 2:,  1:] - Up[:, 1:-1,  1:]) * rdy
     dvdx_NE = (Vx[:, 1:, 2:] - Vx[:, 1:, 1:-1]) * rdx
-    # Corner NW (i-½, j+½):
     dudy_NW = (Up[:, 2:, :-1] - Up[:, 1:-1, :-1]) * rdy
     dvdx_NW = (Vx[:, 1:, 1:-1] - Vx[:, 1:, :-2]) * rdx
-    # Corner SE (i+½, j-½):
     dudy_SE = (Up[:, 1:-1,  1:] - Up[:, :-2,  1:]) * rdy
     dvdx_SE = (Vx[:, :-1, 2:] - Vx[:, :-1, 1:-1]) * rdx
-    # Corner SW (i-½, j-½):
     dudy_SW = (Up[:, 1:-1, :-1] - Up[:, :-2, :-1]) * rdy
     dvdx_SW = (Vx[:, :-1, 1:-1] - Vx[:, :-1, :-2]) * rdx
 
@@ -158,21 +93,17 @@ def shear_prod(
         (dudy_SE + dvdx_SE)**2 + (dudy_SW + dvdx_SW)**2
     )
 
-    # ---- U-W cross terms: (du/dz + dw/dx)² averaged over 4 corners ----
-    Uz = jnp.pad(U, ((1, 1), (0, 0), (0, 0)), mode='edge')   # (nz+2,ny,nx+1)
-    Wx = jnp.concatenate([W[:, :, -1:], W, W[:, :, :1]], axis=2)  # (nz+1,ny,nx+2)
+    Uz = jnp.pad(U, ((1, 1), (0, 0), (0, 0)), mode='edge')
+    Wx = jnp.concatenate([W[:, :, -1:], W, W[:, :, :1]], axis=2)
 
-    dzw_above = dzw_[1:][:, None, None]   # (nz,1,1) w-face k+1
-    dzw_below = dzw_[:-1][:, None, None]  # (nz,1,1) w-face k
+    dzw_above = dzw_[1:][:, None, None]
+    dzw_below = dzw_[:-1][:, None, None]
 
-    # du/dz at w-face above (k+1), at U-face i+1 and i:
     dudz_ab_ip1 = (Uz[2:, :, 1:] - Uz[1:-1, :, 1:]) / dzw_above
     dudz_ab_i   = (Uz[2:, :, :-1] - Uz[1:-1, :, :-1]) / dzw_above
-    # du/dz at w-face below (k), at U-face i+1 and i:
     dudz_bel_ip1 = (Uz[1:-1, :, 1:] - Uz[:-2, :, 1:]) / dzw_below
     dudz_bel_i   = (Uz[1:-1, :, :-1] - Uz[:-2, :, :-1]) / dzw_below
-    # dw/dx at w-face above (k+1) and below (k):
-    dwdx_above = (Wx[1:, :, 2:] - Wx[1:, :, 1:-1]) * rdx    # (nz,ny,nx)
+    dwdx_above = (Wx[1:, :, 2:] - Wx[1:, :, 1:-1]) * rdx
     dwdx_below = (Wx[:-1, :, 2:] - Wx[:-1, :, 1:-1]) * rdx
 
     cross_uw = 0.25 * (
@@ -180,17 +111,13 @@ def shear_prod(
         (dudz_bel_ip1 + dwdx_below)**2 + (dudz_bel_i  + dwdx_below)**2
     )
 
-    # ---- V-W cross terms: (dv/dz + dw/dy)² averaged over 4 corners ----
-    Vz = jnp.pad(V, ((1, 1), (0, 0), (0, 0)), mode='edge')   # (nz+2,ny+1,nx)
-    Wy = jnp.pad(W, ((0, 0), (1, 1), (0, 0)), mode='edge')   # (nz+1,ny+2,nx)
+    Vz = jnp.pad(V, ((1, 1), (0, 0), (0, 0)), mode='edge')
+    Wy = jnp.pad(W, ((0, 0), (1, 1), (0, 0)), mode='edge')
 
-    # dv/dz at w-face above (k+1), at V-face j+1 and j:
     dvdz_ab_jp1 = (Vz[2:, 1:, :] - Vz[1:-1, 1:, :]) / dzw_above
     dvdz_ab_j   = (Vz[2:, :-1, :] - Vz[1:-1, :-1, :]) / dzw_above
-    # dv/dz at w-face below (k):
     dvdz_bel_jp1 = (Vz[1:-1, 1:, :] - Vz[:-2, 1:, :]) / dzw_below
     dvdz_bel_j   = (Vz[1:-1, :-1, :] - Vz[:-2, :-1, :]) / dzw_below
-    # dw/dy:
     dwdy_above = (Wy[1:, 2:, :] - Wy[1:, 1:-1, :]) * rdy
     dwdy_below = (Wy[:-1, 2:, :] - Wy[:-1, 1:-1, :]) * rdy
 
@@ -346,6 +273,8 @@ def smag_viscosity(
     QS:     jax.Array | None = None,
     QG:     jax.Array | None = None,
     tk_prev: jax.Array | None = None,  # D13: previous-step tk for smix limiter
+    fluxbt: jax.Array | None = None,   # D14: (ny,nx) surface heat flux (K·m/s)
+    fluxbq: jax.Array | None = None,   # D14: (ny,nx) surface moisture flux (kg/kg·m/s)
 ) -> tuple[jax.Array, jax.Array]:
     """
     Returns (tk, tkh), both (nz, ny, nx) in m²/s.
@@ -375,7 +304,18 @@ def smag_viscosity(
     Ck        = params.Ck
     Pr        = params.Pr
 
-    dx_eff = jnp.minimum(delta_max, dx)
+    # F8/F10 fix: gSAM tke_full.f90:42 computes
+    #   coef(j) = min(delta_max, dx*mu(j)) * min(delta_max, dy*ady(j))
+    # where dx is the EQUATORIAL spacing (= dx_lon), mu(j)=cos(lat), and
+    # dy*ady(j) = actual per-row meridional spacing (= dy_lat per-row).
+    # jsam metric["dy_lat"] already equals dy_ref*ady(j) so dy_eff is correct.
+    # But dx must be multiplied by cos(lat) to get the actual zonal spacing.
+    _cos_lat_sgs = metric.get("cos_lat", None)
+    if _cos_lat_sgs is not None:
+        # dx * cos_lat(j) = actual zonal grid spacing (m) per latitude row
+        dx_eff = jnp.minimum(delta_max, dx * _cos_lat_sgs)[None, :, None]   # (1, ny, 1)
+    else:
+        dx_eff = jnp.minimum(delta_max, dx)
     dy_eff = jnp.minimum(delta_max, dy)[None, :, None]
 
     grd = (dz[:, None, None] * dx_eff * dy_eff) ** 0.33333
@@ -387,7 +327,8 @@ def smag_viscosity(
 
     # --- gSAM dosmagor=True branch with buoyancy suppression ---
     buoy_sgs  = _compute_buoy_sgs(TABS, tabs0, metric,
-                                   QV=QV, QC=QC, QI=QI, QR=QR, QS=QS, QG=QG)
+                                   QV=QV, QC=QC, QI=QI, QR=QR, QS=QS, QG=QG,
+                                   fluxbt=fluxbt, fluxbq=fluxbq)
 
     # Constants (gSAM tke_full.f90:28-31)
     Ce  = Ck**3 / Cs**4                 # ≈ 0.7673
@@ -1240,15 +1181,20 @@ def _sgs_coefs(
     params:  SGSParams,
     dt:      float,
     tabs0:   jax.Array | None = None,
+    fluxbt:  jax.Array | None = None,   # D14: (ny,nx) surface heat flux (K·m/s)
+    fluxbq:  jax.Array | None = None,   # D14: (ny,nx) surface moisture flux (kg/kg·m/s)
 ):
     """Shared helper: compute tk, tkh with stability cap."""
     U, V, W = state.U, state.V, state.W
     def2      = shear_prod(U, V, W, metric)
     TABS_arg  = state.TABS if tabs0 is not None else None
-    # Pass moisture fields for full moist buoyancy (S6 fix)
+    # D13 fix: pass previous-step tk (stored in state.TKE) for smix limiter
+    # D14 fix: pass surface fluxes to _compute_buoy_sgs via smag_viscosity
     tk, tkh   = smag_viscosity(def2, metric, params, TABS=TABS_arg, tabs0=tabs0,
                                QV=state.QV, QC=state.QC, QI=state.QI,
-                               QR=state.QR, QS=state.QS, QG=state.QG)
+                               QR=state.QR, QS=state.QS, QG=state.QG,
+                               tk_prev=state.TKE,
+                               fluxbt=fluxbt, fluxbq=fluxbq)
     # C9 fix: per-(j,k) stability cap instead of global dz-only cap
     tk_max = _tkmax_3d(metric, dt)
     tk     = jnp.minimum(tk,  tk_max)

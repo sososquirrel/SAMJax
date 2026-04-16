@@ -136,9 +136,9 @@ contains
 
   subroutine c_to_f(cbuf, a, d1, d2, d3)
     ! C order (d1,d2,d3) i3 fastest → Fortran (d3,d2,d1)
+    integer, intent(in) :: d1, d2, d3
     real, intent(in) :: cbuf(*)
     real, intent(out) :: a(d3, d2, d1)
-    integer, intent(in) :: d1, d2, d3
     integer :: i1, i2, i3, pos
     pos = 0
     do i1 = 1, d1
@@ -152,9 +152,9 @@ contains
   end subroutine c_to_f
 
   subroutine c_to_f_v(cbuf, a, d1, d2, d3)
+    integer, intent(in) :: d1, d2, d3
     real, intent(in) :: cbuf(*)
     real, intent(out) :: a(d3, d2, d1)
-    integer, intent(in) :: d1, d2, d3
     integer :: i1, i2, i3, pos
     pos = 0
     do i1 = 1, d1
@@ -168,9 +168,9 @@ contains
   end subroutine c_to_f_v
 
   subroutine c_to_f_w(cbuf, a, d1, d2, d3)
+    integer, intent(in) :: d1, d2, d3
     real, intent(in) :: cbuf(*)
     real, intent(out) :: a(d3, d2, d1)
-    integer, intent(in) :: d1, d2, d3
     integer :: i1, i2, i3, pos
     pos = 0
     do i1 = 1, d1

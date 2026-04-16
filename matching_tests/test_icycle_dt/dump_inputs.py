@@ -46,19 +46,21 @@ def _build_state(case: str):
 
 
 def _jsam_icycle(phi, tend_vals, dt_vals, n_icycles):
-    """Simulate jsam's driver-level AB rotation."""
+    """Simulate gSAM's 3-slot circular buffer (main.f90 icycle rotation).
+
+    gSAM main.f90 lines 353-356:
+        nn=na; na=nc; nc=nb; nb=nn
+    """
     phi = phi.copy().astype(np.float64)
     n = len(phi)
-
-    # jsam stores nm1 and nm2 (not 3-slot circular)
-    tend_nm1 = np.zeros(n, dtype=np.float64)
-    tend_nm2 = np.zeros(n, dtype=np.float64)
+    slots = np.zeros((n, 3), dtype=np.float64)
+    na, nb, nc = 0, 1, 2  # 0-indexed slot indices
 
     for ic in range(n_icycles):
         dt = float(dt_vals[ic])
         tend_n = tend_vals[ic].astype(np.float64)
 
-        # AB coefficients
+        # AB coefficients: Euler -> AB2 -> AB3
         if ic == 0:
             at, bt, ct = 1.0, 0.0, 0.0
         elif ic == 1:
@@ -66,15 +68,16 @@ def _jsam_icycle(phi, tend_vals, dt_vals, n_icycles):
         else:
             at, bt, ct = 23.0/12.0, -16.0/12.0, 5.0/12.0
 
-        phi += dt * (at * tend_n + bt * tend_nm1 + ct * tend_nm2)
+        slots[:, na] = tend_n
+        phi += dt * (at * slots[:, na] + bt * slots[:, nb] + ct * slots[:, nc])
 
-        # Python rotation: nm2 <- nm1, nm1 <- n
-        tend_nm2 = tend_nm1.copy()
-        tend_nm1 = tend_n.copy()
+        # gSAM rotation: nn=na; na=nc; nc=nb; nb=nn
+        na, nb, nc = nc, na, nb
 
     return (phi.astype(np.float32),
-            tend_nm1.astype(np.float32),
-            tend_nm2.astype(np.float32))
+            slots[:, na].astype(np.float32),
+            slots[:, nb].astype(np.float32),
+            slots[:, nc].astype(np.float32))
 
 
 def main() -> int:
@@ -89,24 +92,10 @@ def main() -> int:
         f.write(dt_vals.astype(np.float32).tobytes())
 
     # jsam side
-    phi_final, tend_nm1, tend_nm2 = _jsam_icycle(phi, tend_vals, dt_vals, n_icycles)
+    phi_final, tend_na, tend_nb, tend_nc = _jsam_icycle(phi, tend_vals, dt_vals, n_icycles)
 
     # Match Fortran output layout: phi_final + tend(na) + tend(nb) + tend(nc)
-    # After gSAM's 3 rotations: na points to the OLDEST slot.
-    # jsam: tend_nm1 = most recent, tend_nm2 = second most recent
-    # The mapping depends on how many rotations happened.
-    # For comparison, output: phi + tend_nm1 + tend_nm2 + zeros
-    # (The Fortran driver outputs the 3 slots in their current na/nb/nc order)
-    #
-    # NOTE: This test will SHOW the difference in buffer layout between
-    # gSAM's circular rotation and jsam's Python swap. The phi_final
-    # should match if the AB coefficients are correct.
-    out = np.concatenate([
-        phi_final,
-        tend_nm1,
-        tend_nm2,
-        np.zeros(n, dtype=np.float32),  # jsam has no "nc" slot
-    ])
+    out = np.concatenate([phi_final, tend_na, tend_nb, tend_nc])
     write_bin("jsam_out.bin", out)
 
     print(f"[icycle_dt] case={case}  n={n}  n_icycles={n_icycles}")

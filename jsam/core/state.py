@@ -111,9 +111,13 @@ class ModelState:
             W_mass = load("W")
 
             return cls(
-                U=jnp.zeros((nz, ny, nx + 1)).at[:, :, :-1].set(U_mass),
-                V=jnp.zeros((nz, ny + 1, nx)).at[:, :-1, :].set(V_mass),
-                W=jnp.zeros((nz + 1, ny, nx)).at[:-1, :, :].set(W_mass),
+                U=(jnp.zeros((nz, ny, nx + 1))
+                   .at[:, :, :-1].set(U_mass)
+                   .at[:, :, -1].set(U_mass[:, :, 0])),
+                V=(jnp.zeros((nz, ny + 1, nx))
+                   .at[:, 1:-1, :].set(0.5 * (V_mass[:, :-1, :] + V_mass[:, 1:, :]))),
+                W=(jnp.zeros((nz + 1, ny, nx))
+                   .at[1:-1, :, :].set(0.5 * (W_mass[:-1, :, :] + W_mass[1:, :, :]))),
                 TABS=load("TABS"),
                 QV=load("QV"),
                 QC=load("QC"),
@@ -121,7 +125,10 @@ class ModelState:
                 QR=load("QR"),
                 QS=load("QS"),
                 QG=load("QG"),
-                TKE=load("TKH"),
+                # F3 fix: gSAM initialises SGS TKE to 0 at run start.
+                # TKH is eddy diffusivity (m²/s), not kinetic energy (m²/s²).
+                # Use the "TKE" variable if the file has one, otherwise zeros.
+                TKE=(load("TKE") if "TKE" in ds.variables else jnp.zeros((nz, ny, nx))),
                 p_prev =jnp.zeros((nz, ny, nx)),
                 p_pprev=jnp.zeros((nz, ny, nx)),
                 nstep=jnp.int32(0),

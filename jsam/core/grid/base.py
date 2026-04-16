@@ -6,10 +6,7 @@ import jax.numpy as jnp
 
 
 class Grid(ABC):
-    """
-    Abstract grid. Subclasses implement lat-lon, hexagonal, or triangular
-    meshes. All operators (div, grad, curl) must be defined on the grid.
-    """
+    """Abstract grid for operators (div, grad, curl, laplacian)."""
 
     @property
     @abstractmethod
@@ -25,23 +22,17 @@ class Grid(ABC):
 
     @property
     @abstractmethod
-    def dx(self): ...  # horizontal spacing (m), may be 2D array for lat-lon
+    def dx(self): ...  # horizontal spacing (m)
 
     @property
     @abstractmethod
-    def dz(self): ...  # vertical spacing (m), 1D array
+    def dz(self): ...  # vertical spacing (m)
 
     @abstractmethod
-    def divergence(self, u, v) -> jnp.ndarray:
-        """Horizontal divergence of (u, v) on the grid."""
-        ...
+    def divergence(self, u, v) -> jnp.ndarray: ...
 
     @abstractmethod
-    def gradient(self, phi) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Horizontal gradient (dphi/dx, dphi/dy) on the grid."""
-        ...
+    def gradient(self, phi) -> tuple[jnp.ndarray, jnp.ndarray]: ...
 
     @abstractmethod
-    def laplacian(self, phi) -> jnp.ndarray:
-        """Horizontal Laplacian on the grid."""
-        ...
+    def laplacian(self, phi) -> jnp.ndarray: ...

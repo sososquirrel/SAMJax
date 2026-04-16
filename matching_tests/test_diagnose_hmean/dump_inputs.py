@@ -1,8 +1,8 @@
 """Dump inputs and jsam outputs for test_diagnose_hmean.
 
-Tests the cos-lat + ady weighted horizontal mean used in the diagnose
-block (step.py:946-979). KNOWN BUG: jsam uses cos_lat only, missing
-the ady stretching factor that gSAM includes.
+Tests the cos-lat * ady weighted horizontal mean used in the diagnose
+block (step.py:946-979). Fixed: uses mu*ady weighting matching gSAM
+diagnose.f90 (wgt(j,k) = mu(j)*ady(j)*coef/sums(k), setgrid.f90:466).
 
 Cases
 -----
@@ -78,14 +78,14 @@ def _build_state(case: str):
 
 
 def _jsam_hmean(nz, ny, nx, mu, ady, TABS, QV, QC, QI, QR, QS, QG):
-    """Compute hmean using jsam's current (buggy) approach: cos_lat only."""
+    """Compute hmean using mu*ady weighting matching gSAM diagnose.f90."""
     import jax
     jax.config.update("jax_enable_x64", False)
     import jax.numpy as jnp
 
     cos_lat = jnp.asarray(mu)
-    # This is jsam's current code (step.py:955):
-    _wgt = cos_lat / jnp.sum(cos_lat)
+    # Fixed: uses mu*ady weighting matching gSAM diagnose.f90
+    _wgt = (cos_lat * jnp.asarray(ady)) / jnp.sum(cos_lat * jnp.asarray(ady))
 
     def _hmean(field):
         return jnp.sum(jnp.mean(field, axis=2) * _wgt[None, :], axis=1)

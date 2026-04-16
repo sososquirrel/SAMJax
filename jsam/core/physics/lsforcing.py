@@ -1,40 +1,5 @@
-"""
-Large-scale forcing for jsam.
-
-Port of gSAM ``forcing.f90`` (``dolargescale``) and ``subsidence.f90``.
-
-Two contributions are applied each step:
-
-1. **Horizontal advective tendencies** — column-mean profiles that represent
-   what the resolved large-scale horizontal advection does to the column.
-   Applied directly to TABS and QV:
-       TABS += dtls(z, t) * dt
-       QV   += dqls(z, t) * dt  (clamped to ≥ 0)
-
-2. **Subsidence** — vertical advection by the large-scale vertical velocity
-   ``w_ls(z, t)`` (positive upward, m/s):
-       ∂TABS/∂t|_sub = −w_ls · ∂TABS/∂z
-       ∂QV/∂t|_sub   = −w_ls · ∂QV/∂z
-   Discretised with first-order upwind in z (gSAM ``subsidence.f90``).
-
-Both profiles are stored as time-varying tables and interpolated bilinearly
-to the model grid at the current model time (same pattern as ``RadForcing``).
-
-nstep / time are NOT incremented here (``advance_scalars`` owns that).
-
-ERA5 mapping
-------------
-  dtls  : horizontal temperature advective tendency = −(u·∂T/∂x + v·∂T/∂y),
-          pre-computed offline from ERA5 analysis fields; units K/s.
-  dqls  : same for specific humidity; units kg/kg/s.
-  wsub  : ERA5 omega (Pa/s) → w (m/s) via w = −ω / (ρ g);
-          alternatively use ERA5 ``w`` field directly where available.
-
-References
-----------
-  gSAM SRC/forcing.f90    — dolargescale block
-  gSAM SRC/subsidence.f90
-"""
+"""Large-scale forcing: horizontal advective tendencies (dtls, dqls) + subsidence (wsub).
+Time-varying profiles interpolated bilinearly to model grid. First-order upwind for subsidence."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -45,35 +10,19 @@ import jax.numpy as jnp
 from jsam.core.state import ModelState
 
 
-# ---------------------------------------------------------------------------
-# Forcing table (JAX pytree)
-# ---------------------------------------------------------------------------
-
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class LargeScaleForcing:
-    """
-    Time-varying large-scale forcing profiles.
-
-    Attributes
-    ----------
-    dtls   : (ntime, nz_prof)  horizontal temperature advective tendency (K/s)
-    dqls   : (ntime, nz_prof)  horizontal moisture advective tendency (kg/kg/s)
-    wsub   : (ntime, nz_prof)  large-scale vertical velocity (m/s, +upward)
-    z_prof : (nz_prof,)        height of forcing levels (m), monotone ↑
-    t_prof : (ntime,)          time of each snapshot (s), monotone ↑
-    """
-    dtls:   jax.Array   # (ntime, nz_prof)
-    dqls:   jax.Array   # (ntime, nz_prof)
-    wsub:   jax.Array   # (ntime, nz_prof)
-    z_prof: jax.Array   # (nz_prof,)
-    t_prof: jax.Array   # (ntime,)
-
-    # ---- factories --------------------------------------------------------
+    """Time-varying profiles: dtls, dqls (K/s, kg/kg/s), wsub (m/s), z_prof, t_prof."""
+    dtls:   jax.Array
+    dqls:   jax.Array
+    wsub:   jax.Array
+    z_prof: jax.Array
+    t_prof: jax.Array
 
     @classmethod
     def zeros(cls, nz_prof: int = 2) -> "LargeScaleForcing":
-        """Zero forcing on a trivial 2-level grid."""
+        """Zero forcing on trivial 2-level grid."""
         z = jnp.array([0.0, 1.0e5])
         q = jnp.zeros((2, nz_prof))
         return cls(
@@ -161,32 +110,16 @@ def _profile_on_model_grid(
 # (matches gSAM subsidence.f90)
 # ---------------------------------------------------------------------------
 
-def _subsidence_tend(
-    phi:  jax.Array,   # (nz, ny, nx)
-    wsub: jax.Array,   # (nz,)  large-scale w at cell centres (m/s, +upward)
-    dz:   jax.Array,   # (nz,)  cell widths (m)
-) -> jax.Array:
-    """
-    Compute −w_ls · ∂φ/∂z with first-order upwind differencing.
-
-    Boundary cells (k=0, k=nz-1) use one-sided differences (edge-pad),
-    which sets the tendency to zero when the wind would advect from outside
-    the domain (consistent with rigid-lid / zero-flux BCs).
-
-    Returns tendency (nz, ny, nx) in units of [φ] / s.
-    """
+def _subsidence_tend(phi: jax.Array, wsub: jax.Array, dz: jax.Array) -> jax.Array:
+    """Compute −w_ls·∂φ/∂z with first-order upwind; edge-pad for BCs."""
     dz3 = dz[:, None, None]      # (nz, 1, 1)
     w3  = wsub[:, None, None]    # (nz, 1, 1)
 
-    # Pad phi at bottom (k=-1 = k=0) and top (k=nz = k=nz-1) with edge values
-    phi_lo = jnp.pad(phi, ((1, 0), (0, 0), (0, 0)), mode="edge")  # (nz+1, ny, nx)
-    phi_hi = jnp.pad(phi, ((0, 1), (0, 0), (0, 0)), mode="edge")  # (nz+1, ny, nx)
+    phi_lo = jnp.pad(phi, ((1, 0), (0, 0), (0, 0)), mode="edge")
+    phi_hi = jnp.pad(phi, ((0, 1), (0, 0), (0, 0)), mode="edge")
 
-    # Upwind gradients:
-    #   w > 0 (upward): backward difference  (φ[k] - φ[k-1]) / dz
-    #   w < 0 (downward): forward difference  (φ[k+1] - φ[k]) / dz
-    grad_bwd = (phi - phi_lo[:-1]) / dz3    # (nz, ny, nx)
-    grad_fwd = (phi_hi[1:] - phi) / dz3    # (nz, ny, nx)
+    grad_bwd = (phi - phi_lo[:-1]) / dz3
+    grad_fwd = (phi_hi[1:] - phi) / dz3
 
     dphi_dz  = jnp.where(w3 >= 0.0, grad_bwd, grad_fwd)
     return -w3 * dphi_dz   # (nz, ny, nx)
@@ -197,57 +130,27 @@ def _subsidence_tend(
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def ls_proc(
-    state:   ModelState,
-    metric:  dict,
-    forcing: LargeScaleForcing,
-    dt:      float,
-) -> ModelState:
-    """
-    Apply one step of large-scale forcing.
-
-    1. Horizontal advective tendencies: TABS += dtls*dt, QV += dqls*dt
-    2. Subsidence: TABS and QV advected by w_ls (upwind)
-
-    nstep / time are NOT incremented (advance_scalars owns that).
-
-    Parameters
-    ----------
-    state   : current ModelState
-    metric  : grid metric dict (must contain ``"z"`` and ``"dz"``)
-    forcing : LargeScaleForcing with time-varying profiles
-    dt      : timestep (s)
-
-    Returns
-    -------
-    new ModelState with updated TABS and QV
-    """
-    z_model = metric["z"]    # (nz,)
-    dz      = metric["dz"]   # (nz,)
+def ls_proc(state: ModelState, metric: dict, forcing: LargeScaleForcing, dt: float) -> ModelState:
+    """Apply horizontal advection (dtls, dqls) + subsidence (w_ls) in one step."""
+    z_model = metric["z"]
+    dz      = metric["dz"]
     t       = state.time
 
-    # --- interpolate all profiles to model z at current time ---
     def _on_grid(table):
         return _profile_on_model_grid(t, forcing.t_prof, table, forcing.z_prof, z_model)
 
-    dtls_z = _on_grid(forcing.dtls)   # (nz,)
-    dqls_z = _on_grid(forcing.dqls)   # (nz,)
-    wsub_z = _on_grid(forcing.wsub)   # (nz,)
+    dtls_z = _on_grid(forcing.dtls)
+    dqls_z = _on_grid(forcing.dqls)
+    wsub_z = _on_grid(forcing.wsub)
 
-    # --- 1. Horizontal advective tendencies (broadcast to 3-D) ---
     nz, ny, nx = state.TABS.shape
     TABS_new = state.TABS + dt * dtls_z[:, None, None]
     QV_new   = jnp.maximum(0.0, state.QV + dt * dqls_z[:, None, None])
 
-    # --- 2. Subsidence ---
-    # C6 fix: gSAM subsidence.f90 applies subsidence to the liquid-ice static
-    # energy t = TABS + gamaz (not bare TABS), which includes the adiabatic
-    # term w*g/cp.  Also applies subsidence to momentum (U,V) and all
-    # condensate species (QC, QI, QR, QS, QG).
-    gamaz = metric["gamaz"][:, None, None]   # (nz,1,1)  g*z/cp  K
-    t_field = TABS_new + gamaz                # static energy
+    gamaz = metric["gamaz"][:, None, None]
+    t_field = TABS_new + gamaz
     t_field = t_field + dt * _subsidence_tend(t_field, wsub_z, dz)
-    TABS_new = t_field - gamaz                # recover TABS
+    TABS_new = t_field - gamaz
 
     QV_new   = jnp.maximum(0.0, QV_new + dt * _subsidence_tend(QV_new, wsub_z, dz))
     QC_new   = jnp.maximum(0.0, state.QC + dt * _subsidence_tend(state.QC, wsub_z, dz))

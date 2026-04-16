@@ -16,7 +16,9 @@ import jax.numpy as jnp
 
 HERE = Path(__file__).resolve().parent
 MT_ROOT = HERE.parent
+SAMJAX_ROOT = MT_ROOT.parent
 sys.path.insert(0, str(MT_ROOT))
+sys.path.insert(0, str(SAMJAX_ROOT))
 
 from common.bin_io import write_bin                          # noqa: E402
 from jsam.core.grid.latlon import LatLonGrid                 # noqa: E402

@@ -63,7 +63,7 @@ def _fct_1d(phi, u, dt, dx):
     f_high = np.zeros(n + 1, dtype=np.float32)
     for i in range(n + 1):
         im = (i - 1) % n
-        ip = i % n
+        ip = (i + 1) % n
         if u[i] >= 0:
             f_low[i] = u[i] * phi[im]
         else:
@@ -98,7 +98,7 @@ def _fct_1d(phi, u, dt, dx):
     scale = np.zeros(n + 1, dtype=np.float64)
     for i in range(n + 1):
         im = (i - 1) % n
-        ip = i % n
+        ip = (i + 1) % n
         if f_anti[i] >= 0:
             scale[i] = min(r_plus[ip], r_minus[im])
         else:

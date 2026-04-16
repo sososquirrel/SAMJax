@@ -42,16 +42,20 @@ def save_restart(state: ModelState, path: str | Path) -> Path:
         dims = (f"{name}_k", f"{name}_j", f"{name}_i")
         data_vars[name] = (dims, arr)
 
+    # F4 fix: save both pressure buffers so adamsB has correct history on restart.
     if state.p_prev is not None:
         data_vars["p_prev"] = (("p_k", "p_j", "p_i"), np.asarray(state.p_prev))
+    if state.p_pprev is not None:
+        data_vars["p_pprev"] = (("pp_k", "pp_j", "pp_i"), np.asarray(state.p_pprev))
 
     ds = xr.Dataset(
         data_vars=data_vars,
         attrs={
-            "jsam_restart_version": "1",
+            "jsam_restart_version": "2",
             "nstep": int(state.nstep),
             "time":  float(state.time),
-            "has_p_prev": int(state.p_prev is not None),
+            "has_p_prev":  int(state.p_prev  is not None),
+            "has_p_pprev": int(state.p_pprev is not None),
         },
     )
     encoding = {v: {"zlib": True, "complevel": 1} for v in data_vars}
@@ -70,10 +74,16 @@ def load_restart(path: str | Path) -> ModelState:
 
         kwargs = {name: _get(name) for name in _FIELDS_3D}
 
+        # F4 fix: restore both pressure buffers.
         if int(ds.attrs.get("has_p_prev", 0)):
             kwargs["p_prev"] = _get("p_prev")
         else:
             kwargs["p_prev"] = None
+
+        if int(ds.attrs.get("has_p_pprev", 0)):
+            kwargs["p_pprev"] = _get("p_pprev")
+        else:
+            kwargs["p_pprev"] = None
 
         kwargs["nstep"] = jnp.int32(int(ds.attrs["nstep"]))
         kwargs["time"]  = jnp.float64(float(ds.attrs["time"]))

@@ -1,24 +1,7 @@
 """
 Pressure solver for the anelastic equations on a lat-lon grid.
-
-Solves the Poisson equation:
-    ∇²p' = RHS
-
-where RHS = (1/dt) * ∇·(ρ u*)  / ρ   (anelastic divergence of tentative velocity)
-
-Algorithm (matching gSAM global solver):
-  1. Compute RHS via press_rhs  [matches press_rhs.f90 exactly]
-  2. rfft in longitude (periodic) → nm independent 2-D problems in (lat, z)
-  3. For each zonal wavenumber m: solve H_m p_m = b_m via BiCGSTAB where
-     H_m uses the spherical Helmholtz operator (cosφ-weighted L_y + L_z)
-     This matches gSAM's global GMG solver which also uses the spherical metric.
-  4. irfft back to physical space
-  5. Apply pressure gradient to correct velocity  [matches press_grad.f90]
-
-References:
-  gSAM SRC/press_rhs.f90    — RHS computation
-  gSAM SRC/pressure_big.f90 — FFT + cosine + Thomas solver (we replicate this)
-  gSAM SRC/press_grad.f90   — pressure gradient application
+Solves ∇²p' = RHS via rfft-x + sparse-LU in (y,z) per zonal mode.
+Matches gSAM pressure_big.f90 + press_rhs.f90 + press_grad.f90.
 """
 
 from __future__ import annotations
@@ -31,88 +14,35 @@ from jsam.core.state import ModelState
 from jsam.core.grid.latlon import LatLonGrid, EARTH_RADIUS
 from jsam.core.physics.microphysics import G_GRAV, CP
 
-# ---------------------------------------------------------------------------
-# Grid precomputation helpers (called once, results passed to JIT functions)
-# ---------------------------------------------------------------------------
-
 def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
-    """
-    Precompute all metric factors needed by press_rhs and press_grad.
-    Returns a dict of JAX arrays (can be treated as static/constant).
-
-    Parameters
-    ----------
-    grid         : LatLonGrid
-    polar_filter : IGNORED — kept only for backwards-compatibility with
-                   older callers.  gSAM has no spectral polar filter; the
-                   only pole conditioning is the implicit CFL-based pole
-                   damping in ``damping.f90`` (already folded into
-                   ``diffuse_damping_mom_z``).  Any value passed here is
-                   silently dropped and no ``pfmask_u`` / ``pfmask_v``
-                   entries are added to the metric dict.
-
-    Matches gSAM notation:
-      imu(j)  = 1/cos(lat_j)                  [zonal metric inverse]
-      muv(j)  = cos(lat at v north-face j)     [v-face cosine]
-      rhow(k) = density at w-faces (level interfaces)
-    """
-    lat_rad = np.deg2rad(grid.lat)           # (ny,)
-    lon_rad = np.deg2rad(grid.lon)           # (nx,)
+    """Precompute metric factors for press_rhs and press_grad."""
+    lat_rad = np.deg2rad(grid.lat)
+    lon_rad = np.deg2rad(grid.lon)
     dlon_rad = np.deg2rad(grid.dlon)
 
-    # cos(lat) at mass-point latitudes
-    cos_lat = np.cos(lat_rad)                # (ny,)
+    cos_lat = np.cos(lat_rad)
 
-    # Per-row meridional spacing (m), shape (ny,). On dyvar grids this
-    # ranges 15–110 km; on a uniform grid it is a constant. gSAM's ady(j)
-    # is the ratio dy_per_row[j] / dy_ref (see setgrid.f90:222-256).
-    dy_per_row = np.array(grid.dy_per_row)        # (ny,)
-    dy_ref     = float(grid.dy_ref)               # scalar (mid-latitude)
-    ady        = np.array(grid.ady)               # (ny,) from LatLonGrid (gSAM setgrid.f90)
+    dy_per_row = np.array(grid.dy_per_row)
+    dy_ref     = float(grid.dy_ref)
+    ady        = np.array(grid.ady)
 
-    # cos_v at v-faces.
-    # Interior (1..ny-1): gSAM ady-weighted muv (setgrid.f90:255) —
-    #   muv(j) = (ady(j-1)*mu(j) + ady(j)*mu(j-1)) / (ady(j-1)+ady(j))
-    # Boundary (0, ny): take cos of the actual boundary v-face latitude.
-    # For a global grid that v-face sits at ±90° so cos_v = 0; for a
-    # limited-area grid it is extrapolated half a row outside the mass
-    # points and cos_v is non-zero.
     muv_interior = (ady[:-1] * cos_lat[1:] + ady[1:] * cos_lat[:-1]) / (ady[:-1] + ady[1:])
     lat_v_boundary = np.deg2rad(grid.lat_v[[0, -1]])
     cos_v = np.concatenate([
         [np.cos(lat_v_boundary[0])],
         muv_interior,
         [np.cos(lat_v_boundary[1])],
-    ])                                                      # (ny+1,)
+    ])
 
-    # Physical grid spacings
-    dx_lon = EARTH_RADIUS * dlon_rad    # equatorial zonal spacing (m)
+    dx_lon = EARTH_RADIUS * dlon_rad
 
-    # imu(j) = 1/cos(lat_j)  (zonal metric, matches gSAM)
-    imu = 1.0 / np.clip(cos_lat, 1e-6, None)   # (ny,) guard against poles
+    imu = 1.0 / np.clip(cos_lat, 1e-6, None)
 
-    # Density at w-faces (vertical interfaces) — matches gSAM setdata.f90:473-484
-    # dolatlon branch exactly (non-uniform dz needs the adz cross-weighted form):
-    #
-    #   do k=2,nzm
-    #     rhow(k) = (rho(k-1)*adz(k) + rho(k)*adz(k-1)) / (adz(k)+adz(k-1))
-    #   end do
-    #   rhow(1)  = 2*rho(1)  - rhow(2)
-    #   rhow(nz) = 2*rho(nzm)- rhow(nzm)
-    #
-    # 1-indexed gSAM → 0-indexed Python: interior face k_f=1..nz-1 straddles
-    # mass cells k_f-1 (below) and k_f (above).
-    rho = grid.rho                                                    # (nz,)
-    dz  = grid.dz                                                     # (nz,)
+    rho = grid.rho
+    dz  = grid.dz
     nz  = len(rho)
-    # gSAM stretched-grid factors (setgrid.f90):
-    #   dz_ref    = zi[1] - zi[0]              (scalar, bottom layer thickness)
-    #   adz[k]    = dz[k] / dz_ref             (cell-thickness ratio, shape (nz,))
-    #   adzw[0]   = 1
-    #   adzw[k]   = (z[k]-z[k-1])/dz_ref       for k=1..nz-1
-    #   adzw[nz]  = adzw[nz-1]                 (wraparound)
-    zi   = np.asarray(grid.zi)                 # (nz+1,)
-    z1d  = np.asarray(grid.z)                  # (nz,)
+    zi   = np.asarray(grid.zi)
+    z1d  = np.asarray(grid.z)
     dz_ref = float(zi[1] - zi[0])
     adz    = np.asarray(dz, dtype=np.float64) / dz_ref
     adzw   = np.empty(len(rho) + 1)
@@ -120,216 +50,149 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     adzw[1:-1] = (z1d[1:] - z1d[:-1]) / dz_ref
     adzw[-1] = adzw[-2]
     rhow = np.zeros(nz + 1)
-    # interior: k_f = 1..nz-1  →  rho_below=rho[k_f-1], rho_above=rho[k_f]
-    adz_below = adz[:-1]                                              # (nz-1,)  adz(k_f-1)
-    adz_above = adz[1:]                                               # (nz-1,)  adz(k_f)
+    adz_below = adz[:-1]
+    adz_above = adz[1:]
     rhow[1:-1] = (rho[:-1] * adz_above + rho[1:] * adz_below) \
                  / (adz_below + adz_above)
-    # bottom / top linear extrapolation (gSAM lines 483-484)
     rhow[0]  = 2.0 * rho[0]    - rhow[1]
     rhow[-1] = 2.0 * rho[nz-1] - rhow[-2]
 
-    # Hydrostatic base-state pressure (Pa) by integrating dp = -rho*g*dz from surface.
-    # p_face[0] = p_surf (standard sea-level pressure).
-    p_surf = 101325.0   # Pa
+    p_surf = 101325.0
     p_face = np.zeros(len(rho) + 1)
     p_face[0] = p_surf
     for k in range(len(rho)):
         p_face[k + 1] = p_face[k] - rho[k] * G_GRAV * dz[k]
-    pres = 0.5 * (p_face[:-1] + p_face[1:])   # cell-centre pressure (nz,) Pa
+    pres = 0.5 * (p_face[:-1] + p_face[1:])
 
-    # gamaz[k] = g * z[k] / cp  (liquid-ice static energy height term)
-    gamaz = G_GRAV * grid.z / CP   # (nz,) K
+    gamaz = G_GRAV * grid.z / CP
 
-    # Coriolis + metric arrays (gSAM coriolis.f90)
-    # gSAM uses 4*pi/86400/2 = 7.2722e-5 (solar day), NOT the sidereal value.
-    OMEGA = 4.0 * np.pi / 86400.0 / 2.0    # rad/s  (gSAM setgrid.f90:497)
-    fcory  = 2.0 * OMEGA * np.sin(lat_rad)         # (ny,) f-parameter
-    fcorzy = 2.0 * OMEGA * np.cos(lat_rad)         # (ny,) f' = 2Ω cosφ  (docoriolisz)
-    tanr   = np.tan(lat_rad) / EARTH_RADIUS        # (ny,) tan(lat)/R  metric term
+    OMEGA = 4.0 * np.pi / 86400.0 / 2.0
+    fcory  = 2.0 * OMEGA * np.sin(lat_rad)
+    fcorzy = 2.0 * OMEGA * np.cos(lat_rad)
+    tanr   = np.tan(lat_rad) / EARTH_RADIUS
 
     m = {
-        "imu":     jnp.array(imu),         # (ny,)
-        "cos_v":   jnp.array(cos_v),       # (ny+1,) ady-weighted (gSAM muv)
-        "dx_lon":  float(dx_lon),          # scalar (m)
-        "dy_lat":     jnp.array(dy_per_row),   # (ny,) m   — per-row (Gap 8)
-        "dy_lat_ref": float(dy_ref),           # scalar reference dy (gSAM `dy`)
-        "ady":        jnp.array(ady),          # (ny,) ratio dy_per_row / dy_ref
-        "rho":     jnp.array(rho),         # (nz,)
-        "rhow":    jnp.array(rhow),        # (nz+1,)
-        "dz":      jnp.array(dz),          # (nz,)
-        "adz":    jnp.array(adz),      # (nz,) gSAM adz(k) = dz(k)/dz_ref
-        "adzw":   jnp.array(adzw),     # (nz+1,) gSAM adzw(k) — normalized center spacing
-        "dz_ref": float(dz_ref),       # scalar — gSAM dz (bottom-layer thickness)
-        "cos_lat": jnp.array(cos_lat),     # (ny,)
-        "lat_rad": jnp.array(lat_rad),     # (ny,) mass-cell latitudes (rad)
-        "lon_rad": jnp.array(lon_rad),     # (nx,) mass-cell longitudes (rad)
+        "imu": jnp.array(imu),
+        "cos_v": jnp.array(cos_v),
+        "dx_lon": float(dx_lon),
+        "dy_lat": jnp.array(dy_per_row),
+        "dy_lat_ref": float(dy_ref),
+        "ady": jnp.array(ady),
+        "rho": jnp.array(rho),
+        "rhow": jnp.array(rhow),
+        "dz": jnp.array(dz),
+        "adz": jnp.array(adz),
+        "adzw": jnp.array(adzw),
+        "dz_ref": float(dz_ref),
+        "cos_lat": jnp.array(cos_lat),
+        "lat_rad": jnp.array(lat_rad),
+        "lon_rad": jnp.array(lon_rad),
         "dlon_rad": float(dlon_rad),
-        "nx":       int(len(grid.lon)),    # actual zonal grid size (for FFT eigenvalues)
-        "pres":    jnp.array(pres),        # (nz,) Pa  hydrostatic base-state pressure
-        "gamaz":   jnp.array(gamaz),       # (nz,) K   g*z/cp  (static energy height term)
-        "z":       jnp.array(grid.z),      # (nz,) m   cell-centre heights
-        "fcory":   jnp.array(fcory),       # (ny,) 2*Omega*sin(lat)
-        "fcorzy":  jnp.array(fcorzy),      # (ny,) 2*Omega*cos(lat)  [docoriolisz]
-        "tanr":    jnp.array(tanr),        # (ny,) tan(lat)/R  metric term
+        "nx": int(len(grid.lon)),
+        "pres": jnp.array(pres),
+        "gamaz": jnp.array(gamaz),
+        "z": jnp.array(grid.z),
+        "fcory": jnp.array(fcory),
+        "fcorzy": jnp.array(fcorzy),
+        "tanr": jnp.array(tanr),
     }
 
-    # gSAM has no spectral polar filter — the `polar_filter` kwarg above
-    # is accepted for API compatibility but never emits pfmask_u/pfmask_v.
     return m
 
 
-# ---------------------------------------------------------------------------
-# 1.  RHS — anelastic divergence  (matches press_rhs.f90)
-# ---------------------------------------------------------------------------
-
 @jax.jit
 def press_rhs(
-    U: jax.Array,   # (nz, ny, nx+1)  zonal velocity at east faces
-    V: jax.Array,   # (nz, ny+1, nx)  meridional velocity at north faces
-    W: jax.Array,   # (nz+1, ny, nx)  vertical velocity at top faces
+    U: jax.Array,
+    V: jax.Array,
+    W: jax.Array,
     metric: dict,
     dt: float,
-) -> jax.Array:     # (nz, ny, nx)
-    """
-    RHS of the pressure Poisson equation — spherical anelastic divergence.
-
-    Consistent with the spherical Helmholtz solver and spherical gradient:
-
-      RHS(i,j,k) = (1/dt) * [
-          imu(j) * (U(i+1) - U(i)) / dx                          [spherical]
-        + (cos_v(j+1)*V(j+1) - cos_v(j)*V(j)) / (dy * cos(j))   [spherical]
-        + (rhow(k+1)*W(k+1) - rhow(k)*W(k)) / (rho(k)*dz(k))   [vertical]
-      ]
-
-    where imu(j) = 1/cos(lat_j), cos_v(j) = cos(lat_v_face_j).
-    """
+) -> jax.Array:
+    """RHS of pressure Poisson — spherical anelastic divergence."""
     dx      = metric["dx_lon"]
-    dy      = metric["dy_lat"]    # (ny,) per-row
-    rho     = metric["rho"]       # (nz,)
-    rhow    = metric["rhow"]      # (nz+1,)
-    dz      = metric["dz"]        # (nz,)
-    imu     = metric["imu"]       # (ny,)   = 1/cos(lat)
-    cos_v   = metric["cos_v"]     # (ny+1,)
-    cos_lat = metric["cos_lat"]   # (ny,)
+    dy      = metric["dy_lat"]
+    rho     = metric["rho"]
+    rhow    = metric["rhow"]
+    dz      = metric["dz"]
+    imu     = metric["imu"]
+    cos_v   = metric["cos_v"]
+    cos_lat = metric["cos_lat"]
 
     rho3   = rho[:, None, None]
     rhow3  = rhow[:, None, None]
     dz3    = dz[:, None, None]
-    dy3    = dy[None, :, None]    # (1, ny, 1)
+    dy3    = dy[None, :, None]
 
-    # Spherical zonal divergence: (1/(R cosφ)) d(U)/dλ
     div_u = imu[None, :, None] * (U[:, :, 1:] - U[:, :, :-1]) / dx
 
-    # Spherical meridional divergence: (1/(R cosφ)) d(cosφ V)/dφ
     div_v = (cos_v[None, 1:, None] * V[:, 1:, :]
            - cos_v[None, :-1, None] * V[:, :-1, :]) / (dy3 * cos_lat[None, :, None])
 
-    # Anelastic vertical divergence (same as Cartesian — no metric)
     div_w = (rhow3[1:] * W[1:] - rhow3[:-1] * W[:-1]) / (rho3 * dz3)
 
     return (div_u + div_v + div_w) / dt
 
 
-# ---------------------------------------------------------------------------
-# 2.  Helmholtz operator for one zonal wavenumber m   (used inside PCG)
-# ---------------------------------------------------------------------------
-
 def _helmholtz_op(
-    P_flat: jax.Array,     # (ny*nz,)  real or complex
+    P_flat: jax.Array,
     m: int,
     metric: dict,
     ny: int,
     nz: int,
-) -> jax.Array:            # (ny*nz,)
-    """
-    Apply the Helmholtz operator H_m to P for zonal wavenumber m:
-
-      H_m[P](j,k) = α_m(j) * P(j,k)    [spectral zonal eigenvalue]
-                  + L_y[P](j,k)          [meridional Laplacian with cos(lat)]
-                  + L_z[P](j,k)          [vertical Laplacian with density]
-
-    Boundary conditions (Neumann everywhere → zero normal gradient):
-      L_y: dP/dlat = 0 at south and north poles (j=0 and j=ny-1)
-      L_z: dP/dz   = 0 at bottom (k=0) and top (k=nz-1)
-
-    Note: H_m is negative (semi-)definite. The solver uses the negated system.
-    """
+) -> jax.Array:
+    """Apply Helmholtz operator H_m for zonal wavenumber m."""
     P = P_flat.reshape(ny, nz)
 
-    cos_lat  = metric["cos_lat"]   # (ny,)
-    dy_row   = metric["dy_lat"]    # (ny,) per-row mass-cell spacing
-    rho      = metric["rho"]       # (nz,)
-    rhow     = metric["rhow"]      # (nz+1,)
-    dz       = metric["dz"]        # (nz,)
+    cos_lat  = metric["cos_lat"]
+    dy_row   = metric["dy_lat"]
+    rho      = metric["rho"]
+    rhow     = metric["rhow"]
+    dz       = metric["dz"]
     dlon_rad = metric["dlon_rad"]
 
     R = EARTH_RADIUS
 
-    # ── Spectral zonal eigenvalue α_m(j) ─────────────────────────────────────
-    # FD eigenvalue: -4 sin²(π m / nx) / (dλ * R cos φ)²
-    # Use metric["nx"] (actual grid size) so this is correct for both global
-    # and limited-area domains.  (For global grids nx ≈ 2π/dlon_rad anyway.)
     nx_grid = metric["nx"]
     sin2 = jnp.sin(jnp.pi * m / nx_grid) ** 2
-    alpha_m = -4.0 * sin2 / (dlon_rad * R * cos_lat) ** 2   # (ny,)   [m^-2]
+    alpha_m = -4.0 * sin2 / (dlon_rad * R * cos_lat) ** 2
 
-    zonal = alpha_m[:, None] * P   # (ny, nz)
+    zonal = alpha_m[:, None] * P
 
-    # ── Meridional Laplacian: (1/(R²cos φ)) d/dφ(cos φ dP/dφ) ──────────────
-    # Non-uniform form (gSAM-compatible):
-    #   flux_p[j_face] = cos_v[j_face] * (P[j] - P[j-1]) / dy_v[j_face]
-    #   L_y P[j] = (flux_p[j+1] - flux_p[j]) / (dy_row[j] * cos_lat[j])
-    # where dy_v[j_face] = 0.5*(dy_row[j-1]+dy_row[j]) is the distance
-    # between mass points j-1 and j.  On a uniform grid dy_v = dy_row and
-    # this reduces to the 1/dy² form.
-    cos_v = metric["cos_v"]                                  # (ny+1,)
-    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])              # (ny-1,)
+    cos_v = metric["cos_v"]
+    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])
 
-    dP_north = P[1:, :] - P[:-1, :]                          # (ny-1, nz)
+    dP_north = P[1:, :] - P[:-1, :]
     flux_n = cos_v[1:-1, None] * dP_north / dy_v_int[:, None]
 
-    # Neumann BC: zero flux at south (j=0) and north (j=ny-1) faces
     flux_south = jnp.zeros((1, nz))
     flux_north = jnp.zeros((1, nz))
-    flux = jnp.concatenate([flux_south, flux_n, flux_north], axis=0)  # (ny+1, nz)
+    flux = jnp.concatenate([flux_south, flux_n, flux_north], axis=0)
 
-    L_y = (flux[1:, :] - flux[:-1, :]) / (dy_row[:, None] * cos_lat[:, None])  # (ny, nz)
+    L_y = (flux[1:, :] - flux[:-1, :]) / (dy_row[:, None] * cos_lat[:, None])
 
-    # ── Vertical Laplacian: (1/ρ) d/dz(ρ_w dP/dz) ───────────────────────────
-    # D8 fix: gSAM pressure_big.f90:196 uses adzw(k)*dz (center-to-center
-    # distance) as the flux denominator, not cell thickness dz(k-1).
-    adzw   = metric["adzw"]    # (nz+1,)
-    dz_ref = metric["dz_ref"]  # scalar
-    dPz = P[:, 1:] - P[:, :-1]                           # (ny, nz-1) at z-faces 1..nz-1
-    # adzw[1:-1] are the center-to-center distances at interior faces
-    flux_z_int = rhow[1:-1, None].T * dPz / (adzw[1:-1] * dz_ref)  # (ny, nz-1)
+    adzw   = metric["adzw"]
+    dz_ref = metric["dz_ref"]
+    dPz = P[:, 1:] - P[:, :-1]
+    flux_z_int = rhow[1:-1, None].T * dPz / (adzw[1:-1] * dz_ref)
 
-    # Neumann at bottom and top: zero flux
     flux_z_bot = jnp.zeros((ny, 1))
     flux_z_top = jnp.zeros((ny, 1))
-    flux_z = jnp.concatenate([flux_z_bot, flux_z_int, flux_z_top], axis=1)  # (ny, nz+1)
+    flux_z = jnp.concatenate([flux_z_bot, flux_z_int, flux_z_top], axis=1)
 
-    L_z = (flux_z[:, 1:] - flux_z[:, :-1]) / (dz[None, :] * rho[None, :])  # (ny, nz)
+    L_z = (flux_z[:, 1:] - flux_z[:, :-1]) / (dz[None, :] * rho[None, :])
 
     result = zonal + L_y + L_z
     return result.ravel()
 
 
 def _build_Lz_matrix(metric: dict, nz: int) -> jax.Array:
-    """
-    Build the nz×nz tridiagonal vertical Laplacian matrix (same for all latitudes).
-
-    L_z[k, k'] is the (1/ρ) d/dz(ρ_w dP/dz) operator with Neumann BCs.
-    This matrix is negative semi-definite.
-    """
-    rho  = metric["rho"]    # (nz,) JAX array
-    rhow = metric["rhow"]   # (nz+1,)
-    dz   = metric["dz"]     # (nz,)
-    adzw = metric["adzw"]    # (nz+1,)
+    """Build nz×nz tridiagonal vertical Laplacian matrix."""
+    rho  = metric["rho"]
+    rhow = metric["rhow"]
+    dz   = metric["dz"]
+    adzw = metric["adzw"]
     dz_ref = float(metric["dz_ref"])
 
-    # Convert to numpy for matrix construction
     rho_np  = np.array(rho)
     rhow_np = np.array(rhow)
     dz_np   = np.array(dz)
@@ -339,24 +202,22 @@ def _build_Lz_matrix(metric: dict, nz: int) -> jax.Array:
     for k in range(nz):
         coeff = 1.0 / (rho_np[k] * dz_np[k])
         if k > 0:
-            # D8 fix: use adzw(k)*dz_ref (center-to-center distance) as flux denominator
             c_lo = rhow_np[k] / (adzw_np[k] * dz_ref)
             L[k, k - 1] += c_lo * coeff
             L[k, k]     -= c_lo * coeff
         if k < nz - 1:
-            # D8 fix: use adzw(k+1)*dz_ref
             c_hi = rhow_np[k + 1] / (adzw_np[k + 1] * dz_ref)
             L[k, k + 1] += c_hi * coeff
             L[k, k]     -= c_hi * coeff
 
-    return jnp.array(L)   # (nz, nz)
+    return jnp.array(L)
 
 
 def _compute_alpha_m(m: int, metric: dict) -> jax.Array:
     """Return the zonal eigenvalue α_m(j) for each latitude j."""
     cos_lat  = metric["cos_lat"]   # (ny,) JAX
     dlon_rad = metric["dlon_rad"]
-    nx_grid  = metric["nx"]        # actual number of zonal grid points
+    nx_grid  = metric["nx"]
     sin2 = np.sin(np.pi * m / nx_grid) ** 2
     alpha = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS * np.array(cos_lat)) ** 2
     return jnp.array(alpha)  # (ny,)
@@ -376,18 +237,15 @@ def _build_Ly_matrix(metric: dict, ny: int) -> np.ndarray:
     between adjacent mass points.  Neumann at the poles → boundary fluxes
     are zero.  On a uniform grid this reduces to the 1/dy² form.
     """
-    cos_lat = np.array(metric["cos_lat"])            # (ny,)
-    cos_v   = np.array(metric["cos_v"])              # (ny+1,)
-    dy_row  = np.array(metric["dy_lat"])             # (ny,) per-row
-
-    # dy_v[j_face] for j_face = 1..ny-1 (interior v-faces)
-    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])      # (ny-1,)
+    cos_lat = np.array(metric["cos_lat"])
+    cos_v   = np.array(metric["cos_v"])
+    dy_row  = np.array(metric["dy_lat"])
+    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])
 
     L = np.zeros((ny, ny))
     for j in range(ny):
         inv_row = 1.0 / (dy_row[j] * cos_lat[j])
         if j > 0:
-            # flux_p[j]  contributes  -cos_v[j]*(P[j]-P[j-1])/dy_v[j] * inv_row
             c = cos_v[j] / dy_v_int[j - 1] * inv_row
             L[j, j - 1] += c
             L[j, j]     -= c
@@ -408,16 +266,14 @@ def _build_Hm_matrix(m: int, metric: dict, ny: int, nz: int) -> np.ndarray:
     H_m is negative (semi-)definite; for m≥1 it is negative definite.
     For m=0 it has a one-dimensional null space (constant field).
     """
-    L_z_np = np.array(_build_Lz_matrix(metric, nz))   # (nz, nz)
-    L_y_np = _build_Ly_matrix(metric, ny)              # (ny, ny)
-    alpha  = np.array(_compute_alpha_m(m, metric))     # (ny,)
-
+    L_z_np = np.array(_build_Lz_matrix(metric, nz))
+    L_y_np = _build_Ly_matrix(metric, ny)
+    alpha  = np.array(_compute_alpha_m(m, metric))
     I_ny = np.eye(ny)
     I_nz = np.eye(nz)
-
-    return (np.kron(np.diag(alpha), I_nz)   # α_m(j) * I_nz per latitude
-          + np.kron(L_y_np, I_nz)           # meridional Laplacian
-          + np.kron(I_ny, L_z_np))          # vertical Laplacian
+    return (np.kron(np.diag(alpha), I_nz)
+          + np.kron(L_y_np, I_nz)
+          + np.kron(I_ny, L_z_np))
 
 
 def _make_vertical_precond(m: int, metric: dict, ny: int, nz: int):
@@ -431,22 +287,15 @@ def _make_vertical_precond(m: int, metric: dict, ny: int, nz: int):
     Returns:
         precond(r) — applies M^{-1} r, where r has shape (ny*nz,)
     """
-    L_z = _build_Lz_matrix(metric, nz)            # (nz, nz)
-    alpha = _compute_alpha_m(m, metric)            # (ny,) negative values
-
-    # M[j] = -(alpha_m[j]*I + L_z) = positive definite nz×nz matrix
-    # Build (ny, nz, nz) batch of M matrices
+    L_z = _build_Lz_matrix(metric, nz)
+    alpha = _compute_alpha_m(m, metric)
     I_nz = jnp.eye(nz)
-    M_batch = -(alpha[:, None, None] * I_nz[None, :, :] + L_z[None, :, :])  # (ny, nz, nz)
-
-    # Precompute M^{-1} for each latitude via vmap
-    M_inv = jax.vmap(jnp.linalg.inv)(M_batch)    # (ny, nz, nz)
+    M_batch = -(alpha[:, None, None] * I_nz[None, :, :] + L_z[None, :, :])
+    M_inv = jax.vmap(jnp.linalg.inv)(M_batch)
 
     def precond(r: jax.Array) -> jax.Array:
-        # r: (ny*nz,) → (ny, nz)
         R = r.reshape(ny, nz)
-        # Apply M^{-1}[j] to R[j] for each j
-        Q = jax.vmap(lambda Mi, ri: Mi @ ri)(M_inv, R)   # (ny, nz)
+        Q = jax.vmap(lambda Mi, ri: Mi @ ri)(M_inv, R)
         return Q.ravel()
 
     return precond
@@ -457,22 +306,13 @@ def _make_vertical_precond(m: int, metric: dict, ny: int, nz: int):
 # ---------------------------------------------------------------------------
 
 def _pcg_solve(
-    op,                      # callable: (n,) → (n,), positive definite
-    b: jax.Array,            # (n,) RHS
-    precond,                 # callable: (n,) → (n,), applies M^{-1}
+    op,
+    b: jax.Array,
+    precond,
     tol: float = 1e-5,
     maxiter: int = 200,
-) -> jax.Array:              # (n,)
-    """
-    Preconditioned Conjugate Gradient solver (Python for-loop, eager).
-
-    Avoids jax.lax.while_loop to prevent per-mode JIT compilation overhead
-    (33 modes × compile time ≈ several minutes). Eager PCG is fast for the
-    small (ny×nz) systems we solve here.
-
-    Solves A * x = b where A is symmetric positive definite, M^{-1} ≈ A^{-1}.
-    Stops when ||r||₂ < tol * ||b||₂  or after maxiter iterations.
-    """
+) -> jax.Array:
+    """Preconditioned Conjugate Gradient solver (eager execution)."""
     tol2 = tol ** 2 * float(jnp.dot(b, b))
     if tol2 == 0.0:
         return jnp.zeros_like(b)
@@ -520,13 +360,13 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     """
     import scipy.sparse as sp
 
-    cos_lat  = metric_np["cos_lat"]                    # (ny,)
+    cos_lat  = metric_np["cos_lat"]
     cos_lat_c = np.maximum(cos_lat, 1e-6)
-    cos_v    = metric_np["cos_v"]                      # (ny+1,)
-    dy_row   = np.asarray(metric_np["dy_lat"], dtype=np.float64)   # (ny,) per-row
-    rho      = metric_np["rho"]                        # (nz,)
-    rhow     = metric_np["rhow"]                       # (nz+1,)
-    dz       = metric_np["dz"]                         # (nz,)
+    cos_v    = metric_np["cos_v"]
+    dy_row   = np.asarray(metric_np["dy_lat"], dtype=np.float64)
+    rho      = metric_np["rho"]
+    rhow     = metric_np["rhow"]
+    dz       = metric_np["dz"]
     dlon_rad = float(metric_np["dlon_rad"])
     nx_grid  = int(metric_np["nx"])
 
@@ -534,15 +374,7 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     sin2    = np.sin(np.pi * m / nx_grid) ** 2
     alpha_m = -4.0 * sin2 / (dlon_rad * R * cos_lat_c) ** 2   # (ny,)
 
-    # Non-uniform L_y coefficients (variable meridional spacing, gSAM dyvar).
-    #   flux_p[j_face] = cos_v[j_face] * (P[j] - P[j-1]) / dy_v[j_face]
-    #   L_y[j]         = (flux_p[j+1] - flux_p[j]) / (dy_row[j] * cos_lat[j])
-    # → L_y[j, j-1] =  cos_v[j]   / (dy_v[j]   * dy_row[j] * cos_lat[j])
-    #   L_y[j, j+1] =  cos_v[j+1] / (dy_v[j+1] * dy_row[j] * cos_lat[j])
-    #   L_y[j, j]   = -(L_y[j, j-1] + L_y[j, j+1])
-    # where dy_v[j_face] = 0.5*(dy_row[j-1]+dy_row[j]).  On uniform grids
-    # dy_v == dy_row and this reduces to the old 1/dy² form exactly.
-    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])        # (ny-1,)
+    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])
 
     c_lo = np.zeros(ny)   # coefficient multiplying P[j-1,:]
     c_hi = np.zeros(ny)   # coefficient multiplying P[j+1,:]
@@ -553,14 +385,10 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
         if j < ny - 1:
             c_hi[j] = cos_v[j + 1] / dy_v_int[j] * inv_row
 
-    # D8 fix: use adzw*dz_ref (center-to-center distance) as flux denominator
     adzw = np.asarray(metric_np.get("adzw", np.ones(nz + 1)), dtype=np.float64)
     dz_ref_val = float(metric_np.get("dz_ref", dz[0]))
-
-    # Precompute L_z coefficients for each k (same for all j)
-    # L_z[k, k-1] = d_lo[k],  L_z[k, k+1] = d_hi[k],  L_z[k, k] = -d_lo[k]-d_hi[k]
-    d_lo = np.zeros(nz)   # coefficient multiplying P[:,k-1]
-    d_hi = np.zeros(nz)   # coefficient multiplying P[:,k+1]
+    d_lo = np.zeros(nz)
+    d_hi = np.zeros(nz)
     for k in range(nz):
         c = 1.0 / (rho[k] * dz[k])
         if k > 0:
@@ -568,24 +396,19 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
         if k < nz - 1:
             d_hi[k] = rhow[k + 1] / (adzw[k + 1] * dz_ref_val) * c
 
-    # Build COO arrays
     n = ny * nz
     rows, cols, vals = [], [], []
-
     for j in range(ny):
-        diag_j = alpha_m[j] - (c_lo[j] + c_hi[j])   # zonal + L_y diagonal
+        diag_j = alpha_m[j] - (c_lo[j] + c_hi[j])
         for k in range(nz):
             row = j * nz + k
-            diag_k = -(d_lo[k] + d_hi[k])             # L_z diagonal
-            # Diagonal
+            diag_k = -(d_lo[k] + d_hi[k])
             rows.append(row); cols.append(row)
             vals.append(diag_j + diag_k)
-            # Vertical neighbours
             if k > 0:
                 rows.append(row); cols.append(row - 1); vals.append(d_lo[k])
             if k < nz - 1:
                 rows.append(row); cols.append(row + 1); vals.append(d_hi[k])
-            # Meridional neighbours
             if j > 0:
                 rows.append(row); cols.append(row - nz); vals.append(c_lo[j])
             if j < ny - 1:
@@ -905,13 +728,12 @@ def apply_pressure_gradient(
     solver (FFT-x + sparse-LU in (y,z)):
 
       U -= dt * imu(j) * (p(i) - p(i-1)) / dx
-      V -= dt * (p(j) - p(j-1)) / dy
-      W -= dt * igam2 * (p(k) - p(k-1)) / dz(k)
+      V -= dt * (p(j) - p(j-1)) / dy_v
+      W -= dt * igam2 * (p(k) - p(k-1)) / (dz_ref * adzw(k))
     """
-    dx   = metric["dx_lon"]
+    dx     = metric["dx_lon"]
     dy_row = metric["dy_lat"]   # (ny,) per-row mass-cell dy
-    dz   = metric["dz"]      # (nz,)
-    imu  = metric["imu"]     # (ny,)  = 1/cos(lat)
+    imu    = metric["imu"]      # (ny,)  = 1/cos(lat)
 
     # ── Zonal: imu * dp/dλ at east faces  (spherical) ────────────────────────
     p_west = jnp.roll(p, 1, axis=2)
@@ -925,9 +747,14 @@ def apply_pressure_gradient(
     dp_dy_int = (p[:, 1:, :] - p[:, :-1, :]) / dy_v_int[None, :, None]  # (nz, ny-1, nx)
     V_new = V.at[:, 1:-1, :].add(-dt * dp_dy_int)
 
-    # ── Vertical: dp/dz at top faces  (same as Cartesian) ────────────────────
-    dz3 = dz[:, None, None]
-    dp_dz_int = (p[1:, :, :] - p[:-1, :, :]) / dz3[:-1]        # (nz-1, ny, nx)
+    # ── Vertical: dp/dz at w-faces — use center-to-center spacing adzw*dz_ref
+    # Matches gSAM press_grad.f90: rdz = 1./(dz*adzw(k)) where dz=dz_ref.
+    # Must be consistent with _build_Lz_matrix and _helmholtz_op which also
+    # use adzw (D8 fix).
+    dz_ref = metric["dz_ref"]                                     # scalar
+    adzw   = metric["adzw"]                                       # (nz+1,)
+    dz_face = dz_ref * adzw[1:-1]                                 # (nz-1,) center-to-center
+    dp_dz_int = (p[1:, :, :] - p[:-1, :, :]) / dz_face[:, None, None]  # (nz-1, ny, nx)
     W_new = W.at[1:-1, :, :].add(-dt * igam2 * dp_dz_int)
 
     return U_new, V_new, W_new

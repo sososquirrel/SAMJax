@@ -12,7 +12,7 @@
 FC="${FC:-gfortran}"
 FFLAGS="${FFLAGS:--O2 -fno-unsafe-math-optimizations}"
 PYTHON="${PYTHON:-python}"
-JSAM_ROOT="${JSAM_ROOT:-/glade/u/home/sabramian/jsam}"
+JSAM_ROOT="${JSAM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 ATOL="${ATOL:-5e-5}"
 RTOL="${RTOL:-1e-4}"
 
