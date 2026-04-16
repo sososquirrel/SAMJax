@@ -502,9 +502,12 @@ def main():
                 _cur_dt_from_start = float(state.time)
                 _cur_sim_time = START_TIME + timedelta(seconds=_cur_dt_from_start)
 
-                # Use fallback LW downwelling for SLM on all steps.
-                # (Proper fix: compute RRTMG every nrad steps in step.py and cache)
-                _lwds = jnp.full_like(state.TABS[0], 350.0)
+                # Use cached LW downwelling from step.py RRTMG computation (every nrad steps)
+                # Fall back to 350 K if not yet computed (first nrad-1 steps)
+                if forcing.slm_rad is not None and hasattr(forcing.slm_rad, 'lwds'):
+                    _lwds = forcing.slm_rad.lwds
+                else:
+                    _lwds = jnp.full_like(state.TABS[0], 350.0)
 
                 _lat_rad = jnp.asarray(grid.lat * (np.pi / 180.0))
                 _lon_rad = jnp.asarray(grid.lon * (np.pi / 180.0))

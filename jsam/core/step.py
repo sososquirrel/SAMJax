@@ -26,7 +26,7 @@ from jsam.core.physics.sgs import (
 )
 from jsam.core.physics.microphysics import MicroParams, micro_proc, CP, FAC_COND, FAC_SUB
 from jsam.core.physics.radiation import RadForcing, rad_proc
-from jsam.core.physics.rad_rrtmg import RadRRTMGConfig, rad_rrtmg_proc, compute_qrad_rrtmg
+from jsam.core.physics.rad_rrtmg import RadRRTMGConfig, rad_rrtmg_proc, compute_qrad_rrtmg, compute_qrad_and_lwds_rrtmg
 from jsam.core.physics.lsforcing import LargeScaleForcing, ls_proc
 from jsam.core.physics.surface import BulkParams, bulk_surface_fluxes
 from jsam.core.physics.nudging import NudgingParams, nudge_proc
@@ -274,7 +274,8 @@ def step(
                     "lat_rad":     metric["lat_rad"],
                     "lon_rad":     metric["lon_rad"],
                 }
-            _new_qrad = compute_qrad_rrtmg(
+            # Compute both qrad (for main heating) and lwds (for SLM)
+            _new_qrad, _lwds_new = compute_qrad_and_lwds_rrtmg(
                 state, metric, config.rad_rrtmg, forcing.sst,
                 o3vmr=(None if forcing.o3vmr_rrtmg is None
                        else jnp.asarray(forcing.o3vmr_rrtmg)),
@@ -288,7 +289,8 @@ def step(
                 sst=forcing.sst, o3vmr_rrtmg=forcing.o3vmr_rrtmg,
                 qrad_rrtmg=_new_qrad,
                 slm_static=forcing.slm_static, slm_state=forcing.slm_state,
-                slm_rad=forcing.slm_rad, precip_ref=forcing.precip_ref,
+                slm_rad=(forcing.slm_rad._replace(lwds=_lwds_new) if forcing.slm_rad is not None else forcing.slm_rad),
+                precip_ref=forcing.precip_ref,
             )
         if forcing.qrad_rrtmg is not None:
             state = ModelState(
