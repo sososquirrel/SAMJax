@@ -462,6 +462,7 @@ def slm_proc(
     q_gr = vf.q_gr
     evp_soil = vf.evp_soil
     lhf_soil = vf.lhf_soil
+    r_soil = vf.r_soil
     # Override canopy part of air totals with subcycle averages.
     # Fortran builds evp_air = evp_canop + evp_soil (veg) or evp_soil (bare),
     # with the canopy piece coming from the subcycle.
@@ -477,7 +478,7 @@ def slm_proc(
     #     precip_in is the amount reaching soil surface, clipped to
     #     top-layer saturated conductivity (Fortran soil_water.f90 L1).
     # ------------------------------------------------------------------
-    precip_in_cap = jnp.minimum(
+    precip_in_cap = (1.0 - static.IMPERV) * jnp.minimum(
         precip_sfc + slm_state.mws / dt,
         static.ks[0],
     )
@@ -518,27 +519,20 @@ def slm_proc(
 
     # wet_canop for conductance weighting — using latest mw_post.
     wet_canop = jnp.minimum(1.0, mw_post / jnp.maximum(mw_mx, 1.0e-20))
-    # r_soil is internal to vapor_fluxes and not exposed; reconstruct
-    # the Fortran ``cond_vapor`` using the (r_d + r_litter + r_soil)
-    # branch cannot be done cleanly here. Instead we approximate the
-    # humidity blend with dominant air-side conductance (r_a, 2 r_b,
-    # r_d) — for diagnostic q_cas this matches Fortran to within the
-    # numerical closure of vapor_fluxes.  (The flux diagnostics that
-    # feed sgs_proc are already exact; q_cas only affects the NEXT
-    # step's transfer_coef q_sfc.)
-    # Vegetated branch (Fortran 419-423 simplified w/ r_soil=0):
+    # Vegetated branch (Fortran 419-423): uses actual r_soil from
+    # vapor_fluxes (50-10000 s/m) in the soil conductance term.
     cond_vapor_veg = (
         inv_ra
         + wet_canop / (2.0 * r_b)
         + (1.0 - wet_canop) / (2.0 * r_b + r_c)
-        + 1.0 / (r_d + r_litter + 1.0e-20)
+        + 1.0 / (r_d + r_litter + r_soil)
     )
     cond_vref_veg = inv_ra / cond_vapor_veg
     cond_vcnp_veg = (
         (wet_canop / (2.0 * r_b) + (1.0 - wet_canop) / (2.0 * r_b + r_c))
         / cond_vapor_veg
     )
-    cond_vunder_veg = (1.0 / (r_d + r_litter + 1.0e-20)) / cond_vapor_veg
+    cond_vunder_veg = (1.0 / (r_d + r_litter + r_soil)) / cond_vapor_veg
 
     cond_vref_bare = jnp.ones_like(inv_ra)
     cond_vcnp_bare = jnp.zeros_like(inv_ra)
@@ -588,6 +582,11 @@ def slm_proc(
     # this state against the ocean path; we leave the arithmetic in
     # place so the result is deterministic under JIT.
 
+    # TODO(D27): snow_mass, snowt, and mws are NOT evolved here — they are
+    # passed through unchanged from the previous step. A full port of gSAM's
+    # snow_proc subroutine (snow accumulation, melt, sublimation, snow
+    # temperature evolution, and standing-water / puddle dynamics) is needed
+    # before these prognostics are physically meaningful.
     new_slm_state = SLMState(
         soilt=new_soilt,
         soilw=new_soilw,

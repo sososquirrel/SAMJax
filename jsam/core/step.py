@@ -64,7 +64,7 @@ from jsam.core.physics.sgs import (
     diffuse_momentum_horiz, diffuse_damping_mom_z,
     _sgs_coefs,
 )
-from jsam.core.physics.microphysics import MicroParams, micro_proc
+from jsam.core.physics.microphysics import MicroParams, micro_proc, CP
 from jsam.core.physics.radiation import RadForcing, rad_proc
 from jsam.core.physics.rad_rrtmg import RadRRTMGConfig, rad_rrtmg_proc, compute_qrad_rrtmg
 from jsam.core.physics.lsforcing import LargeScaleForcing, ls_proc
@@ -397,10 +397,19 @@ def step(
     _nstep_py = int(state.nstep)
     _at_ab, _bt_ab, _ct_ab = ab_coefs(_nstep_py, dt, dt_prev, dt_pprev)
 
+    # D11 fix: gSAM increments nstep at TOP of time loop, BEFORE any
+    # physics.  Increment here so any nstep-conditional logic within the
+    # step sees the correct value.
+    state = ModelState(
+        U=state.U, V=state.V, W=state.W,
+        TABS=state.TABS, QV=state.QV, QC=state.QC,
+        QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+        TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+        nstep=state.nstep + 1, time=state.time,
+    )
+
     # ── Oracle-compatible stage dumps (19 gSAM stages per step) ──────
-    # gSAM increments nstep at the top of its time loop, so its "nstep"
-    # label for this step() call equals the incoming state.nstep + 1.
-    _dump_nstep = _nstep_py + 1
+    _dump_nstep = int(state.nstep)
     _stage_dump(state, 0, dt, force_nstep=_dump_nstep)  # pre_step
 
     # ------------------------------------------------------------------
@@ -409,12 +418,13 @@ def step(
     if forcing.ls_forcing is not None:
         state = ls_proc(state, metric, forcing.ls_forcing, dt)
 
-    # gSAM stages 1 (forcing), 2 (nudging) and 3 (buoyancy) all map here.
-    # jsam runs radiation BEFORE nudging, and buoyancy is a tendency-only
-    # accumulator that never mutates state — so for IRMA (donudging_tq=
-    # .false.) the three gSAM stages share identical state values.
     _stage_dump(state, 1, dt, force_nstep=_dump_nstep)  # forcing
     _stage_dump(state, 2, dt, force_nstep=_dump_nstep)  # nudging
+
+    # D9 fix: gSAM computes buoyancy BEFORE radiation, so buoyancy sees
+    # pre-radiation TABS.  Save the state for buoyancy computation.
+    _state_for_buoyancy = state
+
     _stage_dump(state, 3, dt, force_nstep=_dump_nstep)  # buoyancy
 
     # ------------------------------------------------------------------
@@ -598,6 +608,9 @@ def step(
     for _sid in (5, 6, 7, 8, 9):
         _stage_dump(state, _sid, dt, force_nstep=_dump_nstep)
 
+    # C1 fix: save pre-dynamics velocity for half-step averaging in scalar advection
+    _U_old, _V_old, _W_old = state.U, state.V, state.W
+
     _tk = None   # will be set if SGS is active; reused by implicit solver in step 8
     if config.sgs_params is not None:
         _tk, _tkh = _sgs_coefs(
@@ -610,12 +623,36 @@ def step(
     dW_extra = jnp.zeros((nz_s + 1, ny_s, nx_s))
 
     # 4. Buoyancy tendency on W  [≡ gSAM buoyancy.f90 — adds to dwdt(na)]
+    #    D9 fix: use pre-radiation state so buoyancy sees pre-radiation TABS
     if forcing.tabs0 is not None:
         qv0 = forcing.qv0 if forcing.qv0 is not None else jnp.zeros_like(forcing.tabs0)
-        _dW_buo = _buoyancy_W(state, forcing.tabs0, qv0,
+        _dW_buo = _buoyancy_W(_state_for_buoyancy, forcing.tabs0, qv0,
                                metric["dz"], config.g, config.epsv,
                                qn0=forcing.qn0, qp0=forcing.qp0)
         dW_extra = dW_extra + _dW_buo
+
+        # C13 fix: buoyancy energy correction (gSAM buoyancy.f90:58-62)
+        # t(kb) -= 0.5*dtn/cp * buo * w;  t(k) -= 0.5*dtn/cp * buo * w
+        # This conserves total (kinetic + thermal) energy when buoyancy
+        # does work on the vertical velocity.  The correction is applied to
+        # both mass cells adjacent to each interior w-face.
+        _coef_buo = 0.5 * dt / CP
+        # _dW_buo is at w-faces (nz+1, ny, nx); interior faces are 1..nz-1
+        _buo_w_int = _dW_buo[1:-1, :, :]  # (nz-1, ny, nx)
+        _w_int     = state.W[1:-1, :, :]   # (nz-1, ny, nx)
+        _factor    = _coef_buo * _buo_w_int * _w_int   # (nz-1, ny, nx)
+        # Apply to lower cell (kb = k-1, indices 0..nz-2) and upper cell (k, indices 1..nz-1)
+        _TABS_corr = state.TABS
+        _TABS_corr = _TABS_corr.at[:-1, :, :].add(-_factor)  # lower cells
+        _TABS_corr = _TABS_corr.at[1:, :, :].add(-_factor)   # upper cells
+        state = ModelState(
+            U=state.U, V=state.V, W=state.W,
+            TABS=_TABS_corr, QV=state.QV, QC=state.QC,
+            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+            nstep=state.nstep, time=state.time,
+        )
+
         jax.debug.print(
             "  DIAG [{n:>3}] B_buoy    dW_buo_abs_max={m:.4e}  (dt*max={x:.4f})",
             n=state.nstep, m=jnp.max(jnp.abs(_dW_buo)),
@@ -736,6 +773,8 @@ def step(
                 _W_imp, metric["z"],
                 nub=config.w_sponge_nub,
                 taudamp_max=config.w_sponge_max,
+                dtn=_at_ab * dt,   # D4: gSAM tau_max = dtn/dt
+                dt=dt,
             )
         state = ModelState(
             U=_U_imp, V=_V_imp, W=_W_imp,
@@ -958,6 +997,11 @@ def step(
             # field: (nz, ny, nx) → (nz,)
             return jnp.sum(jnp.mean(field, axis=2) * _wgt[None, :], axis=1)
 
+        # D10: gSAM diagnose.f90:37 recovers tabs from the conserved static
+        # energy variable t: tabs = t - gamaz + fac_cond*(qcl+qpl) + fac_sub*(qci+qpi).
+        # With D25 (advecting full t instead of s=TABS+gamaz), jsam's TABS is
+        # now consistent with gSAM's recovered tabs, so averaging state.TABS
+        # directly is correct.
         _tabs_mean = _hmean(state.TABS)
         _q0        = _hmean(state.QV + state.QC + state.QI)
         _qn0       = _hmean(state.QC + state.QI)

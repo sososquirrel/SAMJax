@@ -55,7 +55,7 @@ CPV      = 1870.0       # J/(kg K)  specific heat of water vapour
 CPW      = 3991.86795711963  # J/(kg K)  specific heat of seawater
 RV       = 461.5        # J/(kg K)  gas constant for water vapour
 RGAS     = 287.04       # J/(kg K)  gas constant for dry air
-EPS      = RGAS / RV    # ≈ 0.6220  Rd/Rv
+EPS      = 0.622        # gSAM sat.f90 uses literal 0.622, not Rd/Rv
 
 LV       = 2.501e6      # J/kg      latent heat of vaporization (0°C)
 LF       = 0.337e6      # J/kg      latent heat of fusion
@@ -135,14 +135,21 @@ class MicroParams:
 
 
 def _gamma_coefs(p: MicroParams) -> dict:
-    """Gamma function values derived from terminal-velocity exponents."""
+    """Gamma function values derived from terminal-velocity exponents.
+
+    gSAM declares these as real*4 (float32), so we truncate to float32
+    precision to match (micro_params.f90:82).
+    """
+    def _gam32(x):
+        return float(np.float32(_scipy_gamma(x)))
+
     return {
-        "gamr1": float(_scipy_gamma(3 + p.b_rain)),
-        "gamr2": float(_scipy_gamma((5 + p.b_rain) / 2)),
-        "gams1": float(_scipy_gamma(3 + p.b_snow)),
-        "gams2": float(_scipy_gamma((5 + p.b_snow) / 2)),
-        "gamg1": float(_scipy_gamma(3 + p.b_grau)),
-        "gamg2": float(_scipy_gamma((5 + p.b_grau) / 2)),
+        "gamr1": _gam32(3 + p.b_rain),
+        "gamr2": _gam32((5 + p.b_rain) / 2),
+        "gams1": _gam32(3 + p.b_snow),
+        "gams2": _gam32((5 + p.b_snow) / 2),
+        "gamg1": _gam32(3 + p.b_grau),
+        "gamg2": _gam32((5 + p.b_grau) / 2),
     }
 
 
@@ -224,6 +231,8 @@ def satadj(
     JIT-compilable without data-dependent branching.
     """
     pres_mb  = metric["pres"][:, None, None] / 100.0   # Pa → mb, (nz,1,1)
+    # D21: gSAM uses full 3D pressure pp(i,j,k) for qsat; jsam uses 1D mean.
+    # When 3D p' is available, add: pres_mb = pres_mb + pp_3d / 100.0
     gamaz_3d = metric["gamaz"][:, None, None]            # (nz,1,1) K
 
     a_bg = 1.0 / (params.tbgmax - params.tbgmin)
@@ -263,19 +272,38 @@ def satadj(
             a_pr * FAC_FUS, 0.0,
         )
 
-        # Mixed-phase saturation mixing ratio
+        # C12 fix: homogeneous freezing supersaturation (gSAM cloud.f90:48-52)
+        # At T<235K with negligible existing ice, ice nucleation requires
+        # supersaturation rh_homo = 2.583 - T/207.8 (IFS parameterization).
+        rh_homo = jnp.where(
+            (tabs1 < 235.0) & (QI < 1.0e-8),
+            2.583 - tabs1 / 207.8,
+            1.0,
+        )
+
+        # Mixed-phase saturation mixing ratio (with rh_homo on ice component)
+        qsati_homo = qsati(tabs1, pres_mb) * rh_homo
         qsat = jnp.where(
             tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
             jnp.where(
-                tabs1 <= params.tbgmin, qsati(tabs1, pres_mb),
-                om * qsatw(tabs1, pres_mb) + (1.0 - om) * qsati(tabs1, pres_mb),
+                tabs1 <= params.tbgmin, qsati_homo,
+                om * qsatw(tabs1, pres_mb) + (1.0 - om) * qsati_homo,
             ),
         )
+        # Derivative: d(qsati*rh_homo)/dT = dqsati/dT * rh_homo + qsati * drh_homo/dT
+        # drh_homo/dT = -1/207.8 when active, else 0
+        drh_homo = jnp.where(
+            (tabs1 < 235.0) & (QI < 1.0e-8),
+            -1.0 / 207.8,
+            0.0,
+        )
+        dtqsati_homo = (_dtqsati(tabs1, pres_mb) * rh_homo
+                        + qsati(tabs1, pres_mb) * drh_homo)
         dqsat = jnp.where(
             tabs1 >= params.tbgmax, _dtqsatw(tabs1, pres_mb),
             jnp.where(
-                tabs1 <= params.tbgmin, _dtqsati(tabs1, pres_mb),
-                om * _dtqsatw(tabs1, pres_mb) + (1.0 - om) * _dtqsati(tabs1, pres_mb),
+                tabs1 <= params.tbgmin, dtqsati_homo,
+                om * _dtqsatw(tabs1, pres_mb) + (1.0 - om) * dtqsati_homo,
             ),
         )
 
@@ -297,11 +325,18 @@ def satadj(
 
     # Final condensate and phase partitioning
     om_f = jnp.clip(a_bg * tabs1 - b_bg, 0.0, 1.0)
+    # C12 fix: apply rh_homo to final qsat (consistent with Newton iteration)
+    rh_homo_f = jnp.where(
+        (tabs1 < 235.0) & (QI < 1.0e-8),
+        2.583 - tabs1 / 207.8,
+        1.0,
+    )
+    qsati_homo_f = qsati(tabs1, pres_mb) * rh_homo_f
     qsat_f = jnp.where(
         tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
         jnp.where(
-            tabs1 <= params.tbgmin, qsati(tabs1, pres_mb),
-            om_f * qsatw(tabs1, pres_mb) + (1.0 - om_f) * qsati(tabs1, pres_mb),
+            tabs1 <= params.tbgmin, qsati_homo_f,
+            om_f * qsatw(tabs1, pres_mb) + (1.0 - om_f) * qsati_homo_f,
         ),
     )
     qn_new = jnp.maximum(0.0, q - qsat_f)
@@ -485,9 +520,16 @@ def precip_proc(
     dq = jnp.where(has_cloud, dq_conv,
                    jnp.where(has_precip_no_cloud, dq_evap, 0.0))
 
+    # D20 fix: tiny qp fully evaporated when qn=0 (gSAM precip_proc.f90:227-231)
+    tiny_evap = (qn <= 0.0) & (qp > 0.0) & (qp <= p.qp_threshold)
+    dq = jnp.where(tiny_evap, -qp, dq)
+
     # Apply net change: dq > 0 → cloud→precip;  dq < 0 → precip→vapour
-    qp_new = jnp.maximum(0.0, qp + dq)
-    q_new  = jnp.maximum(0.0, (QV + qn) - dq)   # q = QV + qn
+    qp_raw = qp + dq
+    qp_new = jnp.maximum(0.0, qp_raw)
+    # D19 fix: mass conservation — clipped qp mass returned to vapor
+    clip_mass = qp_raw - qp_new   # negative when clipping occurred
+    q_new  = jnp.maximum(0.0, (QV + qn) - dq - clip_mass)   # q = QV + qn + recovered mass
 
     # Re-partition updated q and qp
     qv_new  = jnp.maximum(0.0, q_new - jnp.maximum(0.0, q_new - qsat_evap))
@@ -516,40 +558,89 @@ def precip_proc(
 def _fall_col_one(
     qp_col:   jax.Array,   # (nz,)  mixing ratio (kg/kg)
     rho_col:  jax.Array,   # (nz,)  kg/m³
-    rhow_col: jax.Array,   # (nz+1,)
-    dz_col:   jax.Array,   # (nz,)  m
-    a_coef:   float,
-    b_coef:   float,
-    rho_hyd:  float,       # hydrometeor density (kg/m³)
-    n_zero:   float,       # intercept parameter (m⁻⁴)
+    dz_col:   jax.Array,   # (nz,)  m  layer thickness
+    v_coef:   float,       # pre-computed: a*gamma(4+b)/6 / (pi*rho_hyd*N0)^(b/4)
+    c_exp:    float,       # b/4
+    vt_max:   float,       # velocity cap (m/s): 9 rain, 2 snow, 10 graupel
     dt:       float,
-) -> tuple:  # (qp_new, wp_max) where wp_max is max Courant number for CFL check
+) -> tuple:  # (qp_new, cfl_max)
     """
-    Upwind sedimentation for one species in one column.
+    MPDATA sedimentation for one species in one column.
 
-    Returns (qp_new, cfl_max).  cfl_max > 1 signals a CFL violation —
-    add subcycling if this occurs.
+    Matches gSAM precip_fall.f90: upwind pass + anti-diffusive correction
+    with non-oscillatory (FCT) flux limiting.
+
+    Terminal velocity follows gSAM microphysics.f90:484-486 and
+    precip_fall.f90:54,97:
+      term_vel = v_coef * (rho*qp)^c_exp            (microphysics.f90)
+      vt = sqrt(1.29/rho) * term_vel                 (precip_fall.f90 rhofac)
+    where v_coef = a * gamma(4+b)/6 / (pi*rho_hyd*N0)^c_exp.
+
+    Returns (qp_new, cfl_max).
     """
     qp_safe = jnp.maximum(qp_col, 0.0)
-    rhofac  = jnp.sqrt(1.29 / rho_col)    # (nz,)
+    rhofac = jnp.sqrt(1.29 / rho_col)
 
     # Terminal velocity (m/s, positive downward)
-    vt = (a_coef * (rho_col * qp_safe / (np.pi * rho_hyd * n_zero + 1e-30))
-          ** (b_coef / 4.0) * rhofac)
+    # gSAM: term_vel_qp = min(vt_max, v_coef*(rho*qp)^c_exp)
+    # then precip_fall.f90:97: wp_vel = rhofac * term_vel_qp
+    term_vel = jnp.minimum(vt_max, v_coef * (rho_col * qp_safe) ** c_exp)
+    vt = rhofac * term_vel
     vt = jnp.where(qp_safe > 1e-12, vt, 0.0)
 
-    # Dimensionless upwind Courant factor:  wp[k] = -vt[k] * rhow[k] * dt / dz[k]
-    # (negative = downward; rhow at bottom face of cell k = rhow_col[k])
-    wp  = -vt * rhow_col[:len(qp_col)] * dt / dz_col   # (nz,)
-    cfl = jnp.max(jnp.abs(wp))
+    # irhoadz[k] = 1/(rho[k]*dz[k])  (gSAM: 1/(rho*adz), with dz factor in wp)
+    irhoadz = 1.0 / (rho_col * dz_col)
 
-    # Upwind flux: fz[k] = qp[k] * wp[k]  (at bottom face of cell k)
-    fz      = qp_safe * wp                                  # (nz,)
-    fz_top  = jnp.concatenate([fz[1:], jnp.zeros((1,))], axis=0)  # fz[k+1], 0 at top
+    # Courant number (dimensionless, positive downward)
+    # gSAM: wp = vt*dt/dz (scalar dz * adz → dz_col here)
+    wp = jnp.minimum(1.0, vt * dt / dz_col)
+    cfl = jnp.max(wp)
 
-    # Flux divergence:  qp[k] -= (fz_top[k] - fz[k]) / (rho[k]*dz[k])
-    qp_new = qp_safe - (fz_top - fz) / (rho_col * dz_col)
-    qp_new = jnp.maximum(0.0, qp_new)
+    # --- Pre-compute mx/mn from original field (gSAM nonos=.true. line 130-135) ---
+    qp_above = jnp.concatenate([qp_safe[1:], qp_safe[-1:]])
+    qp_below = jnp.concatenate([qp_safe[:1], qp_safe[:-1]])
+    mx0 = jnp.maximum(jnp.maximum(qp_below, qp_above), qp_safe)
+    mn0 = jnp.minimum(jnp.minimum(qp_below, qp_above), qp_safe)
+
+    # --- Pass 1: first-order upwind (gSAM line 141-149) ---
+    fz = qp_safe * wp
+    fz_top = jnp.concatenate([fz[1:], jnp.zeros((1,))])
+    tmp_qp = qp_safe - (fz_top - fz) * irhoadz
+    tmp_qp = jnp.maximum(0.0, tmp_qp)
+
+    # --- Anti-diffusive correction (gSAM line 151-162) ---
+    tmp_flux = tmp_qp * wp
+    tmp_flux_below = jnp.concatenate([tmp_flux[:1], tmp_flux[:-1]])
+    www = 0.5 * (1.0 + wp * irhoadz) * (tmp_flux_below - tmp_flux)
+
+    # --- FCT limiter (gSAM line 167-187) ---
+    tmp_above = jnp.concatenate([tmp_qp[1:], tmp_qp[-1:]])
+    tmp_below = jnp.concatenate([tmp_qp[:1], tmp_qp[:-1]])
+
+    mx = jnp.maximum(jnp.maximum(jnp.maximum(tmp_below, tmp_above), tmp_qp), mx0)
+    mn = jnp.minimum(jnp.minimum(jnp.minimum(tmp_below, tmp_above), tmp_qp), mn0)
+
+    eps_fct = 1e-10
+    www_top = jnp.concatenate([www[1:], jnp.zeros((1,))])
+
+    ppos_www_top = jnp.maximum(0.0, www_top)
+    pneg_www_top = jnp.maximum(0.0, -www_top)
+    ppos_www     = jnp.maximum(0.0, www)
+    pneg_www     = jnp.maximum(0.0, -www)
+
+    # gSAM: mx(k) = rho(k)*adz(k)*(mx-tmp_qp) / (pneg(www(kc))+ppos(www(k))+eps)
+    mx_lim = rho_col * dz_col * (mx - tmp_qp) / (pneg_www_top + ppos_www + eps_fct)
+    mn_lim = rho_col * dz_col * (tmp_qp - mn) / (ppos_www_top + pneg_www + eps_fct)
+
+    mx_below = jnp.concatenate([mx_lim[:1], mx_lim[:-1]])
+    mn_below = jnp.concatenate([mn_lim[:1], mn_lim[:-1]])
+
+    fz_corr = (fz
+               + ppos_www * jnp.minimum(1.0, jnp.minimum(mx_lim, mn_below))
+               - pneg_www * jnp.minimum(1.0, jnp.minimum(mx_below, mn_lim)))
+    fz_corr_top = jnp.concatenate([fz_corr[1:], jnp.zeros((1,))])
+
+    qp_new = jnp.maximum(0.0, qp_safe - (fz_corr_top - fz_corr) * irhoadz)
 
     return qp_new, cfl
 
@@ -566,36 +657,45 @@ def precip_fall(
     """
     Gravitational sedimentation of rain, snow, graupel.
 
-    Uses 1D upwind scheme per column (vmapped over ny, nx).
-    Port of gSAM MICRO_SAM1MOM/precip_fall.f90 (upwind step only; no MPDATA
-    anti-diffusive correction — add that for production runs).
+    Full MPDATA with anti-diffusive correction + FCT limiter per column.
+    Port of gSAM MICRO_SAM1MOM/precip_fall.f90.
 
-    NOTE: no subcycling — assumes dt is short enough for CFL < 1.
-    For rain at 8 m/s in a 250-m layer, max stable dt ≈ 30 s.
+    Terminal velocity: v_coef = a * gamma(4+b)/6 / (pi*rho_hyd*N0)^(b/4),
+    matching gSAM microphysics.f90:484-486.  rhofac = sqrt(1.29/rho) applied
+    in precip_fall (line 54,97).
     """
-    rho_1d  = np.array(metric["rho"])    # keep as numpy for vmap efficiency
-    rhow_1d = np.array(metric["rhow"])
-    dz_1d   = np.array(metric["dz"])
+    rho_1d = np.array(metric["rho"])    # keep as numpy for vmap efficiency
+    dz_1d  = np.array(metric["dz"])
 
     nz, ny, nx = QR.shape
 
-    def _fall_species(qp_3d, a, b, rho_hyd, n_zero):
-        """Apply sedimentation to a 3D species field."""
-        # vmap over (j, i): each column treated independently
+    p = params
+    # Pre-compute velocity coefficients: v_coef = a * gamma(4+b)/6 / (pi*rho_hyd*N0)^c
+    # gSAM microphysics.f90:481-486
+    crain = p.b_rain / 4.0
+    csnow = p.b_snow / 4.0
+    cgrau = p.b_grau / 4.0
+    gamr3 = float(np.float32(_scipy_gamma(4.0 + p.b_rain)))
+    gams3 = float(np.float32(_scipy_gamma(4.0 + p.b_snow)))
+    gamg3 = float(np.float32(_scipy_gamma(4.0 + p.b_grau)))
+    vrain = p.a_rain * gamr3 / 6.0 / (np.pi * p.rhor * p.nzeror) ** crain
+    vsnow = p.a_snow * gams3 / 6.0 / (np.pi * p.rhos * p.nzeros) ** csnow
+    vgrau = p.a_grau * gamg3 / 6.0 / (np.pi * p.rhog * p.nzerog) ** cgrau
+
+    def _fall_species(qp_3d, v_coef, c_exp, vt_max):
+        """Apply MPDATA sedimentation to a 3D species field."""
         def _col(qp_col):
-            qp_new, _ = _fall_col_one(qp_col, rho_1d, rhow_1d, dz_1d,
-                                       a, b, rho_hyd, n_zero, dt)
+            qp_new, _ = _fall_col_one(qp_col, rho_1d, dz_1d,
+                                       v_coef, c_exp, vt_max, dt)
             return qp_new
 
-        # vmap over ny × nx
-        _vmap_i = jax.vmap(_col, in_axes=1, out_axes=1)          # over nx
-        _vmap_ji = jax.vmap(_vmap_i, in_axes=1, out_axes=1)     # over ny
+        _vmap_i = jax.vmap(_col, in_axes=1, out_axes=1)
+        _vmap_ji = jax.vmap(_vmap_i, in_axes=1, out_axes=1)
         return _vmap_ji(qp_3d)
 
-    p = params
-    QR_new = _fall_species(QR, p.a_rain, p.b_rain, p.rhor, p.nzeror)
-    QS_new = _fall_species(QS, p.a_snow, p.b_snow, p.rhos, p.nzeros)
-    QG_new = _fall_species(QG, p.a_grau, p.b_grau, p.rhog, p.nzerog)
+    QR_new = _fall_species(QR, vrain, crain, 9.0)
+    QS_new = _fall_species(QS, vsnow, csnow, 2.0)
+    QG_new = _fall_species(QG, vgrau, cgrau, 10.0)
 
     # Latent heat tendency from sedimentation flux divergence
     # ΔT = -(lfac * d(rhow*vt*qp)/dz) / (rho*cp) * dt
@@ -626,10 +726,12 @@ def _ice_fall_col(
     dt: float,
 ) -> tuple:  # (qi_new, dqi)   dqi used for latent-heat tendency
     qi_safe = jnp.maximum(qi_col, 0.0)
-    rhofac  = jnp.sqrt(1.29 / rho_col)
 
     # Heymsfield (JAS 2003, p.2607) ice terminal velocity, m/s
-    vt = fudge * 8.66 * (qi_safe + 1e-10) ** 0.24 * rhofac / gamma_rave
+    # gSAM ice_fall.f90:83,95: qic = rho*qci; vt = 8.66*(qic)^0.24
+    # argument is mass density (rho*q), NOT mixing ratio; no rhofac
+    qic = rho_col * qi_safe
+    vt = fudge * 8.66 * (jnp.maximum(0.0, qic) + 1e-10) ** 0.24 / gamma_rave
     vt = jnp.where(qi_safe > 0.0, vt, 0.0)
 
     # Work in mass-density units qrho = rho * q
@@ -703,10 +805,13 @@ def micro_proc(
     dt: float,
 ) -> ModelState:
     """
-    One microphysics step: saturation adjustment → precip processes → sedimentation.
+    One microphysics step matching gSAM operator order.
 
-    Matches gSAM micro_proc() call sequence (cloud → precip_proc → precip_fall).
-    U, V, W, TKE, nstep, time are passed through unchanged.
+    gSAM ordering (main.f90:299,324):
+      advect_all_scalars calls precip_fall + ice_fall FIRST,
+      then micro_proc calls cloud (satadj) + precip_proc.
+
+    So: sedimentation → saturation adjustment → precipitation processes.
 
     Args:
         state  : current ModelState
@@ -717,23 +822,26 @@ def micro_proc(
     Returns:
         new ModelState with updated TABS, QV, QC, QI, QR, QS, QG
     """
-    # 1. Saturation adjustment
-    TABS, QV, QC, QI = satadj(
-        state.TABS, state.QV, state.QC, state.QI,
-        state.QR, state.QS, state.QG, metric, params,
-    )
+    TABS = state.TABS
+    QV, QC, QI = state.QV, state.QC, state.QI
+    QR, QS, QG = state.QR, state.QS, state.QG
 
-    # 2. Precipitation processes
-    TABS, QV, QC, QI, QR, QS, QG = precip_proc(
-        TABS, QC, QI, state.QR, state.QS, state.QG, QV, metric, params, dt,
-    )
-
-    # 3. Precipitation sedimentation
+    # 1. Precipitation sedimentation (inside advect_all_scalars in gSAM)
     QR, QS, QG, TABS = precip_fall(QR, QS, QG, TABS, metric, params, dt)
 
-    # 4. Cloud-ice sedimentation
+    # 2. Cloud-ice sedimentation (inside advect_all_scalars in gSAM)
     if params.do_ice_fall:
         QI, TABS = ice_fall(QI, TABS, metric, params, dt)
+
+    # 3. Saturation adjustment (cloud() in gSAM micro_proc)
+    TABS, QV, QC, QI = satadj(
+        TABS, QV, QC, QI, QR, QS, QG, metric, params,
+    )
+
+    # 4. Precipitation processes (precip_proc() in gSAM micro_proc)
+    TABS, QV, QC, QI, QR, QS, QG = precip_proc(
+        TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
+    )
 
     return ModelState(
         U   =state.U,
@@ -766,35 +874,38 @@ def micro_proc_with_precip(
     The flux is computed as the column-integrated loss of rain+snow+graupel
     mass during sedimentation: for each column, ``sum_k rho[k] * dz[k] *
     ((QR+QS+QG)_before - (QR+QS+QG)_after) / dt``.
+
+    Operator order matches gSAM: sedimentation first, then satadj + precip_proc.
     """
     rho = jnp.asarray(metric["rho"])
     dz  = jnp.asarray(metric["dz"])
 
-    qp_before = state.QR + state.QS + state.QG
+    TABS = state.TABS
+    QV, QC, QI = state.QV, state.QC, state.QI
+    QR, QS, QG = state.QR, state.QS, state.QG
 
-    # Saturation adjustment
-    TABS, QV, QC, QI = satadj(
-        state.TABS, state.QV, state.QC, state.QI,
-        state.QR, state.QS, state.QG, metric, params,
-    )
-    # Precip processes
-    TABS, QV, QC, QI, QR, QS, QG = precip_proc(
-        TABS, QC, QI, state.QR, state.QS, state.QG, QV, metric, params, dt,
-    )
-    # Capture column precipitation mass *before* sedimentation drains it
+    # 1. Precipitation sedimentation (inside advect_all_scalars in gSAM)
     qp_pre_fall = QR + QS + QG
-    # Sedimentation
     QR, QS, QG, TABS = precip_fall(QR, QS, QG, TABS, metric, params, dt)
     qp_post_fall = QR + QS + QG
 
     # Mass lost to the surface during sedimentation (kg/m²):
-    # ∑_k rho[k] * dz[k] * Δq[k]. Divide by dt → kg/m²/s = mm/s.
     delta = (qp_pre_fall - qp_post_fall) * (rho * dz)[:, None, None]
     precip_ref = jnp.sum(delta, axis=0) / dt
     precip_ref = jnp.maximum(precip_ref, 0.0)
 
+    # 2. Cloud-ice sedimentation
     if params.do_ice_fall:
         QI, TABS = ice_fall(QI, TABS, metric, params, dt)
+
+    # 3. Saturation adjustment
+    TABS, QV, QC, QI = satadj(
+        TABS, QV, QC, QI, QR, QS, QG, metric, params,
+    )
+    # 4. Precip processes
+    TABS, QV, QC, QI, QR, QS, QG = precip_proc(
+        TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
+    )
 
     new_state = ModelState(
         U   =state.U, V=state.V, W=state.W,

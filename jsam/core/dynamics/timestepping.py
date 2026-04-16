@@ -208,6 +208,9 @@ def advance_scalars(
     dt: float,
     dt_prev:  float | None = None,
     dt_pprev: float | None = None,
+    U_old:    "jax.Array | None" = None,   # C1: pre-dynamics U for half-step avg
+    V_old:    "jax.Array | None" = None,   # C1: pre-dynamics V
+    W_old:    "jax.Array | None" = None,   # C1: pre-dynamics W
 ) -> tuple:   # (ModelState, Tendencies)
     """
     Advance all scalar fields (TABS, QV, QC, QI, QR, QS, QG) by one step.
@@ -233,19 +236,33 @@ def advance_scalars(
     from jsam.core.state import ModelState
 
     nstep = state.nstep
-    U, V, W = state.U, state.V, state.W
+
+    # C1 fix: gSAM advect_all_scalars uses time-averaged velocity:
+    #   u_transport = 0.5*(u_old + u_new)  after the first dynamics step.
+    # U_old is the pre-dynamics velocity saved before advance_momentum.
+    if U_old is not None:
+        U = 0.5 * (U_old + state.U)
+        V = 0.5 * (V_old + state.V)
+        W = 0.5 * (W_old + state.W)
+    else:
+        U, V, W = state.U, state.V, state.W
 
     # gSAM advects the liquid-ice static energy  s = TABS + gamaz
     # rather than TABS directly.  This removes the dry-adiabatic lapse-rate
     # from the vertical gradient, avoiding large flux-form tendencies in the
     # lowest cell.  After advection, TABS = s_adv - gamaz.
     gamaz = metric["gamaz"][:, None, None]   # (nz,1,1)  g*z/cp  K
-    s_n = state.TABS + gamaz                  # liquid-ice static energy (simplified)
+    # D25 fix: gSAM advects full t = TABS + gamaz - fac_cond*(QC+QR) - fac_sub*(QI+QS+QG)
+    from jsam.core.physics.microphysics import FAC_COND, FAC_SUB
+    s_n = (state.TABS + gamaz
+           - FAC_COND * (state.QC + state.QR)
+           - FAC_SUB * (state.QI + state.QS + state.QG))
 
     # --- 1. Current advective tendencies ---
+    # C5: pass nstep for MACHO direction ordering cycle
     def _tend(phi: jax.Array) -> jax.Array:
         """(phi_adv - phi) / dt  — one call to advect_scalar per field."""
-        return (advect_scalar(phi, U, V, W, metric, dt) - phi) / dt
+        return (advect_scalar(phi, U, V, W, metric, dt, nstep=nstep) - phi) / dt
 
     tends_n = Tendencies(
         TABS=_tend(s_n),        # tendency of s = TABS + gamaz
@@ -278,7 +295,8 @@ def advance_scalars(
         TKE =state.TKE,
         p_prev  =state.p_prev,
         p_pprev =state.p_pprev,
-        nstep=state.nstep + 1,
+        # D11 fix: nstep already incremented at top of step(); only advance time here
+        nstep=state.nstep,
         time =state.time + dt,
     )
 

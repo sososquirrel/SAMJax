@@ -142,7 +142,8 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     gamaz = G_GRAV * grid.z / CP   # (nz,) K
 
     # Coriolis + metric arrays (gSAM coriolis.f90)
-    OMEGA = 7.2921e-5    # rad/s  (gSAM params.f90)
+    # gSAM uses 4*pi/86400/2 = 7.2722e-5 (solar day), NOT the sidereal value.
+    OMEGA = 4.0 * np.pi / 86400.0 / 2.0    # rad/s  (gSAM setgrid.f90:497)
     fcory  = 2.0 * OMEGA * np.sin(lat_rad)         # (ny,) f-parameter
     fcorzy = 2.0 * OMEGA * np.cos(lat_rad)         # (ny,) f' = 2Ω cosφ  (docoriolisz)
     tanr   = np.tan(lat_rad) / EARTH_RADIUS        # (ny,) tan(lat)/R  metric term
@@ -296,8 +297,13 @@ def _helmholtz_op(
     L_y = (flux[1:, :] - flux[:-1, :]) / (dy_row[:, None] * cos_lat[:, None])  # (ny, nz)
 
     # ── Vertical Laplacian: (1/ρ) d/dz(ρ_w dP/dz) ───────────────────────────
+    # D8 fix: gSAM pressure_big.f90:196 uses adzw(k)*dz (center-to-center
+    # distance) as the flux denominator, not cell thickness dz(k-1).
+    adzw   = metric["adzw"]    # (nz+1,)
+    dz_ref = metric["dz_ref"]  # scalar
     dPz = P[:, 1:] - P[:, :-1]                           # (ny, nz-1) at z-faces 1..nz-1
-    flux_z_int = rhow[1:-1, None].T * dPz / dz[:-1]      # (ny, nz-1)  interior faces
+    # adzw[1:-1] are the center-to-center distances at interior faces
+    flux_z_int = rhow[1:-1, None].T * dPz / (adzw[1:-1] * dz_ref)  # (ny, nz-1)
 
     # Neumann at bottom and top: zero flux
     flux_z_bot = jnp.zeros((ny, 1))
@@ -320,30 +326,26 @@ def _build_Lz_matrix(metric: dict, nz: int) -> jax.Array:
     rho  = metric["rho"]    # (nz,) JAX array
     rhow = metric["rhow"]   # (nz+1,)
     dz   = metric["dz"]     # (nz,)
+    adzw = metric["adzw"]    # (nz+1,)
+    dz_ref = float(metric["dz_ref"])
 
     # Convert to numpy for matrix construction
     rho_np  = np.array(rho)
     rhow_np = np.array(rhow)
     dz_np   = np.array(dz)
+    adzw_np = np.array(adzw)
 
     L = np.zeros((nz, nz))
     for k in range(nz):
         coeff = 1.0 / (rho_np[k] * dz_np[k])
         if k > 0:
-            c_lo = rhow_np[k] / dz_np[k - 1]   # flux at bottom face of k
-            # Actually: flux[k] = rhow[k] * (P[k]-P[k-1]) / dz[k-1] is NOT right
-            # We use: flux[l] = rhow[l] * (P[l] - P[l-1]) / dz[l-1] for l=1..nz-1
-            # But in _helmholtz_op we use: flux_z_int = rhow[1:-1] * dPz / dz[:-1]
-            # dPz[l] = P[l+1] - P[l] for l=0..nz-2
-            # So flux_z_int[l] = rhow[l+1] * (P[l+1]-P[l]) / dz[l]  (face between l and l+1)
-            # L_z[k] = (flux_z_int[k] - flux_z_int[k-1]) / (rho[k] * dz[k])
-            # flux_z_int[k-1] = rhow[k] * (P[k]-P[k-1]) / dz[k-1]
-            c_lo = rhow_np[k] / dz_np[k - 1]
+            # D8 fix: use adzw(k)*dz_ref (center-to-center distance) as flux denominator
+            c_lo = rhow_np[k] / (adzw_np[k] * dz_ref)
             L[k, k - 1] += c_lo * coeff
             L[k, k]     -= c_lo * coeff
         if k < nz - 1:
-            # flux_z_int[k] = rhow[k+1] * (P[k+1]-P[k]) / dz[k]
-            c_hi = rhow_np[k + 1] / dz_np[k]
+            # D8 fix: use adzw(k+1)*dz_ref
+            c_hi = rhow_np[k + 1] / (adzw_np[k + 1] * dz_ref)
             L[k, k + 1] += c_hi * coeff
             L[k, k]     -= c_hi * coeff
 
@@ -551,6 +553,10 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
         if j < ny - 1:
             c_hi[j] = cos_v[j + 1] / dy_v_int[j] * inv_row
 
+    # D8 fix: use adzw*dz_ref (center-to-center distance) as flux denominator
+    adzw = np.asarray(metric_np.get("adzw", np.ones(nz + 1)), dtype=np.float64)
+    dz_ref_val = float(metric_np.get("dz_ref", dz[0]))
+
     # Precompute L_z coefficients for each k (same for all j)
     # L_z[k, k-1] = d_lo[k],  L_z[k, k+1] = d_hi[k],  L_z[k, k] = -d_lo[k]-d_hi[k]
     d_lo = np.zeros(nz)   # coefficient multiplying P[:,k-1]
@@ -558,9 +564,9 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     for k in range(nz):
         c = 1.0 / (rho[k] * dz[k])
         if k > 0:
-            d_lo[k] = rhow[k] / (dz[k - 1]) * c
+            d_lo[k] = rhow[k] / (adzw[k] * dz_ref_val) * c
         if k < nz - 1:
-            d_hi[k] = rhow[k + 1] / dz[k] * c
+            d_hi[k] = rhow[k + 1] / (adzw[k + 1] * dz_ref_val) * c
 
     # Build COO arrays
     n = ny * nz

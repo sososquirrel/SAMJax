@@ -125,7 +125,8 @@ def _interp1d(x: jax.Array, xp: jax.Array, fp: jax.Array) -> jax.Array:
     dx = x1 - x0
     w  = jnp.where(dx > 0.0, (x - x0) / dx, 0.0)
     w  = jnp.clip(w, 0.0, 1.0)
-    return f0 + w * (f1 - f0)
+    above = x > xp[-1]
+    return jnp.where(above, 0.0, f0 + w * (f1 - f0))
 
 
 def _interp_time(t: jax.Array, t_prof: jax.Array, table: jax.Array) -> jax.Array:
@@ -239,8 +240,21 @@ def ls_proc(
     QV_new   = jnp.maximum(0.0, state.QV + dt * dqls_z[:, None, None])
 
     # --- 2. Subsidence ---
-    TABS_new = TABS_new + dt * _subsidence_tend(TABS_new, wsub_z, dz)
+    # C6 fix: gSAM subsidence.f90 applies subsidence to the liquid-ice static
+    # energy t = TABS + gamaz (not bare TABS), which includes the adiabatic
+    # term w*g/cp.  Also applies subsidence to momentum (U,V) and all
+    # condensate species (QC, QI, QR, QS, QG).
+    gamaz = metric["gamaz"][:, None, None]   # (nz,1,1)  g*z/cp  K
+    t_field = TABS_new + gamaz                # static energy
+    t_field = t_field + dt * _subsidence_tend(t_field, wsub_z, dz)
+    TABS_new = t_field - gamaz                # recover TABS
+
     QV_new   = jnp.maximum(0.0, QV_new + dt * _subsidence_tend(QV_new, wsub_z, dz))
+    QC_new   = jnp.maximum(0.0, state.QC + dt * _subsidence_tend(state.QC, wsub_z, dz))
+    QI_new   = jnp.maximum(0.0, state.QI + dt * _subsidence_tend(state.QI, wsub_z, dz))
+    QR_new   = jnp.maximum(0.0, state.QR + dt * _subsidence_tend(state.QR, wsub_z, dz))
+    QS_new   = jnp.maximum(0.0, state.QS + dt * _subsidence_tend(state.QS, wsub_z, dz))
+    QG_new   = jnp.maximum(0.0, state.QG + dt * _subsidence_tend(state.QG, wsub_z, dz))
 
     return ModelState(
         U     = state.U,
@@ -248,11 +262,11 @@ def ls_proc(
         W     = state.W,
         TABS  = TABS_new,
         QV    = QV_new,
-        QC    = state.QC,
-        QI    = state.QI,
-        QR    = state.QR,
-        QS    = state.QS,
-        QG    = state.QG,
+        QC    = QC_new,
+        QI    = QI_new,
+        QR    = QR_new,
+        QS    = QS_new,
+        QG    = QG_new,
         TKE   = state.TKE,
         p_prev = state.p_prev, p_pprev = state.p_pprev,
         nstep = state.nstep,

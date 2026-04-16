@@ -190,7 +190,7 @@ def _cam_ocean_albedo(
     """
     cz = np.asarray(coszen, dtype=np.float64)
     ts = np.asarray(ts,     dtype=np.float64)
-    ADIF = 0.07
+    ADIF = 0.06   # Taylor (1996); matches gSAM cam_rad_parameterizations.f90:130
 
     # Default: all zero (night).
     asdir = np.zeros_like(cz)
@@ -258,7 +258,7 @@ class RadRRTMGConfig:
 _G_GRAV = 9.79764                # m/s²  gSAM consts
 _P_SURF_DEFAULT = 101325.0       # Pa
 _MW_AIR = 28.97
-_MW_H2O = 18.02
+_MW_H2O = 18.016
 
 # CAM ice effective radius lookup table (hexagonal columns, T = 180..274 K)
 # From gSAM SRC/RAD_RRTM/cam_rad_parameterizations.f90
@@ -279,6 +279,19 @@ _ICE_RETAB = np.array([
 ], dtype=np.float64)                         # (95,)
 
 _LIQ_RE_OCEAN = 14.0                         # µm, CAM default for open ocean
+_LIQ_RE_LAND_MIN = 8.0                       # µm, CAM land minimum
+_LIQ_RE_LAND_MAX = 14.0                      # µm, CAM land maximum
+
+
+def _liq_re_land(tlay: np.ndarray) -> np.ndarray:
+    """C10 fix: T-dependent liquid Re over land (gSAM cam_rad_parameterizations.f90:38-60).
+
+    Linear ramp from 14 um at T >= 263.16 K to 8 um at T <= 243.16 K.
+    Over ocean, Re is always 14 um (handled by the caller via landmask).
+    """
+    t = np.asarray(tlay, dtype=np.float64)
+    frac = np.clip((t - 243.16) / (263.16 - 243.16), 0.0, 1.0)
+    return _LIQ_RE_LAND_MIN + frac * (_LIQ_RE_LAND_MAX - _LIQ_RE_LAND_MIN)
 
 
 def build_plev_hpa(metric: dict, p_surf_Pa: float = _P_SURF_DEFAULT) -> np.ndarray:
@@ -303,7 +316,7 @@ def analytic_o3_vmr(play_hpa: np.ndarray) -> np.ndarray:
 # gSAM o3file binary parser  (unformatted sequential, little-endian)
 # ---------------------------------------------------------------------------
 
-_MWO3 = 47.998
+_MWO3 = 48.0
 _O3_MMR_TO_VMR = _MW_AIR / _MWO3   # 0.60342...
 
 
@@ -499,6 +512,7 @@ def _rrtmg_lw_numpy(
     return (
         np.asarray(hr, dtype=np.float64),        # (ncol, nlay) K/day
         np.asarray(dflx, dtype=np.float64),      # (ncol, nlay+1) W/m² down-welling
+        np.asarray(uflx, dtype=np.float64),      # (ncol, nlay+1) W/m² up-welling
     )
 
 
@@ -590,6 +604,7 @@ def _rrtmg_sw_numpy(
     return (
         np.asarray(swhr,   dtype=np.float64),   # (ncol, nlay)  K/day
         np.asarray(swdflx, dtype=np.float64),   # (ncol, nlay+1) W/m^2  downwelling
+        np.asarray(swuflx, dtype=np.float64),   # (ncol, nlay+1) W/m^2  upwelling
     )
 
 
@@ -611,6 +626,7 @@ def _compute_dTABS_dt_host(
     o3vmr:      np.ndarray,     # (nz,) or (ncol, nz)
     cfg:        RadRRTMGConfig,
     sw_inputs:  Optional[dict] = None,
+    landmask:   Optional[np.ndarray] = None,  # (ny, nx) bool — True over land
 ) -> tuple[np.ndarray, np.ndarray]:  # (nz, ny, nx) K/s, (ny, nx) W/m^2 lwds
     """
     Compute LW+SW radiative heating tendency and surface LW down-welling flux.
@@ -658,12 +674,19 @@ def _compute_dTABS_dt_host(
     cldfr  = np.where((cliqwp > 0.0) | (cicewp > 0.0), 1.0, 0.0)
 
     # Effective radii
-    reliq  = np.where(cliqwp > 0.0, _LIQ_RE_OCEAN, 0.0)         # (ncol, nz) µm
+    # C10 fix: T-dependent liquid Re over land (8-14 um), 14 um over ocean
+    if landmask is not None:
+        land_col = landmask.reshape(ncol)  # (ncol,) bool
+        reliq_ocean = np.where(cliqwp > 0.0, _LIQ_RE_OCEAN, 0.0)
+        reliq_land  = np.where(cliqwp > 0.0, _liq_re_land(TABS_col), 0.0)
+        reliq = np.where(land_col[:, None], reliq_land, reliq_ocean)  # (ncol, nz)
+    else:
+        reliq  = np.where(cliqwp > 0.0, _LIQ_RE_OCEAN, 0.0)     # (ncol, nz) µm
     reice_all = _ice_re_from_T(TABS_col)
     reice  = np.where(cicewp > 0.0, reice_all, 0.0)
 
     # Clamp ice re to RRTMG's valid range for iceflglw=3 (Fu): 5..131 µm
-    reice = np.clip(reice, 5.0, 131.0)
+    reice = np.clip(reice, 5.0, 140.0)
     # Liq re valid range for liqflglw=1 (Hu & Stamnes): 2.5..60 µm
     reliq = np.clip(reliq, 2.5, 60.0)
 
@@ -733,9 +756,14 @@ def _compute_dTABS_dt_host(
         aldir_col  = np.asarray(sw_inputs["aldir"], dtype=np.float64)
         aldif_col  = np.asarray(sw_inputs["aldif"], dtype=np.float64)
 
+    # C11 fix: layer mass for flux-divergence heating rate (gSAM rad.f90:722-730)
+    # layerM = dp / g  (kg/m²) for each real layer
+    dp_real = plev[:, :-1] - plev[:, 1:]  # (ncol, nz) hPa
+    layerM_real = 100.0 * dp_real / _G_GRAV  # (ncol, nz) kg/m²
+
     for i0 in range(0, ncol, _CHUNK_NCOL):
         i1 = min(i0 + _CHUNK_NCOL, ncol)
-        hr_ext, dflx_ext = _rrtmg_lw_numpy(
+        _hr_ext, dflx_ext, uflx_ext = _rrtmg_lw_numpy(
             play_hpa=play_ext[i0:i1], plev_hpa=plev_ext[i0:i1],
             tlay=tlay_ext[i0:i1],     tlev=tlev_ext[i0:i1],
             tsfc=tsfc64[i0:i1],
@@ -745,13 +773,22 @@ def _compute_dTABS_dt_host(
             reice=reice_ext[i0:i1],   reliq=reliq_ext[i0:i1],
             cfg=cfg,
         )
-        # Drop the extra top layer; jsam only advances the nz real layers.
-        hr_K_per_day[i0:i1] = hr_ext[:, :nz]
+        # C11 fix: compute heating rate from flux divergence for real layers
+        # HR = (Fup[k] - Fup[k+1] + Fdown[k+1] - Fdown[k]) / (cp * layerM)
+        # Fluxes are on the extended grid (nlay_rad+1 interfaces); real layers
+        # are indices 0..nz-1.
+        lw_up = uflx_ext[:, :nz+1]    # (chunk, nz+1) real interfaces
+        lw_dn = dflx_ext[:, :nz+1]
+        lw_hr_Ks = (lw_up[:, :nz] - lw_up[:, 1:nz+1]
+                    + lw_dn[:, 1:nz+1] - lw_dn[:, :nz]) / (
+                    cfg.cpdair * layerM_real[i0:i1])
+        hr_K_per_day[i0:i1] = lw_hr_Ks * 86400.0   # K/s → K/day
+
         # Surface down-welling LW = dflx at sfc interface (index 0).
         lwds_col[i0:i1] = dflx_ext[:, 0]
 
         if do_sw:
-            sw_hr_ext, _sw_dflx_ext = _rrtmg_sw_numpy(
+            _sw_hr_ext, sw_dflx_ext, sw_uflx_ext = _rrtmg_sw_numpy(
                 play_hpa=play_ext[i0:i1], plev_hpa=plev_ext[i0:i1],
                 tlay=tlay_ext[i0:i1],     tlev=tlev_ext[i0:i1],
                 tsfc=tsfc64[i0:i1],
@@ -764,9 +801,13 @@ def _compute_dTABS_dt_host(
                 reice=reice_ext[i0:i1],   reliq=reliq_ext[i0:i1],
                 cfg=cfg,
             )
-            # gSAM combines LW+SW heating in a single qrad buffer
-            # (rad.f90:935 ``qrad = lwHeatingRate + swHeatingRate``).
-            hr_K_per_day[i0:i1] += sw_hr_ext[:, :nz]
+            # C11 fix: SW heating from flux divergence too
+            sw_up = sw_uflx_ext[:, :nz+1]
+            sw_dn = sw_dflx_ext[:, :nz+1]
+            sw_hr_Ks = (sw_up[:, :nz] - sw_up[:, 1:nz+1]
+                        + sw_dn[:, 1:nz+1] - sw_dn[:, :nz]) / (
+                        cfg.cpdair * layerM_real[i0:i1])
+            hr_K_per_day[i0:i1] += sw_hr_Ks * 86400.0
 
     # Safety clip: physically-realised heating should be within ±50 K/day.
     # SW peaks near ~5 K/day in cloud tops, LW around -25 K/d at the top of

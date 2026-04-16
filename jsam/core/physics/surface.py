@@ -57,6 +57,8 @@ class BulkParams:
     karman:      float = 0.4       # von Kármán constant
     epsv:        float = 0.61      # (Rv/Rd − 1); virtual temp correction
     salt_factor: float = 0.98      # ocean salinity reduction of qs
+    ug:          float = 0.0       # geostrophic u wind (m/s)
+    vg:          float = 0.0       # geostrophic v wind (m/s)
     p00:         float = 1.0e5     # reference pressure (Pa)
     Rd:          float = 287.04    # dry air gas constant (J/kg/K)
     Rv:          float = 461.5     # water vapour gas constant (J/kg/K)
@@ -72,7 +74,7 @@ def _psimhu(xd: jax.Array) -> jax.Array:
     """Unstable momentum stability function (Paulson 1970)."""
     return (
         jnp.log((1.0 + xd * (2.0 + xd)) * (1.0 + xd * xd) / 8.0)
-        - 2.0 * jnp.arctan(xd) + 1.5707963   # π/2 − 3·ln2 ≈ 1.571
+        - 2.0 * jnp.arctan(xd) + 1.571   # truncated π/2 matching gSAM oceflx.f90:88
     )
 
 
@@ -150,9 +152,8 @@ def _one_iteration(
     u10n = vmag * rd / rdn   # neutral 10-m wind speed
 
     # --- updated neutral coefficients ---
-    delt_stable = 0.5 + jnp.sign(delt) * 0.5
     rdn_new = jnp.sqrt(_cdn(u10n))
-    rhn_new = (1.0 - delt_stable) * 0.0327 + delt_stable * 0.018
+    rhn_new = (1.0 - stable) * 0.0327 + stable * 0.018
     ren_new = jnp.full_like(vmag, 0.0346)
 
     # --- shift all coeffs to zbot and stability ---
@@ -218,6 +219,8 @@ def bulk_surface_fluxes(
     # Cell-centre winds from staggered faces
     u_cc = 0.5 * (state.U[0, :, :-1] + state.U[0, :, 1:])   # (ny, nx)
     v_cc = 0.5 * (state.V[0, :-1, :] + state.V[0, 1:, :])   # (ny, nx)
+    u_cc = u_cc + params.ug
+    v_cc = v_cc + params.vg
 
     vmag  = jnp.maximum(params.umin, jnp.sqrt(u_cc ** 2 + v_cc ** 2))
 
@@ -225,9 +228,10 @@ def bulk_surface_fluxes(
     # stays finite.  The resulting fluxes will be zeroed out below.
     sst_safe = jnp.where(jnp.isnan(sst), TABS0, sst)
 
-    # Potential temperatures
-    thbot = TABS0 * exner0            # atmospheric θ at k=0
-    ts    = sst_safe * exner_s        # surface θ (referenced to pres_sfc)
+    # Potential temperatures  θ = T * (p00/p)^(R/cp) = T / exner
+    # gSAM surface.f90:68  th = tabs * prespot  where prespot = (1000/pres)^(R/cp)
+    thbot = TABS0 / exner0            # atmospheric θ at k=0
+    ts    = sst_safe / exner_s        # surface θ (referenced to pres_sfc)
 
     delt  = thbot - ts                # (ny, nx)
 

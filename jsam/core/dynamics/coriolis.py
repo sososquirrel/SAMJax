@@ -80,7 +80,12 @@ def coriolis_tend(
     # ------------------------------------------------------------------
     adyv_int = 0.5 * (ady[:-1] + ady[1:])                 # (ny-1,)
     adyv = jnp.concatenate([ady[:1], adyv_int, ady[-1:]]) # (ny+1,)
-    imuv = 1.0 / jnp.clip(cos_v, 1e-6, None)              # (ny+1,)
+    # gSAM (setgrid.f90:255): imuv = 1/muv where muv is the ady-weighted
+    # average of cos(lat) at adjacent mass rows.  At the poles muv=0 so
+    # imuv would be infinite; gSAM avoids the pole v-faces via jb/jc
+    # clamping (coriolis.f90:29-31).  We set imuv=0 at the pole faces
+    # (j=0, j=ny) — the V=0 BC ensures these never contribute.
+    imuv = jnp.where(cos_v > 0.0, 1.0 / cos_v, 0.0)       # (ny+1,)
 
     # ------------------------------------------------------------------
     # w-face spacings dzw[k] (ny+1,) matching gSAM adzw·dz_ref.
@@ -124,8 +129,18 @@ def coriolis_tend(
         return (f3 + u * tanr3) * mu3 * u
 
     q_row = _q(U_left) + _q(U_right)                 # (nz, ny, nx)
+    # gSAM coriolis.f90:29-31 — pole boundary clamping:
+    #   jb = max(1, j-1);  jc = min(ny, j+1)
+    # At the first interior v-face (j_v=1), jb clamps so both rows come
+    # from j=0 (south-pole-adjacent mass row).  At j_v=ny-1, jc clamps
+    # similarly.  This prevents the stencil from using the polar v-face
+    # where adyv diverges.
     q_n = q_row[:, 1:ny,     :]                      # north mass row j_v
     q_s = q_row[:, 0:ny - 1, :]                      # south mass row j_v - 1
+    # Clamp: at j_v=1 (index 0 in interior), use q_row[:,0,:] for both
+    q_s = q_s.at[:, 0, :].set(q_n[:, 0, :])         # jb clamped at south pole
+    # Clamp: at j_v=ny-1 (index ny-2 in interior), use q_row[:,ny-1,:] for both
+    q_n = q_n.at[:, -1, :].set(q_s[:, -1, :])       # jc clamped at north pole
 
     imuv_int = imuv[None, 1:ny, None]                # (1, ny-1, 1)
     dV_int = -0.25 * imuv_int * (q_n + q_s)          # (nz, ny-1, nx)

@@ -89,6 +89,7 @@ class VaporFluxOutput:
     lhf_air:   jax.Array
     q_gr:      jax.Array
     mw_new:    jax.Array
+    r_soil:    jax.Array   # (ny, nx) soil resistance (s/m) — exposed for q_cas diagnostic
 
     _dynamic_fields: ClassVar[tuple[str, ...]] = (
         "evapo_wet", "evapo_dry",
@@ -96,6 +97,7 @@ class VaporFluxOutput:
         "evp_soil",  "lhf_soil",
         "evp_air",   "lhf_air",
         "q_gr",      "mw_new",
+        "r_soil",
     )
 
     def tree_flatten(self):
@@ -371,4 +373,5 @@ def vapor_fluxes(
         lhf_air=lhf_air.astype(f32),
         q_gr=q_gr.astype(f32),
         mw_new=mw_new.astype(f32),
+        r_soil=r_soil.astype(f32),
     )

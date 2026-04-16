@@ -72,24 +72,34 @@ def nudge_scalar(
     z1_m:    float,
     z2_m:    float,
     tau_s:   float,
+    cos_lat: jax.Array | None = None,  # (ny,) for domain-mean weighting
 ) -> jax.Array:
     """Relax ``phi`` toward ``phi_ref`` in band ``[z1_m, z2_m]``.
 
-    Matches gSAM nudging.f90 line 452 (implicit-style substitution)::
+    C7 fix: matches gSAM nudging.f90 line 452 — nudges the DOMAIN MEAN
+    ``phi0(k)`` toward ``phi_ref(k)``, not each individual grid point.
+    This avoids damping horizontal variability::
 
-        phi^{n+1} = phi^n - (phi^n - phi_ref) * (dt / tau)   in band
-                  = (1 - dt/tau) * phi^n + (dt/tau) * phi_ref
+        phi^{n+1}(i,j,k) = phi^n(i,j,k) - (phi0(k) - phi_ref(k)) * (dt / tau)
 
-    The coefficient ``dt/tau`` is clipped to [0, 1] to preserve monotonicity
-    when dt >= tau (shouldn't happen in practice but keeps the step robust
-    under kurant dt shrinkage).
+    where phi0(k) is the cos-lat-weighted horizontal mean of phi at level k.
     """
-    coef = jnp.clip(dt / tau_s, 0.0, 1.0)       # scalar, stable
+    coef = dt / tau_s                             # no clipping (matches gSAM)
     mask = _band_mask(z, z1_m, z2_m)            # (nz,)
     coef_k = coef * mask                        # (nz,)  zero outside band
     coef_3d = coef_k[:, None, None]             # (nz,1,1) broadcast
     ref_3d  = phi_ref[:, None, None]            # (nz,1,1) broadcast
-    return phi + coef_3d * (ref_3d - phi)
+
+    # Compute domain-mean profile phi0(k) using cos-lat weighting
+    if cos_lat is not None:
+        wgt = cos_lat / jnp.sum(cos_lat)        # (ny,) normalised weights
+        phi0 = jnp.sum(jnp.mean(phi, axis=2) * wgt[None, :], axis=1)  # (nz,)
+    else:
+        phi0 = jnp.mean(phi, axis=(1, 2))       # (nz,) simple mean fallback
+
+    phi0_3d = phi0[:, None, None]               # (nz,1,1) broadcast
+    # Spatially uniform correction: nudge domain mean toward reference
+    return phi - coef_3d * (phi0_3d - ref_3d)
 
 
 def nudge_proc(
@@ -110,6 +120,7 @@ def nudge_proc(
         return state
 
     z = metric["z"]        # (nz,) cell-centre heights in metres
+    cos_lat = metric.get("cos_lat", None)   # (ny,) for domain-mean weighting
 
     new_TABS = state.TABS
     new_QV   = state.QV
@@ -118,12 +129,14 @@ def nudge_proc(
         new_TABS = nudge_scalar(
             state.TABS, tabs_ref, z, dt,
             params.z1_m, params.z2_m, params.tau_s,
+            cos_lat=cos_lat,
         )
 
     if params.nudge_qv and qv_ref is not None:
         new_QV = nudge_scalar(
             state.QV, qv_ref, z, dt,
             params.z1_m, params.z2_m, params.tau_s,
+            cos_lat=cos_lat,
         )
 
     return ModelState(

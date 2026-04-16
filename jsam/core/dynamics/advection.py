@@ -80,13 +80,10 @@ def _face5(
         + (1/6)   * (cn**2 - 1) * (d2 - 0.5*cn*d3)
         + (1/120) * (cn**2 - 1) * (cn**2 - 4) * (d4 - jnp.sign(cn)*d5)
     )
-    # ULTIMATE monotone limiter (gSAM advect_um_lib.f90):
-    #   clip face value to [min(f_im1,f_i), max(f_im1,f_i)]
-    # This prevents overshoots from the 5th-order stencil at the poles and
-    # wherever the flow creates strong local convergence.
-    lo = jnp.minimum(f_im1, f_i)
-    hi = jnp.maximum(f_im1, f_i)
-    return jnp.clip(face, lo, hi)
+    # C3 fix: gSAM face_5th returns the RAW 5th-order value with no monotone
+    # limiter.  Monotonicity is enforced later by the FCT (Zalesak) step.
+    # The previous ULTIMATE limiter was overly diffusive for the MACHO predictor.
+    return face
 
 
 # ---------------------------------------------------------------------------
@@ -120,15 +117,19 @@ def advect_scalar(
     W:      jax.Array,   # (nz+1, ny, nx)  vertical velocity at top faces (m/s)
     metric: dict,
     dt:     float,
+    nstep:  int = 0,     # C5: timestep counter for MACHO ordering cycle
 ) -> jax.Array:          # (nz, ny, nx)  updated phi
     """
-    One timestep of 5th-order ULTIMATE-MACHO scalar advection (anelastic lat-lon)
+    One timestep of 5th-order MACHO scalar advection (anelastic lat-lon)
     with Zalesak FCT to enforce monotonicity and positivity.
 
-    Implements gSAM advect_scalar3D case 2 (x→y→z) + fct3D.
+    C2 fix: Courant numbers include Jacobian factors adz(k)*ady(j).
+    C4 fix: FCT flux divergences include irho/iadz weighting.
+    C5 fix: MACHO direction ordering cycles through 6 permutations.
 
     Algorithm:
       1. MACHO predictor: compute high-order face values (fx, fy, fz)
+         with cycling direction order mod(nstep-1, 6)
       2. FCT (Zalesak 1979):
          a. Compute 1st-order upwind fluxes → upwind update (monotone, diffusive)
          b. Antidiffusive flux = high-order flux − upwind flux
@@ -147,49 +148,97 @@ def advect_scalar(
     iadz = 1.0 / dz[:, None, None]            # (nz, 1, 1)
     dy3   = dy[None, :, None]                  # (1, ny, 1)
 
-    # Mass-weighted Courant numbers (= velocity * dt / dx, matching gSAM cu/cv/cw)
-    cu_w = U[:, :, :-1]   * dt / dx            # west face of cell i  (nz, ny, nx)
-    cu_e = jnp.roll(cu_w, -1, axis=2)          # east face of cell i
-    cv_s = V[:, 0:ny,   :] * dt / dy3          # south face of cell j
-    cv_n = V[:, 1:ny+1, :] * dt / dy3          # north face of cell j
-    cw_t = W[1:nz+1, :, :] * dt * iadz         # top face of cell k   (nz, ny, nx)
+    # C2 fix: Jacobian factors for Courant numbers
+    # gSAM cu = u/rho where u is mass flux = rho*vel*adz*ady
+    # so cu = vel * adz * ady.  Courant number = cu * dt/dx = vel*dt/dx*adz*ady
+    ady   = metric["ady"][:, None]             # (ny, 1) -> broadcast as (1, ny, 1) below
+    ady3  = ady[None, :, :]                    # (1, ny, 1)
+    adz   = (dz / dz[0])[:, None, None]        # (nz, 1, 1) normalised layer thickness
+
+    cu_w = U[:, :, :-1]   * dt / dx * adz * ady3       # (nz, ny, nx)
+    cu_e = jnp.roll(cu_w, -1, axis=2)
+    cv_s = V[:, 0:ny,   :] * dt / dy3 * adz * ady3     # (nz, ny, nx)
+    cv_n = V[:, 1:ny+1, :] * dt / dy3 * adz * ady3
+    # z: gSAM cw = w/(rhow*adz); Courant = cw*dt = w*dt/(rhow*adz)
+    # For the face_5th CN we need the non-dimensional version
+    cw_t = W[1:nz+1, :, :] * dt * iadz                 # (nz, ny, nx)
 
     # ------------------------------------------------------------------ #
     # MACHO predictor — compute high-order face values                    #
+    # C5 fix: cycle through 6 direction orderings via mod(nstep-1, 6)     #
+    #   0: z→x→y  1: y→z→x  2: x→y→z  3: z→y→x  4: x→z→y  5: y→x→z    #
+    # The first two directions get advective-form predictor updates;      #
+    # the third direction computes face values only (no predictor update).#
     # ------------------------------------------------------------------ #
+    cw_b = jnp.concatenate([jnp.zeros_like(cw_t[:1]), cw_t[:-1]], axis=0)
+
+    def _face_x(fadv_in):
+        return _face5(
+            jnp.roll(fadv_in,  3, axis=2), jnp.roll(fadv_in,  2, axis=2),
+            jnp.roll(fadv_in,  1, axis=2), fadv_in,
+            jnp.roll(fadv_in, -1, axis=2), jnp.roll(fadv_in, -2, axis=2),
+            cu_w,
+        )
+
+    def _adv_update_x(fadv_in, fx_in):
+        fx_e_in = jnp.roll(fx_in, -1, axis=2)
+        return fadv_in + _adv_cn(cu_w, cu_e) * (fx_in - fx_e_in), fx_e_in
+
+    def _face_y(fadv_in):
+        fp = jnp.pad(fadv_in, ((0, 0), (3, 3), (0, 0)), mode='edge')
+        return _face5(
+            fp[:, 0:ny, :], fp[:, 1:ny+1, :], fp[:, 2:ny+2, :],
+            fp[:, 3:ny+3, :], fp[:, 4:ny+4, :], fp[:, 5:ny+5, :],
+            cv_s,
+        )
+
+    def _adv_update_y(fadv_in, fy_s_in):
+        fy_n_in = jnp.concatenate([fy_s_in[:, 1:, :], fy_s_in[:, -1:, :]], axis=1)
+        return fadv_in + _adv_cn(cv_s, cv_n) * (fy_s_in - fy_n_in), fy_n_in
+
+    def _face_z(fadv_in):
+        fp = jnp.pad(fadv_in, ((3, 3), (0, 0), (0, 0)), mode='edge')
+        fz_t_in = _face5(
+            fp[1:nz+1], fp[2:nz+2], fp[3:nz+3],
+            fp[4:nz+4], fp[5:nz+5], fp[6:nz+6],
+            cw_t,
+        )
+        fz_t_in = fz_t_in.at[-1].set(0.0)  # rigid-lid BC
+        return fz_t_in
+
+    def _adv_update_z(fadv_in, fz_t_in):
+        fz_b_in = jnp.concatenate([jnp.zeros_like(fz_t_in[:1]), fz_t_in[:-1]], axis=0)
+        return fadv_in + _adv_cn(cw_b, cw_t) * (fz_b_in - fz_t_in), fz_b_in
+
     fadv = phi
+    macho_order = (nstep - 1) % 6
 
-    # --- x: face values → advective update ---
-    fx = _face5(
-        jnp.roll(fadv,  3, axis=2),
-        jnp.roll(fadv,  2, axis=2),
-        jnp.roll(fadv,  1, axis=2),
-        fadv,
-        jnp.roll(fadv, -1, axis=2),
-        jnp.roll(fadv, -2, axis=2),
-        cu_w,
-    )   # fx[:,j,i] = face value at west face of cell i
-    fx_e = jnp.roll(fx, -1, axis=2)
-    fadv = fadv + _adv_cn(cu_w, cu_e) * (fx - fx_e)
-
-    # --- y: face values → advective update ---
-    fp = jnp.pad(fadv, ((0, 0), (3, 3), (0, 0)), mode='edge')
-    fy_s = _face5(
-        fp[:, 0:ny, :], fp[:, 1:ny+1, :], fp[:, 2:ny+2, :],
-        fp[:, 3:ny+3, :], fp[:, 4:ny+4, :], fp[:, 5:ny+5, :],
-        cv_s,
-    )   # fy_s[:,j,:] = face value at south face of cell j
-    fy_n = jnp.concatenate([fy_s[:, 1:, :], fy_s[:, -1:, :]], axis=1)
-    fadv = fadv + _adv_cn(cv_s, cv_n) * (fy_s - fy_n)
-
-    # --- z: face values only (last direction — no advective update) ---
-    fp = jnp.pad(fadv, ((3, 3), (0, 0), (0, 0)), mode='edge')
-    fz_t = _face5(
-        fp[1:nz+1], fp[2:nz+2], fp[3:nz+3],
-        fp[4:nz+4], fp[5:nz+5], fp[6:nz+6],
-        cw_t,
-    )   # fz_t[k] = face value at top face of cell k
-    fz_b = jnp.concatenate([jnp.zeros_like(fz_t[:1]), fz_t[:-1]], axis=0)
+    # Execute the 6 MACHO orderings.
+    # Each ordering: dir1 (face+update), dir2 (face+update), dir3 (face only).
+    if macho_order == 0:    # z → x → y
+        fz_t = _face_z(fadv);         fadv, fz_b = _adv_update_z(fadv, fz_t)
+        fx   = _face_x(fadv);         fadv, fx_e = _adv_update_x(fadv, fx)
+        fy_s = _face_y(fadv);         fy_n = jnp.concatenate([fy_s[:, 1:, :], fy_s[:, -1:, :]], axis=1)
+    elif macho_order == 1:  # y → z → x
+        fy_s = _face_y(fadv);         fadv, fy_n = _adv_update_y(fadv, fy_s)
+        fz_t = _face_z(fadv);         fadv, fz_b = _adv_update_z(fadv, fz_t)
+        fx   = _face_x(fadv);         fx_e = jnp.roll(fx, -1, axis=2)
+    elif macho_order == 2:  # x → y → z  (original case 2)
+        fx   = _face_x(fadv);         fadv, fx_e = _adv_update_x(fadv, fx)
+        fy_s = _face_y(fadv);         fadv, fy_n = _adv_update_y(fadv, fy_s)
+        fz_t = _face_z(fadv);         fz_b = jnp.concatenate([jnp.zeros_like(fz_t[:1]), fz_t[:-1]], axis=0)
+    elif macho_order == 3:  # z → y → x
+        fz_t = _face_z(fadv);         fadv, fz_b = _adv_update_z(fadv, fz_t)
+        fy_s = _face_y(fadv);         fadv, fy_n = _adv_update_y(fadv, fy_s)
+        fx   = _face_x(fadv);         fx_e = jnp.roll(fx, -1, axis=2)
+    elif macho_order == 4:  # x → z → y
+        fx   = _face_x(fadv);         fadv, fx_e = _adv_update_x(fadv, fx)
+        fz_t = _face_z(fadv);         fadv, fz_b = _adv_update_z(fadv, fz_t)
+        fy_s = _face_y(fadv);         fy_n = jnp.concatenate([fy_s[:, 1:, :], fy_s[:, -1:, :]], axis=1)
+    else:                   # 5: y → x → z
+        fy_s = _face_y(fadv);         fadv, fy_n = _adv_update_y(fadv, fy_s)
+        fx   = _face_x(fadv);         fadv, fx_e = _adv_update_x(fadv, fx)
+        fz_t = _face_z(fadv);         fz_b = jnp.concatenate([jnp.zeros_like(fz_t[:1]), fz_t[:-1]], axis=0)
 
     # ------------------------------------------------------------------ #
     # FCT (Zalesak 1979) — matches gSAM fct3D in advect_um_lib.f90       #
@@ -203,14 +252,17 @@ def advect_scalar(
     rw_b = rhow[0:nz,   None, None]
     rho3 = rho[:, None, None]
 
-    # High-order fluxes (same as original flux-form update)
-    ho_x_w = U[:, :, :-1] * fx * dt / dx
-    ho_x_e = U[:, :, 1:]  * fx_e * dt / dx
-    ho_y_s = V[:, :ny, :]  * fy_s * dt / dy3
-    ho_y_n = V[:, 1:,  :]  * fy_n * dt / dy3
-    ho_z_t = rw_t * W[1:nz+1] * fz_t / (rho3 * dz[:, None, None]) * dt
+    # C4 fix: all flux divergences are divided by rho(k)*adz(k) in gSAM.
+    # High-order fluxes include irho*iadz so the FCT limiter operates on
+    # the same scale across all three directions.
+    dz3 = dz[:, None, None]
+    ho_x_w = U[:, :, :-1] * fx * dt / dx * irho * iadz
+    ho_x_e = U[:, :, 1:]  * fx_e * dt / dx * irho * iadz
+    ho_y_s = V[:, :ny, :]  * fy_s * dt / dy3 * irho * iadz
+    ho_y_n = V[:, 1:,  :]  * fy_n * dt / dy3 * irho * iadz
+    ho_z_t = rw_t * W[1:nz+1] * fz_t / (rho3 * dz3) * dt * iadz
     ho_z_b = jnp.concatenate([jnp.zeros_like(ho_z_t[:1]),
-                               rw_b[1:] * W[1:nz] * fz_b[1:] / (rho3[1:] * dz[1:, None, None]) * dt],
+                               rw_b[1:] * W[1:nz] * fz_b[1:] / (rho3[1:] * dz[1:, None, None]) * dt * iadz[1:]],
                               axis=0)
 
     # --- Step 1: local min/max of original field (7-point stencil) ---
@@ -226,30 +278,30 @@ def advect_scalar(
     mx0 = jnp.maximum(jnp.maximum(jnp.maximum(phi, f_xm), jnp.maximum(f_xp, f_ym)),
                        jnp.maximum(f_yp, jnp.maximum(f_zm, f_zp)))
 
-    # --- Step 2: 1st-order upwind fluxes (same conventions as high-order) ---
+    # --- Step 2: 1st-order upwind fluxes (C4 fix: include irho*iadz) ---
     # x: upwind at west face of cell i
     U_w = U[:, :, :-1]
     U_e = U[:, :, 1:]
     up_x_w = (jnp.roll(phi, 1, axis=2) * jnp.maximum(0.0, U_w)
-            + phi * jnp.minimum(0.0, U_w)) * dt / dx
+            + phi * jnp.minimum(0.0, U_w)) * dt / dx * irho * iadz
     up_x_e = (phi * jnp.maximum(0.0, U_e)
-            + jnp.roll(phi, -1, axis=2) * jnp.minimum(0.0, U_e)) * dt / dx
+            + jnp.roll(phi, -1, axis=2) * jnp.minimum(0.0, U_e)) * dt / dx * irho * iadz
 
     # y: upwind at south face of cell j
     V_s = V[:, :ny, :]
     V_n = V[:, 1:, :]
     up_y_s = (f_ym * jnp.maximum(0.0, V_s)
-            + phi * jnp.minimum(0.0, V_s)) * dt / dy3
+            + phi * jnp.minimum(0.0, V_s)) * dt / dy3 * irho * iadz
     up_y_n = (phi * jnp.maximum(0.0, V_n)
-            + f_yp * jnp.minimum(0.0, V_n)) * dt / dy3
+            + f_yp * jnp.minimum(0.0, V_n)) * dt / dy3 * irho * iadz
 
-    # z: upwind at top face of cell k (with rhow/rho weighting)
+    # z: upwind at top face of cell k (with rhow/rho weighting + iadz)
     W_t = W[1:nz+1]
     up_z_t = (phi * jnp.maximum(0.0, W_t)
-            + f_zp * jnp.minimum(0.0, W_t)) * rw_t / (rho3 * dz[:, None, None]) * dt
+            + f_zp * jnp.minimum(0.0, W_t)) * rw_t / (rho3 * dz3) * dt * iadz
     up_z_b = jnp.concatenate([jnp.zeros_like(up_z_t[:1]),
         (f_zm[1:] * jnp.maximum(0.0, W[1:nz])
-       + phi[1:] * jnp.minimum(0.0, W[1:nz])) * rw_b[1:] / (rho3[1:] * dz[1:, None, None]) * dt],
+       + phi[1:] * jnp.minimum(0.0, W[1:nz])) * rw_b[1:] / (rho3[1:] * dz[1:, None, None]) * dt * iadz[1:]],
         axis=0)
 
     # --- Step 3: upwind update ---

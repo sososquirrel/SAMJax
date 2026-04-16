@@ -207,36 +207,129 @@ def shear_prod(
 # ---------------------------------------------------------------------------
 
 def _compute_buoy_sgs(
-    TABS:   jax.Array,     # (nz, ny, nx) K
-    tabs0:  jax.Array,     # (nz,) K reference profile
-    z:      jax.Array,     # (nz,) m cell-centre heights
-    g_cp:   float = 9.79764 / 1004.64,
-    g:      float = 9.79764,
+    TABS:   jax.Array,       # (nz, ny, nx) K
+    tabs0:  jax.Array,       # (nz,) K reference profile
+    metric: dict,
+    QV:     jax.Array | None = None,   # moisture fields (all nz,ny,nx)
+    QC:     jax.Array | None = None,
+    QI:     jax.Array | None = None,
+    QR:     jax.Array | None = None,
+    QS:     jax.Array | None = None,
+    QG:     jax.Array | None = None,
+    fluxbt: jax.Array | None = None,   # D14: (ny,nx) surface heat flux (K·m/s)
+    fluxbq: jax.Array | None = None,   # D14: (ny,nx) surface moisture flux (kg/kg·m/s)
 ) -> jax.Array:
     """
-    gSAM-style SGS buoyancy frequency squared at cell centres, dry limit.
+    Full moist SGS buoyancy at cell centres, matching gSAM tke_full.f90:96-242.
 
-    buoy_sgs = (g / tabs0) * d(t_liq)/dz   where t_liq ≈ TABS + (g/cp)·z
-             ≈ Brunt–Väisälä frequency squared (>0 stable, <0 unstable).
+    Includes virtual temperature, condensate loading, precipitation drag,
+    and moist-adiabatic saturation correction when the interface mixture
+    is supersaturated.
 
-    Ignores moisture and cloud latent contributions (sufficient for
-    stratosphere/upper troposphere where W runaway happens).  Returns
-    a (nz, ny, nx) array, averaged from face values to cell centres.
+    Falls back to the dry-only formulation when moisture fields are None.
     """
-    t_liq = TABS + g_cp * z[:, None, None]                          # (nz,ny,nx)
+    from jsam.core.physics.microphysics import (
+        qsatw, qsati, _dtqsatw, _dtqsati,
+        FAC_COND, FAC_FUS, FAC_SUB, G_GRAV, CP,
+    )
 
-    dz_c = (z[1:] - z[:-1])[:, None, None]                          # (nz-1,1,1)
-    tabs0_face = 0.5 * (tabs0[1:] + tabs0[:-1])[:, None, None]      # (nz-1,1,1)
-    buoy_face = (g / tabs0_face) * (t_liq[1:] - t_liq[:-1]) / dz_c  # (nz-1,ny,nx)
+    z      = metric["z"]
+    gamaz  = metric["gamaz"]
+    adzw   = metric["adzw"]
+    pres   = metric["pres"]
+    dz_ref = metric["dz_ref"]
+    g      = G_GRAV
+    EPSV   = 0.61
 
-    # Face → cell-centre average (k=0 and k=nz-1 use nearest face)
-    buoy_centre = jnp.concatenate(
+    bet = g / tabs0   # (nz,)
+
+    # --- Dry fallback ---
+    if QV is None:
+        g_cp = g / CP
+        t_liq = TABS + g_cp * z[:, None, None]
+        dz_c = (z[1:] - z[:-1])[:, None, None]
+        tabs0_face = 0.5 * (tabs0[1:] + tabs0[:-1])[:, None, None]
+        buoy_face = (g / tabs0_face) * (t_liq[1:] - t_liq[:-1]) / dz_c
+        return jnp.concatenate(
+            [buoy_face[:1],
+             0.5 * (buoy_face[:-1] + buoy_face[1:]),
+             buoy_face[-1:]], axis=0)
+
+    # --- Full moist buoyancy (gSAM tke_full.f90:122-242) ---
+    t_se = (TABS + gamaz[:, None, None]
+            - FAC_COND * (QC + QR)
+            - FAC_SUB  * (QI + QS + QG))
+
+    qpl  = QR
+    qpi  = QS + QG
+    qtot = QV + QC + QI
+
+    pres_mb  = pres / 100.0
+    presi_mb = jnp.concatenate([pres_mb[:1],
+                                0.5 * (pres_mb[:-1] + pres_mb[1:]),
+                                pres_mb[-1:]])
+
+    kb = slice(None, -1)
+    kc = slice(1, None)
+
+    bet_face = 0.5 * (bet[1:] + bet[:-1])
+    betdz = (bet_face / (dz_ref * adzw[1:-1]))[:, None, None]
+
+    # Unsaturated (tke_full.f90:143-159)
+    tabs_if = 0.5 * (TABS[kc] + FAC_COND * QC[kc] + FAC_SUB * QI[kc]
+                    + TABS[kb] + FAC_COND * QC[kb] + FAC_SUB * QI[kb])
+    qtot_if = 0.5 * (qtot[kc] + qtot[kb])
+    qp_if   = 0.5 * (qpl[kc] + qpi[kc] + qpl[kb] + qpi[kb])
+
+    bbb = 1.0 + EPSV * qtot_if - qp_if
+    buoy_unsat = betdz * (
+        bbb * (t_se[kc] - t_se[kb])
+        + EPSV * tabs_if * (qtot[kc] - qtot[kb])
+        + (bbb * FAC_COND - tabs_if) * (qpl[kc] - qpl[kb])
+        + (bbb * FAC_SUB  - tabs_if) * (qpi[kc] - qpi[kb]))
+
+    # Saturated check (tke_full.f90:170-237)
+    qctot = QC[kc] + QI[kc] + QC[kb] + QI[kb]
+    has_cloud = qctot > 0.0
+    omn = (QC[kc] + QC[kb]) / (qctot + 1e-20)
+    presi_if = presi_mb[1:-1, None, None]
+    qsat_chk = omn * qsatw(tabs_if, presi_if) + (1.0 - omn) * qsati(tabs_if, presi_if)
+    is_sat = has_cloud & (qtot_if > qsat_chk)
+
+    lstarn = FAC_COND + (1.0 - omn) * FAC_FUS
+    tabs_if_sat = 0.5 * (TABS[kc] + TABS[kb])
+    dqsat = (omn * _dtqsatw(tabs_if_sat, presi_if)
+             + (1.0 - omn) * _dtqsati(tabs_if_sat, presi_if))
+    qsatt = (omn * qsatw(tabs_if_sat, presi_if)
+             + (1.0 - omn) * qsati(tabs_if_sat, presi_if))
+    bbb_s = (1.0 + EPSV * qsatt + qsatt - qtot_if - qp_if
+             + 1.61 * tabs_if_sat * dqsat) / (1.0 + lstarn * dqsat)
+    tabs_k = tabs_if_sat
+    buoy_sat = betdz * (
+        bbb_s * (t_se[kc] - t_se[kb])
+        + (bbb_s * lstarn - (1.0 + lstarn * dqsat) * tabs_if_sat)
+            * (qtot[kc] - qtot[kb])
+        + (bbb_s * FAC_COND - (1.0 + FAC_COND * dqsat) * tabs_k)
+            * (qpl[kc] - qpl[kb])
+        + (bbb_s * FAC_SUB  - (1.0 + FAC_SUB * dqsat) * tabs_k)
+            * (qpi[kc] - qpi[kb]))
+
+    buoy_face = jnp.where(is_sat, buoy_sat, buoy_unsat)
+
+    # D14 fix: gSAM tke_full.f90:96-118 — at the surface, buoy_sgs is derived
+    # from surface heat/moisture fluxes rather than finite-differenced profiles.
+    #   buoy_sgs(k=1) = bet(1) * (fluxbt + EPSV*tabs0(1)*fluxbq)
+    if fluxbt is not None:
+        _bet0 = g / tabs0[0]
+        _fbt = fluxbt   # (ny,nx)  K·m/s
+        _fbq = fluxbq if fluxbq is not None else jnp.zeros_like(fluxbt)
+        _buoy_sfc = _bet0 * (_fbt + EPSV * tabs0[0] * _fbq)   # (ny,nx)
+        buoy_face = buoy_face.at[0].set(_buoy_sfc)
+
+    return jnp.concatenate(
         [buoy_face[:1],
          0.5 * (buoy_face[:-1] + buoy_face[1:]),
-         buoy_face[-1:]],
-        axis=0,
-    )
-    return buoy_centre
+         buoy_face[-1:]], axis=0)
 
 
 @functools.partial(jax.jit, static_argnames=("params",))
@@ -246,6 +339,13 @@ def smag_viscosity(
     params: SGSParams,
     TABS:   jax.Array | None = None,   # (nz, ny, nx) K
     tabs0:  jax.Array | None = None,   # (nz,) K reference profile
+    QV:     jax.Array | None = None,   # moisture fields for moist buoyancy
+    QC:     jax.Array | None = None,
+    QI:     jax.Array | None = None,
+    QR:     jax.Array | None = None,
+    QS:     jax.Array | None = None,
+    QG:     jax.Array | None = None,
+    tk_prev: jax.Array | None = None,  # D13: previous-step tk for smix limiter
 ) -> tuple[jax.Array, jax.Array]:
     """
     Returns (tk, tkh), both (nz, ny, nx) in m²/s.
@@ -255,11 +355,17 @@ def smag_viscosity(
 
     gSAM dosmagor=True with buoyancy suppression (TABS and tabs0 given):
         buoy = N²  (>0 stable)
-        if buoy > 0:  smix = min(grd, max(0.1·grd, √(0.76·tk_iter/Ck/√buoy)))
+        if buoy > 0:  smix = min(grd, max(0.1·grd, √(0.76·tk_prev/Ck/√buoy)))
         Cee  = (Ce/0.7) · (0.19 + 0.51·smix/grd),   Ce = Ck³/Cs⁴
         tk   = √(Ck³/Cee · max(0, def2 − Pr·buoy)) · smix²
-    tk_iter is one fixed-point iteration with smix₀ = grd, needed because
-    gSAM uses the previous-step tk in the smix limiter.
+
+    D13: tk_prev is the previous-step tk used in the mixing length limiter
+    (gSAM tke_full.f90:288 uses stored tk array). Falls back to fixed-point
+    iteration from grd when tk_prev is None.
+
+    When moisture fields (QV..QG) are provided, uses the full moist buoyancy
+    from gSAM tke_full.f90 including virtual temp, condensate loading,
+    and saturation correction.  Falls back to dry buoyancy when None.
     """
     dx        = metric["dx_lon"]
     dy        = metric["dy_lat"]   # (ny,) per-row
@@ -269,22 +375,19 @@ def smag_viscosity(
     Ck        = params.Ck
     Pr        = params.Pr
 
-    # Cartesian: uniform equatorial dx everywhere (no cos(lat) shrinkage).
-    # Per-row dy → per-row dy_eff → per-row mixing length.
-    dx_eff = jnp.minimum(delta_max, dx)                         # scalar
-    dy_eff = jnp.minimum(delta_max, dy)[None, :, None]          # (1, ny, 1)
+    dx_eff = jnp.minimum(delta_max, dx)
+    dy_eff = jnp.minimum(delta_max, dy)[None, :, None]
 
-    grd = (dz[:, None, None] * dx_eff * dy_eff) ** (1.0 / 3.0)
+    grd = (dz[:, None, None] * dx_eff * dy_eff) ** 0.33333
 
     if TABS is None or tabs0 is None:
-        # Legacy pure-Smagorinsky path (no buoyancy suppression)
         tk  = Cs**2 * grd**2 * jnp.sqrt(jnp.maximum(0.0, def2))
         tkh = params.Pr * tk
         return tk, tkh
 
     # --- gSAM dosmagor=True branch with buoyancy suppression ---
-    z         = metric["z"]
-    buoy_sgs  = _compute_buoy_sgs(TABS, tabs0, z)
+    buoy_sgs  = _compute_buoy_sgs(TABS, tabs0, metric,
+                                   QV=QV, QC=QC, QI=QI, QR=QR, QS=QS, QG=QG)
 
     # Constants (gSAM tke_full.f90:28-31)
     Ce  = Ck**3 / Cs**4                 # ≈ 0.7673
@@ -293,8 +396,14 @@ def smag_viscosity(
 
     def2_adj = jnp.maximum(0.0, def2 - Pr * buoy_sgs)
 
-    # Fixed-point iter 0: smix = grd, Cee = Ce1 + Ce2 = Ce
-    tk_iter = jnp.sqrt(Ck**3 / Ce * def2_adj) * grd**2
+    # D13 fix: gSAM uses previous-step tk in the mixing length limiter
+    # (tke_full.f90:288). When tk_prev is available, use it directly;
+    # otherwise fall back to the single fixed-point iteration.
+    if tk_prev is not None:
+        tk_for_smix = tk_prev
+    else:
+        # Fixed-point iter 0: smix = grd, Cee = Ce1 + Ce2 = Ce
+        tk_for_smix = jnp.sqrt(Ck**3 / Ce * def2_adj) * grd**2
 
     # gSAM smix limiter for stable layers (buoy > 0)
     stable = buoy_sgs > 0.0
@@ -302,7 +411,7 @@ def smag_viscosity(
         grd,
         jnp.maximum(
             0.1 * grd,
-            jnp.sqrt(0.76 * tk_iter / Ck / jnp.sqrt(buoy_sgs + 1e-10)),
+            jnp.sqrt(0.76 * tk_for_smix / Ck / jnp.sqrt(buoy_sgs + 1e-10)),
         ),
     )
     smix = jnp.where(stable, smix_stable, grd)
@@ -340,12 +449,19 @@ def diffuse_scalar(
     dzw_ = _dzw(dz)           # (nz+1,)
     nz, ny, nx = field.shape
 
-    # ---- Horizontal x-direction — Cartesian (no imu) ----
+    # ---- Horizontal x-direction — with imu(j) = 1/cos(lat) metric (C8 fix) ----
     field_xp = jnp.concatenate([field[:, :, -1:], field, field[:, :, :1]], axis=2)  # (nz,ny,nx+2)
     tkh_xp   = jnp.concatenate([tkh[:, :, -1:],  tkh,  tkh[:, :, :1]],  axis=2)
     rdx2     = (1.0 / dx) ** 2                                             # scalar
+    # C8 fix: gSAM diffuse_scalar3D.f90:48 — rdx5 = rdx2 * imu(j)^2
+    cos_lat  = metric.get("cos_lat", None)
+    if cos_lat is not None:
+        imu2 = (1.0 / cos_lat[None, :, None]) ** 2   # (1, ny, 1)
+    else:
+        imu2 = 1.0
+    rdx2_j   = rdx2 * imu2                                                # (1, ny, 1) or scalar
     tkh_fx   = 0.5 * (tkh_xp[:, :, :-1] + tkh_xp[:, :, 1:])              # (nz,ny,nx+1) x-faces
-    flx_x    = -rdx2 * tkh_fx * (field_xp[:, :, 1:] - field_xp[:, :, :-1])  # (nz,ny,nx+1)
+    flx_x    = -rdx2_j * tkh_fx * (field_xp[:, :, 1:] - field_xp[:, :, :-1])  # (nz,ny,nx+1)
     dfdt     = -(flx_x[:, :, 1:] - flx_x[:, :, :-1])                     # (nz,ny,nx)
 
     # ---- Horizontal y-direction (non-uniform) ----
@@ -427,10 +543,16 @@ def diffuse_momentum(
     rhow = metric["rhow"] # (nz+1,)
     dzw_ = _dzw(dz)        # (nz+1,)
 
-    # Cartesian: uniform 1/dx² everywhere (no imu)
-    rdx2u = (1.0 / dx)**2   # scalar — same for U, V, W grids
-    rdx2v = rdx2u
-    rdx2w = rdx2u
+    # C8 fix: apply imu(j)^2 = 1/cos(lat)^2 metric to x-direction
+    cos_lat = metric.get("cos_lat", None)
+    rdx2_base = (1.0 / dx)**2
+    if cos_lat is not None:
+        imu2 = (1.0 / cos_lat[None, :, None]) ** 2   # (1, ny, 1)
+    else:
+        imu2 = 1.0
+    rdx2u = rdx2_base * imu2   # for U grid (ny rows)
+    rdx2v = rdx2_base * imu2   # for V grid (approximate; uses mass-row cos)
+    rdx2w = rdx2_base * imu2   # for W grid
     rdy2  = 1.0 / dy_ref**2
 
     # Helper: interpolate cell-centre tk to U x-faces (periodic in x)
@@ -438,11 +560,19 @@ def diffuse_momentum(
     tk_Ux = 0.5 * (jnp.roll(tk, 1, axis=2) + tk)  # (nz,ny,nx), valid at face i using tk[i-1] and tk[i]
     # Extend to nx+1 with periodic wrap: face nx same as face 0
     tk_at_U = jnp.concatenate([tk_Ux, tk_Ux[:, :, :1]], axis=2)          # (nz,ny,nx+1)
-    # Interpolate to V y-faces (Neumann pad): tk_at_V[k,j,i] = mean of cell rows j-1 and j
+    # D12 fix: 4-point corner interpolation for staggered tk (gSAM diffuse_mom3D.f90:44-48)
+    # At V y-face (j+1/2, i): average tk from 4 surrounding cells (j,i-1), (j,i), (j+1,i-1), (j+1,i)
+    tk_xm = jnp.roll(tk, 1, axis=2)                                       # tk at i-1
     tk_yp   = jnp.pad(tk, ((0, 0), (1, 0), (0, 0)), mode='edge')          # (nz,ny+1,nx)
-    tk_at_V = 0.5 * (tk_yp[:, :-1, :] + tk_yp[:, 1:, :])                 # (nz,ny,nx) at V interior rows 1..ny-1
+    tk_xm_yp = jnp.pad(tk_xm, ((0, 0), (1, 0), (0, 0)), mode='edge')    # (nz,ny+1,nx)
+    tk_at_V = 0.25 * (tk_yp[:, :-1, :] + tk_yp[:, 1:, :]
+                     + tk_xm_yp[:, :-1, :] + tk_xm_yp[:, 1:, :])         # (nz,ny,nx)
     tk_at_V = jnp.pad(tk_at_V, ((0, 0), (0, 1), (0, 0)), mode='edge')    # (nz,ny+1,nx) add top row
-    # Interpolate to W z-faces (edge pad): tk_at_W[k,j,i] = mean of cells k-1 and k
+    # Interpolate to W z-faces: 4-point average over (k-1,i), (k,i), (k-1,i-1), (k,i-1)
+    tk_zp = jnp.pad(tk, ((1, 0), (0, 0), (0, 0)), mode='edge')            # (nz+1,ny,nx)
+    tk_xm_zp = jnp.pad(tk_xm, ((1, 0), (0, 0), (0, 0)), mode='edge')
+    tk_at_W_int = 0.25 * (tk_zp[:-1, :, :] + tk_zp[1:, :, :]
+                        + tk_xm_zp[:-1, :, :] + tk_xm_zp[1:, :, :])      # (nz,ny,nx)
     tk_at_W = jnp.pad(
         0.5 * (tk[:-1, :, :] + tk[1:, :, :]),                             # (nz-1,ny,nx) interior
         ((1, 1), (0, 0), (0, 0)), mode='edge',
@@ -556,6 +686,9 @@ def diffuse_momentum(
     dW_dz = W[1:, :, :] - W[:-1, :, :]                                    # (nz,ny,nx)
     tk_Wz2 = 0.5 * (tk_at_W[:-1, :, :] + tk_at_W[1:, :, :])              # (nz,ny,nx)
     fz_Wint = -tk_Wz2 * dW_dz / dz[:, None, None]                         # (nz,ny,nx)
+    # D24 fix: gSAM diffuse_mom3D.f90:137 zeros fwz(i,j,2) — the flux at the
+    # lowest interior W face (between W[1] and W[2], 0-indexed = fz_Wint[1]).
+    fz_Wint = fz_Wint.at[1].set(0.0)
     fz_W = jnp.concatenate([
         jnp.zeros((1, W.shape[1], W.shape[2])),
         fz_Wint,
@@ -593,7 +726,14 @@ def diffuse_momentum_horiz(
     dy_ref = metric["dy_lat_ref"]          # SGS closure uses reference dy (Gap 8)
     dz  = metric["dz"]
 
-    rdx2 = (1.0 / dx)**2
+    # C8 fix: apply imu(j)^2 = 1/cos(lat)^2 metric to x-direction
+    cos_lat = metric.get("cos_lat", None)
+    rdx2_base = (1.0 / dx)**2
+    if cos_lat is not None:
+        imu2 = (1.0 / cos_lat[None, :, None]) ** 2   # (1, ny, 1)
+    else:
+        imu2 = 1.0
+    rdx2 = rdx2_base * imu2
     rdy2 = 1.0 / dy_ref**2
 
     # Interpolate tk to staggered positions
@@ -816,14 +956,24 @@ def diffuse_damping_mom_z(
     tk_vf = jnp.pad(tk_vf, ((0, 0), (0, 1), (0, 0)), mode='edge')  # (nz, ny+1, nx)
     tkz_v = 0.5 * (tk_vf[:-1] + tk_vf[1:])  # (nz-1, ny+1, nx)
 
-    # Polar + upper-level damping for V (use cos at v-face latitudes)
-    # V y-faces are between mass latitudes: cos_v ≈ cos at half-lat
+    # Polar + upper-level damping for V
+    # D7 fix: gSAM uses mass-cell mu(j) and umax(j) for BOTH U and V.
+    # Map interior v-faces to the average of the two adjacent mass-row values.
     cos_v_half = jnp.pad(
         0.5 * (cos_lat[:-1] + cos_lat[1:]),
         (1, 1), mode='edge',
     )  # (ny+1,)
-    tauy_v = tau_max * (1.0 - cos_v_half ** 2) ** 200
-    umax_v = damping_u_cu * dx * cos_v_half / dt
+    # Use mass-cell-averaged tau and umax (not v-face cos)
+    tauy_mass = tau_max * (1.0 - cos_lat ** 2) ** 200    # (ny,)
+    umax_mass = damping_u_cu * dx * cos_lat / dt         # (ny,)
+    tauy_v = jnp.pad(
+        0.5 * (tauy_mass[:-1] + tauy_mass[1:]),
+        (1, 1), constant_values=tau_max,
+    )  # (ny+1,)
+    umax_v = jnp.pad(
+        0.5 * (umax_mass[:-1] + umax_mass[1:]),
+        (1, 1), constant_values=0.0,
+    )  # (ny+1,)
     umax_v3d = umax_v[None, :, None]
 
     tau_base_v = jnp.where(
@@ -1007,13 +1157,8 @@ def sgs_proc(
     def2       = shear_prod(U, V, W, metric)
     tk, tkh    = smag_viscosity(def2, metric, params)
 
-    # Stability cap for explicit forward-Euler diffusion.
-    # Vertical is the most restrictive dimension at GCM resolution (dz << dx,dy).
-    # Constraint: K * dt / dz² ≤ 0.5  →  K_max = 0.5 * dz² / dt
-    # Without this, Smagorinsky tk ≈ O(1e5) m²/s at 2° resolution causes
-    # the diffusion tendency to grow faster than dt can damp it.
-    dz_3d  = metric["dz"][:, None, None]           # (nz,1,1)
-    tk_max = 0.5 * dz_3d ** 2 / dt                  # (nz,1,1)  m²/s
+    # C9 fix: per-(j,k) 3D CFL stability cap (replaces global dz-only cap)
+    tk_max = _tkmax_3d(metric, dt)
     tk     = jnp.minimum(tk,  tk_max)
     tkh    = jnp.minimum(tkh, tk_max)
 
@@ -1040,12 +1185,12 @@ def sgs_proc(
         V    = V     + dt * dV,
         W    = W     + dt * dW,
         TABS = state.TABS + dt * dTABS,
-        QV   = jnp.maximum(0.0, state.QV + dt * dQV),
-        QC   = jnp.maximum(0.0, state.QC + dt * dQC),
-        QI   = jnp.maximum(0.0, state.QI + dt * dQI),
-        QR   = jnp.maximum(0.0, state.QR + dt * dQR),
-        QS   = jnp.maximum(0.0, state.QS + dt * dQS),
-        QG   = jnp.maximum(0.0, state.QG + dt * dQG),
+        QV   = state.QV + dt * dQV,
+        QC   = state.QC + dt * dQC,
+        QI   = state.QI + dt * dQI,
+        QR   = state.QR + dt * dQR,
+        QS   = state.QS + dt * dQS,
+        QG   = state.QG + dt * dQG,
         TKE  = state.TKE,   # Smagorinsky: no prognostic TKE equation
         p_prev = state.p_prev, p_pprev = state.p_pprev,
         nstep = state.nstep,
@@ -1059,6 +1204,36 @@ def sgs_proc(
 #   sgs_mom_proc  → advance_momentum → advance_scalars → sgs_scalars_proc
 # ---------------------------------------------------------------------------
 
+def _tkmax_3d(metric: dict, dt: float) -> jax.Array:
+    """C9 fix: per-(j,k) CFL stability cap for explicit SGS diffusion.
+
+    Matches gSAM SGS_TKE.SAM/tke_full.f90:
+        cx = dx^2/dt;  cy = dy^2/dt;  cz = (dz*min(adzw_lo,adzw_hi))^2/dt
+        tkmax = 0.09 / (1/cx + 1/cy + 1/cz)
+
+    With the C8 imu metric, effective dx in x is dx*cos(lat).
+    Returns (nz, ny, 1) array.
+    """
+    dx  = metric["dx_lon"]
+    dy  = metric["dy_lat"]           # (ny,)
+    dz  = metric["dz"]              # (nz,)
+    cos_lat = metric.get("cos_lat", None)
+
+    if cos_lat is not None:
+        cx = ((dx * cos_lat) ** 2 / dt)[None, :, None]   # (1, ny, 1)
+    else:
+        cx = dx ** 2 / dt
+
+    cy = (dy ** 2 / dt)[None, :, None]                    # (1, ny, 1)
+
+    dzw_lo = jnp.concatenate([dz[:1], 0.5 * (dz[:-1] + dz[1:])])
+    dzw_hi = jnp.concatenate([0.5 * (dz[:-1] + dz[1:]), dz[-1:]])
+    dz_eff = jnp.minimum(dzw_lo, dzw_hi)
+    cz = (dz_eff ** 2 / dt)[:, None, None]                # (nz, 1, 1)
+
+    return 0.09 / (1.0 / cx + 1.0 / cy + 1.0 / cz)       # (nz, ny, 1)
+
+
 def _sgs_coefs(
     state:   ModelState,
     metric:  dict,
@@ -1070,9 +1245,12 @@ def _sgs_coefs(
     U, V, W = state.U, state.V, state.W
     def2      = shear_prod(U, V, W, metric)
     TABS_arg  = state.TABS if tabs0 is not None else None
-    tk, tkh   = smag_viscosity(def2, metric, params, TABS=TABS_arg, tabs0=tabs0)
-    dz_3d  = metric["dz"][:, None, None]
-    tk_max = 0.5 * dz_3d ** 2 / dt
+    # Pass moisture fields for full moist buoyancy (S6 fix)
+    tk, tkh   = smag_viscosity(def2, metric, params, TABS=TABS_arg, tabs0=tabs0,
+                               QV=state.QV, QC=state.QC, QI=state.QI,
+                               QR=state.QR, QS=state.QS, QG=state.QG)
+    # C9 fix: per-(j,k) stability cap instead of global dz-only cap
+    tk_max = _tkmax_3d(metric, dt)
     tk     = jnp.minimum(tk,  tk_max)
     tkh    = jnp.minimum(tkh, tk_max)
     return tk, tkh
@@ -1152,12 +1330,12 @@ def sgs_scalars_proc(
         V    = state.V,
         W    = state.W,
         TABS = state.TABS + dt * dTABS,
-        QV   = jnp.maximum(0.0, state.QV + dt * dQV),
-        QC   = jnp.maximum(0.0, state.QC + dt * dQC),
-        QI   = jnp.maximum(0.0, state.QI + dt * dQI),
-        QR   = jnp.maximum(0.0, state.QR + dt * dQR),
-        QS   = jnp.maximum(0.0, state.QS + dt * dQS),
-        QG   = jnp.maximum(0.0, state.QG + dt * dQG),
+        QV   = state.QV + dt * dQV,
+        QC   = state.QC + dt * dQC,
+        QI   = state.QI + dt * dQI,
+        QR   = state.QR + dt * dQR,
+        QS   = state.QS + dt * dQS,
+        QG   = state.QG + dt * dQG,
         TKE  = state.TKE,
         p_prev = state.p_prev, p_pprev = state.p_pprev,
         nstep = state.nstep,

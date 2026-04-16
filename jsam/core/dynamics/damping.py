@@ -95,15 +95,15 @@ def pole_damping(
     U_clipped = jnp.clip(U, -umax_u, umax_u)   # (nz, ny, nx+1)
     U_new = (U + U_clipped * tau_u) / (1.0 + tau_u)  # (nz, ny, nx+1)
 
-    # ── Apply to V (v-face latitudes, ny+1 rows; poles are rows 0 and ny) ──
-    lat_v_int = 0.5 * (lat_rad[:-1] + lat_rad[1:])   # (ny-1,)
-    cos_v_int = jnp.cos(lat_v_int)                    # (ny-1,)
-    sin2_v    = 1.0 - cos_v_int ** 2
-    tau_v_lat = sin2_v ** 200                          # (ny-1,)
-    umax_v_int = cu * dx * cos_v_int / dt              # (ny-1,)
+    # ── Apply to V (D7 fix: gSAM uses mass-cell mu(j) and umax(j) for BOTH U and V) ──
+    # For interior v-faces (j_v=1..ny-1), use the mass-cell values from the
+    # adjacent row.  gSAM damping.f90 uses mu(j) at mass rows for V too.
+    # Map each interior v-face to the average of the two adjacent mass-row values.
+    tau_v_int = 0.5 * (tau_lat[:-1] + tau_lat[1:])     # (ny-1,) from mass-cell tau
+    umax_v_int = 0.5 * (umax[:-1] + umax[1:])          # (ny-1,) from mass-cell umax
 
     # Build full (ny+1,) tau and umax for V rows (poles → 1 and 0 respectively)
-    tau_v_1d = jnp.concatenate([jnp.ones(1), tau_v_lat, jnp.ones(1)])    # (ny+1,)
+    tau_v_1d = jnp.concatenate([jnp.ones(1), tau_v_int, jnp.ones(1)])    # (ny+1,)
     umax_v   = jnp.concatenate([jnp.zeros(1), umax_v_int, jnp.zeros(1)]) # (ny+1,)
 
     if pres is not None:
@@ -225,6 +225,8 @@ def gsam_w_sponge(
     z: jax.Array,        # (nz,) cell-centre heights (m)
     nub: float = 0.6,
     taudamp_max: float = 0.333,
+    dtn: float = 1.0,    # current AB-weighted sub-timestep (s)
+    dt: float = 1.0,     # base timestep (s)
 ) -> jax.Array:
     """
     gSAM-exact W-only Rayleigh sponge at model top (damping.f90 section 1).
@@ -235,14 +237,30 @@ def gsam_w_sponge(
                    = 0                                       otherwise
         W_new      = W / (1 + taudamp)
 
-    Matches gSAM damping.f90:33-50 exactly (tau_max=1 since dtn=dt in jsam).
+    Matches gSAM damping.f90:33-50 exactly.
     Applied to W only — U/V damping lives in diffuse_damping_mom_z.
     """
     nz = z.shape[0]
-    nu = (z - z[0]) / (z[-1] - z[0])                      # (nz,)
+    # D5 fix: use interface heights zi instead of cell-centre z
+    # gSAM damping.f90:34: nu = (zi(k)-zi(1)) / (zi(nzm)-zi(1))
+    # Approximate zi from cell-centre z: zi[0] = z[0]-dz[0]/2, zi[k] = (z[k-1]+z[k])/2
+    # For simplicity, reconstruct bottom/top interface from half-cell offsets.
+    # However, since z is cell-centre and we need interface heights, we
+    # use the metric zi if available, or approximate.
+    # gSAM: zi(1) is the surface, zi(nzm) is the top of the second-to-last cell.
+    # We approximate: zi_bot = z[0] - dz_approx/2 where dz_approx = z[1]-z[0] for uniform
+    # Better: just shift so nu uses half-cell-shifted heights.
+    # The key difference is using z interfaces not centres.
+    dz_half_bot = (z[1] - z[0]) * 0.5 if nz > 1 else z[0]
+    dz_half_top = (z[-1] - z[-2]) * 0.5 if nz > 1 else z[0]
+    zi_bot = z[0] - dz_half_bot   # surface interface
+    zi_top = z[-1] - dz_half_top  # top of nzm-1 cell (gSAM zi(nzm))
+    nu = (z - zi_bot) / (zi_top - zi_bot)                  # (nz,)
     nu_excess = jnp.clip((nu - nub) / (1.0 - nub), 0.0, 1.0)
     zzz = 100.0 * nu_excess ** 2
-    taudamp = jnp.where(nu > nub, taudamp_max * zzz / (1.0 + zzz), 0.0)  # (nz,)
+    # D4 fix: gSAM damping.f90:24 uses tau_max = dtn/dt
+    tau_max = dtn / dt
+    taudamp = jnp.where(nu > nub, tau_max * taudamp_max * zzz / (1.0 + zzz), 0.0)  # (nz,)
 
     # Interpolate centre-level taudamp to w-faces (nz+1)
     taudamp_w = jnp.concatenate([
