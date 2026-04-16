@@ -567,6 +567,12 @@ def step(
         pm=jnp.max(jnp.abs(p_new)),
     )
 
+    # Normalize pressure for adamsB: scale by 1/at so that the AB coefficients
+    # (bt*dt, ct*dt) in adamsB combine correctly across steps with different at values.
+    # This matches gSAM's convention where press_rhs divides by at and press_grad
+    # multiplies by at, making the stored pressure independent of at scaling.
+    p_for_storage = p_new / _at_ab if _at_ab != 0.0 else p_new
+
     _stage_dump(state, 13, dt, force_nstep=_dump_nstep)
 
     _TABS_before_adv = state.TABS
@@ -592,6 +598,7 @@ def step(
         state, tends_nm1, tends_nm2, metric, dt,
         dt_prev=dt_prev, dt_pprev=dt_pprev,
         U_old=_U_old, V_old=_V_old, W_old=_W_old,
+        is_f11=(config.micro_params is not None),
     )
 
     # F11 mode: convert advected static energy back to absolute temperature
@@ -754,7 +761,7 @@ def step(
         TABS=state.TABS, QV=state.QV, QC=state.QC,
         QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
         TKE=state.TKE,
-        p_prev=p_new, p_pprev=p_prev_for_adamsb,
+        p_prev=p_for_storage, p_pprev=p_prev_for_adamsb,
         nstep=state.nstep, time=state.time,
     )
 
