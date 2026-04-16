@@ -228,12 +228,12 @@ def _advect_scalar_jit(
 
     out_flux = (jnp.maximum(0.0, afx_e) - jnp.minimum(0.0, afx_w)
               + jnp.maximum(0.0, afy_n) - jnp.minimum(0.0, afy_s)
-              + jnp.maximum(0.0, afz_t) - jnp.minimum(0.0, afz_b))
+              + (jnp.maximum(0.0, afz_t) - jnp.minimum(0.0, afz_b)) * iadz)
     scale_out = (f_up - mn) / (out_flux + eps)
 
     in_flux = (jnp.maximum(0.0, afx_w) - jnp.minimum(0.0, afx_e)
              + jnp.maximum(0.0, afy_s) - jnp.minimum(0.0, afy_n)
-             + jnp.maximum(0.0, afz_b) - jnp.minimum(0.0, afz_t))
+             + (jnp.maximum(0.0, afz_b) - jnp.minimum(0.0, afz_t)) * iadz)
     scale_in = (mx - f_up) / (in_flux + eps)
     scale_out_xm = jnp.roll(scale_out, 1, axis=2)
     scale_in_xm  = jnp.roll(scale_in,  1, axis=2)
