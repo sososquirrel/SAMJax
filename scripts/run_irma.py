@@ -497,23 +497,14 @@ def main():
             # ── SLM per-step radiative / precip forcing ──────────────────
             if args.slm:
                 from jsam.io.slm_forcing import build_slm_rad_inputs
-                from jsam.core.physics.rad_rrtmg import (
-                    compute_qrad_and_lwds_rrtmg,
-                )
                 from jsam.core.physics.microphysics import micro_proc_with_precip
 
                 _cur_dt_from_start = float(state.time)
                 _cur_sim_time = START_TIME + timedelta(seconds=_cur_dt_from_start)
 
-                if forcing.sst is not None and config.rad_rrtmg is not None:
-                    _, _lwds = compute_qrad_and_lwds_rrtmg(
-                        state, metric, config.rad_rrtmg,
-                        forcing.sst,
-                        o3vmr=(None if forcing.o3vmr_rrtmg is None
-                               else jnp.asarray(forcing.o3vmr_rrtmg)),
-                    )
-                else:
-                    _lwds = jnp.full_like(state.TABS[0], 350.0)
+                # Use fallback LW downwelling for SLM on all steps.
+                # (Proper fix: compute RRTMG every nrad steps in step.py and cache)
+                _lwds = jnp.full_like(state.TABS[0], 350.0)
 
                 _lat_rad = jnp.asarray(grid.lat * (np.pi / 180.0))
                 _lon_rad = jnp.asarray(grid.lon * (np.pi / 180.0))
