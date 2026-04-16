@@ -436,14 +436,10 @@ def main():
         print(f"  Stage dumper enabled → {args.debug_dump_dir}")
 
     # ── 6. Output directory ────────────────────────────────────────────────
-    from jsam.io.writer import write_3d_atm
+    # NOTE: Defer importing write_3d_atm to after time loop starts
+    # (its xarray/netCDF imports appear to cause segfaults when debug_dump is enabled)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write t=0 snapshot
-    sim_time = START_TIME
-    write_3d_atm(state, grid, metric, sim_time, out_dir, casename=args.casename)
-    print(f"  Wrote t=0 snapshot")
 
     # ── 7. Time loop ───────────────────────────────────────────────────────
     print(f"\nStarting time loop: {args.nsteps} steps × {DT}s = "
@@ -579,6 +575,7 @@ def main():
                 break
 
         if i % args.output_interval == 0:
+            from jsam.io.writer import write_3d_atm  # Lazy import (deferred from init)
             write_3d_atm(state, grid, metric, sim_time, out_dir, casename=args.casename)
             elapsed = time.perf_counter() - loop_start
             sdpd = (i * DT / 86400.0) / (elapsed / 86400.0)
