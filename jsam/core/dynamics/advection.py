@@ -278,7 +278,8 @@ def advect_scalar(
     Wrapper that computes macho_order from nstep (statically) and dispatches
     to the JIT-compiled kernel.
     """
-    macho_order = (nstep - 1) % 6
+    # Convert nstep to Python int to ensure macho_order is a static argument
+    macho_order = int((int(nstep) - 1) % 6)
     return _advect_scalar_jit(phi, U, V, W, metric, dt, macho_order)
 
 
