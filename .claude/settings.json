@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit -m ' *)",
+      "Bash(qstat)",
+      "Bash(git commit -m 'Fix FCT scale factor: apply iadz weighting to vertical flux term *)"
+    ],
+    "additionalDirectories": [
+      "/glade/derecho/scratch/sabramian"
+    ]
+  }
+}

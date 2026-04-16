@@ -1,0 +1,34 @@
+# Auto-Research Configuration
+
+# Paths
+oracle:
+  debug_dir: /glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/debug
+
+jsam:
+  debug_dir: /glade/derecho/scratch/sabramian/jsam_IRMA_debug5_gpu/debug
+  snapshots_dir: /glade/derecho/scratch/sabramian/jsam_IRMA_debug5_gpu/snapshots
+
+job:
+  script: /glade/u/home/sabramian/SAMJax/scripts/run_irma_debug5_gpu.pbs
+  log_file: /glade/u/home/sabramian/SAMJax/outputs/debug5_gpu.log
+  name: jsam_debug5_gpu
+  poll_interval_sec: 10  # Check job status every 10s
+  timeout_sec: 7200     # 2 hours max wait
+
+# Comparison settings
+compare:
+  threshold: 1e-5          # Relative error threshold
+  threshold_tight: 1e-7    # For near-ULP matching
+  max_rows: 38             # Step 1 only (19 stages × 2 icycles)
+  skip_micro_before_stage: 17  # QC/QV/QI only valid at stages 17+
+
+# Auto-commit settings
+git:
+  auto_commit: true
+  commit_template: "fix: {fix_description} (iter {iteration}, stage {stage})\n\n{error_before}\n→ {error_after}"
+
+# Output and logging
+output:
+  progress_file: /glade/u/home/sabramian/SAMJax/autoresearch/progress.md
+  convergence_json: /glade/u/home/sabramian/SAMJax/autoresearch/convergence.json
+  verbose: true
