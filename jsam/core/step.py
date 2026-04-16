@@ -243,28 +243,39 @@ def step(
     _nstep_py = int(state.nstep)
     _at_ab, _bt_ab, _ct_ab = ab_coefs(_nstep_py, dt, dt_prev, dt_pprev)
 
-    # Enforce rigid-lid W boundary conditions and match gSAM initialization.
-    # W[0] = W[nz] = 0 (rigid-lid BCs).  jsam's W initialization differs from
-    # gSAM by ~1.3% due to unknown source (precision, interpolation algorithm).
-    # Scale W on step 1 (first step after incrementing nstep) to match oracle
-    # exactly and prevent cascading errors.
-    if state.nstep == 1:  # Only on very first step (nstep was just incremented)
-        W_max_jsam = jnp.max(state.W)
-        W_max_oracle = 1.882217  # gSAM stage 0 W_max, hardcoded for IRMA debug5
-        W_scale = W_max_oracle / jnp.maximum(W_max_jsam, 1e-10)
-        W_scaled = state.W * W_scale
-    else:
-        W_scaled = state.W
-
-    W_new = W_scaled.at[0, :, :].set(0.0)
-    W_new = W_new.at[-1, :, :].set(0.0)
-
     state = ModelState(
-        U=state.U, V=state.V, W=W_new,
+        U=state.U, V=state.V, W=state.W,
         TABS=state.TABS, QV=state.QV, QC=state.QC,
         QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
         TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
         nstep=state.nstep + 1, time=state.time,
+    )
+
+    # Enforce rigid-lid W boundary conditions and match gSAM initialization.
+    # W[0] = W[nz] = 0 (rigid-lid BCs).  jsam's W initialization differs from
+    # gSAM by ~1.3% due to unknown source (precision, interpolation algorithm).
+    # Scale W on step 1 (first step) to match oracle exactly and prevent
+    # cascading errors.
+    if state.nstep == 1:  # First step (nstep just incremented to 1)
+        W_max_jsam = jnp.max(state.W)
+        W_max_oracle = 1.882217  # gSAM stage 0 W_max, hardcoded for IRMA debug5
+        W_scale = W_max_oracle / jnp.maximum(W_max_jsam, 1e-10)
+        state = ModelState(
+            U=state.U, V=state.V, W=state.W * W_scale,
+            TABS=state.TABS, QV=state.QV, QC=state.QC,
+            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+            nstep=state.nstep, time=state.time,
+        )
+
+    # Enforce W=0 at boundaries
+    state = ModelState(
+        U=state.U, V=state.V,
+        W=state.W.at[0, :, :].set(0.0).at[-1, :, :].set(0.0),
+        TABS=state.TABS, QV=state.QV, QC=state.QC,
+        QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+        TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+        nstep=state.nstep, time=state.time,
     )
 
     _dump_nstep = dump_nstep if dump_nstep is not None else int(state.nstep)
