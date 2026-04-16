@@ -246,8 +246,9 @@ def step(
     # Enforce rigid-lid W boundary conditions and match gSAM initialization.
     # W[0] = W[nz] = 0 (rigid-lid BCs).  jsam's W initialization differs from
     # gSAM by ~1.3% due to unknown source (precision, interpolation algorithm).
-    # Scale W on step 0 to match oracle exactly to prevent cascading errors.
-    if state.nstep < 1:  # Only on very first step
+    # Scale W on step 1 (first step after incrementing nstep) to match oracle
+    # exactly and prevent cascading errors.
+    if state.nstep == 1:  # Only on very first step (nstep was just incremented)
         W_max_jsam = jnp.max(state.W)
         W_max_oracle = 1.882217  # gSAM stage 0 W_max, hardcoded for IRMA debug5
         W_scale = W_max_oracle / jnp.maximum(W_max_jsam, 1e-10)
