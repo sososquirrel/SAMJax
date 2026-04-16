@@ -42,8 +42,8 @@ def main() -> int:
 
     with open(workdir / "inputs.bin", "wb") as f:
         f.write(struct.pack("ii", ny, nx))
-        f.write(sst.tobytes(order="C"))
-        f.write(presi.tobytes(order="C"))
+        f.write(sst.tobytes(order="F"))
+        f.write(presi.tobytes(order="F"))
         f.write(struct.pack("f", salt_factor))
 
     write_bin(workdir / "jsam_out.bin", qs.ravel())

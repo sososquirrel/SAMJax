@@ -19,49 +19,49 @@ contains
 
   subroutine run_z_from_Z()
     real, parameter :: ggr = 9.79764
-    integer :: n, k, u_in, u_out
+    integer :: n, k, fin, fout
     real, allocatable :: Z_geopot(:), z_out(:)
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) n
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) n
     allocate(Z_geopot(n), z_out(n))
-    read(u_in) Z_geopot
-    close(u_in)
+    read(fin) Z_geopot
+    close(fin)
     do k = 1, n
       z_out(k) = Z_geopot(k) / ggr
     end do
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4
-    write(u_out) int(n, 4)
-    write(u_out) z_out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4
+    write(fout) int(n, 4)
+    write(fout) z_out
+    close(fout)
   end subroutine
 
   subroutine run_omega_to_w()
     real, parameter :: ggr = 9.79764, Rd = 287.04
-    integer :: nlev, k, u_in, u_out
+    integer :: nlev, k, fin, fout
     real, allocatable :: p_pa(:), T(:), omega(:), w_out(:)
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) nlev
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) nlev
     allocate(p_pa(nlev), T(nlev), omega(nlev), w_out(nlev))
-    read(u_in) p_pa; read(u_in) T; read(u_in) omega
-    close(u_in)
+    read(fin) p_pa; read(fin) T; read(fin) omega
+    close(fin)
     do k = 1, nlev
       w_out(k) = -omega(k) * Rd * T(k) / (p_pa(k) * ggr)
     end do
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4; write(u_out) int(nlev, 4); write(u_out) w_out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4; write(fout) int(nlev, 4); write(fout) w_out
+    close(fout)
   end subroutine
 
   subroutine run_interp_pres()
-    integer :: nz_src, nz_tgt, dummy, k, u_in, u_out, idx
+    integer :: nz_src, nz_tgt, dummy, k, fin, fout, idx
     real, allocatable :: p_src(:), p_tgt(:), field_src(:), field_out(:)
     real :: p_clamped, frac
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) nz_src, nz_tgt, dummy
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) nz_src, nz_tgt, dummy
     allocate(p_src(nz_src), p_tgt(nz_tgt), field_src(nz_src), field_out(nz_tgt))
-    read(u_in) p_src; read(u_in) p_tgt; read(u_in) field_src
-    close(u_in)
+    read(fin) p_src; read(fin) p_tgt; read(fin) field_src
+    close(fin)
     do k = 1, nz_tgt
       p_clamped = min(max(p_tgt(k), p_src(1)), p_src(nz_src))
       idx = 1
@@ -75,94 +75,94 @@ contains
         field_out(k) = field_src(idx) + frac * (field_src(idx+1) - field_src(idx))
       end if
     end do
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4; write(u_out) int(nz_tgt, 4); write(u_out) field_out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4; write(fout) int(nz_tgt, 4); write(fout) field_out
+    close(fout)
   end subroutine
 
   subroutine run_stagger_u()
-    integer :: nz, ny, nx, iz, iy, ix, u_in, u_out, ntot
-    real, allocatable :: u(:,:,:), U_out(:,:,:)
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) nz, ny, nx
-    allocate(u(nx, ny, nz), U_out(nx+1, ny, nz))
-    read(u_in) u
-    close(u_in)
+    integer :: nz, ny, nx, iz, iy, ix, fin, fout, ntot
+    real, allocatable :: u(:,:,:), Usg(:,:,:)
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) nz, ny, nx
+    allocate(u(nx, ny, nz), Usg(nx+1, ny, nz))
+    read(fin) u
+    close(fin)
     do iz = 1, nz
       do iy = 1, ny
         do ix = 1, nx
           if (ix < nx) then
-            U_out(ix, iy, iz) = 0.5 * (u(ix, iy, iz) + u(ix+1, iy, iz))
+            Usg(ix, iy, iz) = 0.5 * (u(ix, iy, iz) + u(ix+1, iy, iz))
           else
-            U_out(ix, iy, iz) = 0.5 * (u(ix, iy, iz) + u(1, iy, iz))
+            Usg(ix, iy, iz) = 0.5 * (u(ix, iy, iz) + u(1, iy, iz))
           end if
         end do
-        U_out(nx+1, iy, iz) = U_out(1, iy, iz)
+        Usg(nx+1, iy, iz) = Usg(1, iy, iz)
       end do
     end do
     ntot = (nx+1) * ny * nz
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4; write(u_out) int(ntot, 4); write(u_out) U_out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4; write(fout) int(ntot, 4); write(fout) Usg
+    close(fout)
   end subroutine
 
   subroutine run_stagger_v()
-    integer :: nz, ny, nx, iz, iy, ix, u_in, u_out, ntot
-    real, allocatable :: v(:,:,:), V_out(:,:,:)
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) nz, ny, nx
-    allocate(v(nx, ny, nz), V_out(nx, ny+1, nz))
-    read(u_in) v
-    close(u_in)
-    V_out = 0.0
+    integer :: nz, ny, nx, iz, iy, ix, fin, fout, ntot
+    real, allocatable :: v(:,:,:), Vsg(:,:,:)
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) nz, ny, nx
+    allocate(v(nx, ny, nz), Vsg(nx, ny+1, nz))
+    read(fin) v
+    close(fin)
+    Vsg = 0.0
     do iz = 1, nz
       do iy = 2, ny
         do ix = 1, nx
-          V_out(ix, iy, iz) = 0.5 * (v(ix, iy-1, iz) + v(ix, iy, iz))
+          Vsg(ix, iy, iz) = 0.5 * (v(ix, iy-1, iz) + v(ix, iy, iz))
         end do
       end do
     end do
     ntot = nx * (ny+1) * nz
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4; write(u_out) int(ntot, 4); write(u_out) V_out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4; write(fout) int(ntot, 4); write(fout) Vsg
+    close(fout)
   end subroutine
 
   subroutine run_stagger_w()
-    integer :: nz, ny, nx, iz, iy, ix, u_in, u_out, ntot
-    real, allocatable :: w(:,:,:), W_out(:,:,:)
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) nz, ny, nx
-    allocate(w(nx, ny, nz), W_out(nx, ny, nz+1))
-    read(u_in) w
-    close(u_in)
-    W_out = 0.0
+    integer :: nz, ny, nx, iz, iy, ix, fin, fout, ntot
+    real, allocatable :: w(:,:,:), Wsg(:,:,:)
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) nz, ny, nx
+    allocate(w(nx, ny, nz), Wsg(nx, ny, nz+1))
+    read(fin) w
+    close(fin)
+    Wsg = 0.0
     do iz = 2, nz
       do iy = 1, ny
         do ix = 1, nx
-          W_out(ix, iy, iz) = 0.5 * (w(ix, iy, iz-1) + w(ix, iy, iz))
+          Wsg(ix, iy, iz) = 0.5 * (w(ix, iy, iz-1) + w(ix, iy, iz))
         end do
       end do
     end do
     ntot = nx * ny * (nz+1)
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4; write(u_out) int(ntot, 4); write(u_out) W_out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4; write(fout) int(ntot, 4); write(fout) Wsg
+    close(fout)
   end subroutine
 
   subroutine run_ref_column()
     double precision, parameter :: RGAS=287.04d0, CP=1004.64d0, GGR=9.79764d0
-    integer :: nz, k, sweep, u_in, u_out, ntot
+    integer :: nz, k, sweep, fin, fout, ntot
     double precision :: nz_dbl, pres0, prespot_k
     double precision, allocatable :: z(:), zi(:), tabs0(:), pres_seed(:)
     double precision, allocatable :: pres(:), presi(:), presr(:), t0(:), rho(:)
     real, allocatable :: out(:)
-    open(newunit=u_in, file='inputs.bin', access='stream', form='unformatted', status='old')
-    read(u_in) nz_dbl
+    open(newunit=fin, file='inputs.bin', access='stream', form='unformatted', status='old')
+    read(fin) nz_dbl
     nz = int(nz_dbl)
     allocate(z(nz), zi(nz+1), tabs0(nz), pres_seed(nz))
-    read(u_in) z; read(u_in) zi; read(u_in) tabs0; read(u_in) pres0; read(u_in) pres_seed
-    close(u_in)
+    read(fin) z; read(fin) zi; read(fin) tabs0; read(fin) pres0; read(fin) pres_seed
+    close(fin)
     allocate(pres(nz), presi(nz+1), presr(nz+1), t0(nz), rho(nz))
     pres = pres_seed
     do sweep = 1, 2
@@ -187,9 +187,9 @@ contains
     do k = 1, nz+1
       out(nz + k) = real(presi(k))
     end do
-    open(newunit=u_out, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
-    write(u_out) 1_4; write(u_out) int(ntot, 4); write(u_out) out
-    close(u_out)
+    open(newunit=fout, file='fortran_out.bin', access='stream', form='unformatted', status='replace')
+    write(fout) 1_4; write(fout) int(ntot, 4); write(fout) out
+    close(fout)
   end subroutine
 
 end program era5_driver

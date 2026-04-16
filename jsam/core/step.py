@@ -838,6 +838,7 @@ def step(
     state, tends_n = advance_scalars(
         state, tends_nm1, tends_nm2, metric, dt,
         dt_prev=dt_prev, dt_pprev=dt_pprev,
+        U_old=_U_old, V_old=_V_old, W_old=_W_old,  # C1: half-step velocity
     )
     jax.debug.print(
         "  DIAG [{n:>3}] H_advsc   W=[{wn:.3f},{wx:.3f}] T=[{tn:.2f},{tx:.2f}]",

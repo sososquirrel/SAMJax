@@ -3,6 +3,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export JSAM_ROOT="$(cd "${HERE}/../.." && pwd)"
 source "${HERE}/../common/env.sh"
 
 WD="$(make_workdir test_rad_rrtmg)"

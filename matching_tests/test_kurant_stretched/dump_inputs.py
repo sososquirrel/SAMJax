@@ -69,9 +69,9 @@ def main() -> int:
 
     with open(workdir / "inputs.bin", "wb") as f:
         f.write(struct.pack("iii", nz, ny, nx))
-        f.write(U_abs.tobytes(order="C"))
-        f.write(V_abs.tobytes(order="C"))
-        f.write(W_abs.tobytes(order="C"))
+        f.write(U_abs.tobytes(order="F"))
+        f.write(V_abs.tobytes(order="F"))
+        f.write(W_abs.tobytes(order="F"))
         f.write(struct.pack("fff", dx_ref, dy_ref, dz_ref))
         f.write(cos_lat.tobytes())
         f.write(ady.tobytes())

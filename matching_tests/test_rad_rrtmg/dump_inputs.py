@@ -114,7 +114,7 @@ def _call_raw_sw(inp, cfg):
         C(inp["reice"]), C(inp["reliq"]),
         tauaer, ssaaer, asmaer, ecaer,
     )
-    return np.asarray(r[2], dtype=np.float64), np.asarray(r[1], dtype=np.float64)
+    return np.asarray(r[2], dtype=np.float64), np.asarray(r[1], dtype=np.float64), np.asarray(r[0], dtype=np.float64)
 
 
 def _call_raw_lw(inp, cfg):
@@ -137,7 +137,7 @@ def _call_raw_lw(inp, cfg):
         C(inp["cicewp"]), C(inp["cliqwp"]),
         C(inp["reice"]), C(inp["reliq"]), tauaer,
     )
-    return np.asarray(r[2], dtype=np.float64), np.asarray(r[1], dtype=np.float64)
+    return np.asarray(r[2], dtype=np.float64), np.asarray(r[1], dtype=np.float64), np.asarray(r[0], dtype=np.float64)
 
 
 def main():
@@ -147,7 +147,7 @@ def main():
     inp = _tropical_column()
 
     print("  calling jsam _rrtmg_sw_numpy wrapper ...")
-    sw_hr_j, sw_df_j = _rrtmg_sw_numpy(
+    sw_hr_j, sw_df_j, sw_uf_j = _rrtmg_sw_numpy(
         play_hpa=inp["play_hpa"], plev_hpa=inp["plev_hpa"],
         tlay=inp["tlay"], tlev=inp["tlev"], tsfc=inp["tsfc"],
         h2ovmr=inp["h2ovmr"], o3vmr=inp["o3vmr"],
@@ -159,7 +159,7 @@ def main():
         reice=inp["reice"], reliq=inp["reliq"], cfg=cfg,
     )
     print("  calling jsam _rrtmg_lw_numpy wrapper ...")
-    lw_hr_j, lw_df_j = _rrtmg_lw_numpy(
+    lw_hr_j, lw_df_j, lw_uf_j = _rrtmg_lw_numpy(
         play_hpa=inp["play_hpa"], plev_hpa=inp["plev_hpa"],
         tlay=inp["tlay"], tlev=inp["tlev"], tsfc=inp["tsfc"],
         h2ovmr=inp["h2ovmr"], o3vmr=inp["o3vmr"],
@@ -176,9 +176,9 @@ def main():
     print(f"  wrote jsam_out.bin  ({jsam_out.size} floats)")
 
     print("  calling raw f2py RRTMG_SW ...")
-    sw_hr_r, sw_df_r = _call_raw_sw(inp, cfg)
+    sw_hr_r, sw_df_r, sw_uf_r = _call_raw_sw(inp, cfg)
     print("  calling raw f2py RRTMG_LW ...")
-    lw_hr_r, lw_df_r = _call_raw_lw(inp, cfg)
+    lw_hr_r, lw_df_r, lw_uf_r = _call_raw_lw(inp, cfg)
 
     fort_out = np.concatenate([
         sw_hr_r.ravel(), lw_hr_r.ravel(),
