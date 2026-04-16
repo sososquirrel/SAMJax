@@ -436,10 +436,12 @@ def main():
         print(f"  Stage dumper enabled → {args.debug_dump_dir}")
 
     # ── 6. Output directory ────────────────────────────────────────────────
-    # NOTE: Defer importing write_3d_atm to after time loop starts
-    # (its xarray/netCDF imports appear to cause segfaults when debug_dump is enabled)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write t=0 snapshot
+    # NOTE: The actual write happens in the time loop via lazy import (see below)
+    # to avoid segfault when xarray/netCDF initialization conflicts with debug_dump
 
     # ── 7. Time loop ───────────────────────────────────────────────────────
     print(f"\nStarting time loop: {args.nsteps} steps × {DT}s = "
