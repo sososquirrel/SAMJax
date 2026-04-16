@@ -243,8 +243,14 @@ def step(
     _nstep_py = int(state.nstep)
     _at_ab, _bt_ab, _ct_ab = ab_coefs(_nstep_py, dt, dt_prev, dt_pprev)
 
+    # Enforce rigid-lid W boundary conditions (W=0 at bottom and top)
+    # to match gSAM exactly.  This ensures the pressure solver and W advection
+    # match bit-for-bit.
+    W_new = state.W.at[0, :, :].set(0.0)
+    W_new = W_new.at[-1, :, :].set(0.0)
+
     state = ModelState(
-        U=state.U, V=state.V, W=state.W,
+        U=state.U, V=state.V, W=W_new,
         TABS=state.TABS, QV=state.QV, QC=state.QC,
         QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
         TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
