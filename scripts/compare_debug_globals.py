@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 GSAM = "/glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/debug/globals.csv"
-JSAM = "/glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug/globals.csv"
+JSAM = "/glade/derecho/scratch/sabramian/jsam_IRMA_debug30_fixed/debug/globals.csv"
 
 g = pd.read_csv(GSAM)
 j = pd.read_csv(JSAM)
@@ -53,8 +53,36 @@ for (step, sid) in common:
 
 df = pd.DataFrame(rows)
 
+# Per-step, per-variable table (max rel error across all stages for each variable)
+print("=== Per-step, per-variable max error (first 20 steps) ===")
+print(f"{'step':>4}", end="")
+for f in fields:
+    print(f"  {f:>8}", end="")
+print()
+by_step = {}
+for (step, sid) in common:
+    if step not in by_step:
+        by_step[step] = {f: 0.0 for f in fields}
+    for f in fields:
+        for m in metrics:
+            col = f"{f}_{m}"
+            a = float(g.loc[(step, sid), col])
+            b = float(j.loc[(step, sid), col])
+            denom = max(abs(a), abs(b), 1e-30)
+            rel = abs(a - b) / denom
+            by_step[step][f] = max(by_step[step][f], rel)
+for step in sorted(by_step.keys()):
+    if step > 20:
+        break
+    vals = by_step[step]
+    print(f"{step:>4}", end="")
+    for f in fields:
+        pct = vals[f] * 100.0
+        print(f"  {pct:>7.2f}%", end="")
+    print()
+
 # Summary: per-step max diff, showing where divergence first crosses thresholds
-print("=== Per-step summary (max relative diff across all 21 global reductions) ===")
+print("\n=== Per-step summary (max relative diff across all 21 global reductions) ===")
 per_step = df.groupby("step")["max_rel"].max()
 print(per_step.to_string())
 

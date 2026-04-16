@@ -145,7 +145,7 @@ def advance_scalars(
         QG  =(qg_new - state.QG)  / dt,
     )
 
-    tabs_new = s_new - gamaz + FAC_COND * (qc_new + qr_new) + FAC_SUB * (qi_new + qs_new + qg_new)
+    tabs_new = s_new - gamaz
 
     new_state = ModelState(
         U   =state.U,

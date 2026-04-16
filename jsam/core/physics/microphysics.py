@@ -71,6 +71,12 @@ class MicroParams:
     gamma_rave:    float = 1.0
     donograupel: bool = False
     do_ice_fall: bool = True
+    # Khairoutdinov-Kogan (2000) autoconversion
+    doKKauto: bool = False
+    doKKaccr: bool = False
+    Nc_land:  float = 300.0   # cloud droplet concentration over land  [cm^-3]
+    Nc_ocn:   float = 50.0    # cloud droplet concentration over ocean [cm^-3]
+    do_scale_dependence_of_autoconv: bool = True
 
 
 def _gamma_coefs(p: MicroParams) -> dict:
@@ -334,6 +340,7 @@ def precip_proc(
     params: MicroParams,
     dt: float,
     evap_coefs: tuple | None = None,  # pre-computed (evapr1,evapr2,evaps1,evaps2,evapg1,evapg2)
+    landmask: "jax.Array | None" = None,  # (ny, nx) bool/int; used for KK Ncc
 ) -> tuple:  # (TABS_new, QV_new, QC_new, QI_new, QR_new, QS_new, QG_new)
     """
     Microphysical source/sink terms: autoconversion, accretion, and evaporation.
@@ -414,8 +421,34 @@ def precip_proc(
     qn = qcc + qii   # total cloud condensate
 
     # ── Branch 1: autoconversion + accretion (when qn > 0) ──────────────────
-    # Cloud water autoconversion (Kessler)
-    autor = jnp.where(qcc > p.qcw0, p.alphaelq, 0.0)
+    # Cloud water autoconversion
+    if p.doKKauto:
+        # Khairoutdinov-Kogan (2000) parameterization (precip_proc.f90:95-119)
+        # Ncc depends on land/ocean; KK uses zero threshold (qcw0 = 0 in gSAM)
+        qcw0_eff = 0.0
+        if landmask is not None:
+            # landmask: (ny, nx) bool/int; broadcast to (1, ny, nx)
+            _lm = jnp.asarray(landmask, dtype=jnp.float32)[None, :, :]
+            Ncc = _lm * p.Nc_land + (1.0 - _lm) * p.Nc_ocn
+        else:
+            Ncc = p.Nc_ocn  # all-ocean fallback
+        # KK rate: power 1.47 not 2.47 because autor is multiplied by qcc implicitly
+        autor = 1350.0 * jnp.maximum(qcc, 0.0) ** 1.47 / (Ncc ** 1.79 + 1e-30)
+        # Scale-dependence factor: dx must be in km; factor = min(1, 100/(dx_km*mu))^2
+        # At <100 km effective resolution (typical global), factor = 1 (no change)
+        dx_km = metric["dx_lon"] / 1000.0      # convert m → km
+        mu_2d = metric["cos_lat"][None, :, None]  # (1, ny, 1)
+        eff_dx_km = dx_km * mu_2d + 1e-30
+        if p.do_scale_dependence_of_autoconv:
+            scale_fac = jnp.minimum(1.0, 100.0 / eff_dx_km) ** 2
+        else:
+            scale_fac = jnp.maximum(1.0, (0.001 * eff_dx_km) ** 2)
+        autor = autor * scale_fac
+    else:
+        # Standard Kessler parameterization
+        qcw0_eff = p.qcw0
+        autor = jnp.where(qcc > p.qcw0, p.alphaelq, 0.0)
+
     # Cloud ice autoconversion
     autos = jnp.where(qii > p.qci0, p.betaelq * coefice, 0.0)
 
@@ -429,10 +462,10 @@ def precip_proc(
                        accrgi * coefice * qgg ** powg1, 0.0)
 
     # Implicit scheme for qcc and qii (precip_proc.f90 line 186-187)
-    qcc_imp = (qcc + dt * autor * p.qcw0) / (1.0 + dt * (accrr + accrcs + accrcg + autor))
+    qcc_imp = (qcc + dt * autor * qcw0_eff) / (1.0 + dt * (accrr + accrcs + accrcg + autor))
     qii_imp = (qii + dt * autos * p.qci0) / (1.0 + dt * (accris + accrig + autos))
 
-    dq_conv = dt * (accrr * qcc_imp + autor * (qcc_imp - p.qcw0)
+    dq_conv = dt * (accrr * qcc_imp + autor * (qcc_imp - qcw0_eff)
                     + (accris + accrig) * qii_imp
                     + (accrcs + accrcg) * qcc_imp
                     + autos * (qii_imp - p.qci0))
@@ -748,6 +781,7 @@ def micro_proc(
     params: MicroParams,
     dt: float,
     tabs_phys: "jax.Array | None" = None,   # F11: physical TABS from previous satadj
+    landmask: "jax.Array | None" = None,    # (ny, nx) bool/int for KK Ncc
 ) -> ModelState:
     """
     One microphysics step matching gSAM operator order.
@@ -831,6 +865,7 @@ def micro_proc(
     TABS, QV, QC, QI, QR, QS, QG = precip_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
         evap_coefs=_evap_coef_cache["coefs"],
+        landmask=landmask,
     )
 
     return ModelState(
@@ -857,6 +892,7 @@ def micro_proc_with_precip(
     params: MicroParams,
     dt: float,
     tabs_phys: "jax.Array | None" = None,   # F11: physical TABS from previous satadj
+    landmask: "jax.Array | None" = None,    # (ny, nx) bool/int for KK Ncc
 ) -> tuple[ModelState, jax.Array]:
     """Same as :func:`micro_proc` but also returns the surface precipitation
     flux at the reference (lowest) level in mm/s (= kg/m²/s), shape
@@ -919,6 +955,7 @@ def micro_proc_with_precip(
     TABS, QV, QC, QI, QR, QS, QG = precip_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
         evap_coefs=_evap_coef_cache["coefs"],
+        landmask=landmask,
     )
 
     new_state = ModelState(

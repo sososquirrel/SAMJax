@@ -679,8 +679,13 @@ def step(
     _stage_dump(state, 16, dt, force_nstep=_dump_nstep)
 
     if config.micro_params is not None:
+        _micro_landmask = (
+            (forcing.slm_static.landmask != 0)
+            if forcing.slm_static is not None else None
+        )
         state = micro_proc(state, metric, config.micro_params, dt,
-                           tabs_phys=_TABS_before_adv)
+                           tabs_phys=_TABS_before_adv,
+                           landmask=_micro_landmask)
 
     _stage_dump(state, 17, dt, force_nstep=_dump_nstep)
 
