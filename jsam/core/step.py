@@ -147,8 +147,12 @@ def _buoyancy_W(
     epsv:   float,
     qn0:    jax.Array | None = None,    # (nz,)
     qp0:    jax.Array | None = None,    # (nz,)
+    terraw: jax.Array | None = None,    # (ny, nx) terrain mask (0=below terrain, >0=above)
 ) -> jax.Array:
-    """Buoyancy on W-faces (nz+1,ny,nx) [m/s²]. Area-weighted to W-faces."""
+    """Buoyancy on W-faces (nz+1,ny,nx) [m/s²]. Area-weighted to W-faces.
+
+    terraw: terrain mask. If provided, buoyancy is zeroed where terraw <= 0.
+    """
     if tabs0.ndim == 1:
         tabs0_3d = tabs0[:, None, None]   # (nz,1,1)
     elif tabs0.ndim == 2:
@@ -188,6 +192,11 @@ def _buoyancy_W(
         )
         + (state.TABS - tabs0_3d) * thermal_factor
     )   # (nz, ny, nx)
+
+    # Apply terrain mask: zero out buoyancy below terrain (terraw <= 0)
+    if terraw is not None:
+        terraw_3d = terraw[None, :, :] if terraw.ndim == 2 else terraw
+        b = jnp.where(terraw_3d > 0.0, b, 0.0)
 
     dz_lo = dz[:-1][:, None, None]
     dz_hi = dz[1:][:, None, None]
@@ -423,23 +432,9 @@ def step(
         qv0 = forcing.qv0 if forcing.qv0 is not None else jnp.zeros_like(forcing.tabs0)
         _dW_buo = _buoyancy_W(_state_for_buoyancy, forcing.tabs0, qv0,
                                metric["dz"], config.g, config.epsv,
-                               qn0=forcing.qn0, qp0=forcing.qp0)
+                               qn0=forcing.qn0, qp0=forcing.qp0,
+                               terraw=metric.get("terraw", None))
         dW_extra = dW_extra + _dW_buo
-
-        _coef_buo = 0.5 * dt / CP
-        _buo_w_int = _dW_buo[1:-1, :, :]
-        _w_int     = state.W[1:-1, :, :]
-        _factor    = _coef_buo * _buo_w_int * _w_int
-        _TABS_corr = state.TABS
-        _TABS_corr = _TABS_corr.at[:-1, :, :].add(-_factor)  # lower cells
-        _TABS_corr = _TABS_corr.at[1:, :, :].add(-_factor)   # upper cells
-        state = ModelState(
-            U=state.U, V=state.V, W=state.W,
-            TABS=_TABS_corr, QV=state.QV, QC=state.QC,
-            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
-            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
-            nstep=state.nstep, time=state.time,
-        )
 
         jax.debug.print(
             "  DIAG [{n:>3}] B_buoy    dW_buo_abs_max={m:.4e}  (dt*max={x:.4f})",

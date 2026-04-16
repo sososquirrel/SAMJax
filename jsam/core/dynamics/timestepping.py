@@ -108,8 +108,16 @@ def advance_scalars(
     U_old:    "jax.Array | None" = None,
     V_old:    "jax.Array | None" = None,
     W_old:    "jax.Array | None" = None,
+    is_f11:   bool = False,
 ) -> tuple:
-    """Advance scalars (TABS, QV, QC, QI, QR, QS, QG) by one step."""
+    """Advance scalars (TABS, QV, QC, QI, QR, QS, QG) by one step.
+
+    Args:
+        is_f11: if True, state.TABS is treated as liquid-ice static energy
+                (already includes gamaz and condensate compensation).
+                If False, state.TABS is physical temperature and we compute
+                static energy s_n = TABS + gamaz - condensate.
+    """
     from jsam.core.state import ModelState
 
     nstep = state.nstep
@@ -121,9 +129,15 @@ def advance_scalars(
         U, V, W = state.U, state.V, state.W
     gamaz = metric["gamaz"][:, None, None]
     from jsam.core.physics.microphysics import FAC_COND, FAC_SUB
-    s_n = (state.TABS + gamaz
-           - FAC_COND * (state.QC + state.QR)
-           - FAC_SUB * (state.QI + state.QS + state.QG))
+
+    if is_f11:
+        # F11 mode: state.TABS is already static energy, just use it
+        s_n = state.TABS
+    else:
+        # Standard mode: convert physical TABS to static energy
+        s_n = (state.TABS + gamaz
+               - FAC_COND * (state.QC + state.QR)
+               - FAC_SUB * (state.QI + state.QS + state.QG))
     def _adv(phi: jax.Array) -> jax.Array:
         return advect_scalar(phi, U, V, W, metric, dt, nstep=nstep)
 
@@ -145,7 +159,9 @@ def advance_scalars(
         QG  =(qg_new - state.QG)  / dt,
     )
 
-    tabs_new = s_new - gamaz
+    # F11 mode: return advected static energy (step.py will convert back).
+    # Standard mode: convert static energy back to physical TABS.
+    tabs_new = s_new if is_f11 else (s_new - gamaz)
 
     new_state = ModelState(
         U   =state.U,

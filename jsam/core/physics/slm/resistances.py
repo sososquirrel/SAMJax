@@ -37,7 +37,7 @@ from jsam.core.physics.slm.state import SLMState, SLMStatic
 
 
 # Physical constants (from gSAM params.f90 / slm_params.f90) ---------------
-_GGR: float = 9.81          # gravitational acceleration (m/s^2)
+_GGR: float = 9.79764       # gravitational acceleration (m/s^2) — gSAM consts.f90 ggr
 _Z0_SOIL: float = 0.005     # baresoil roughness length (m)
 _RHO_SNOW: float = 100.0    # snow density (kg/m^3)
 

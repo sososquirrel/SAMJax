@@ -1,7 +1,17 @@
 """
 Pressure solver for the anelastic equations on a lat-lon grid.
 Solves ∇²p' = RHS via rfft-x + sparse-LU in (y,z) per zonal mode.
-Matches gSAM pressure_big.f90 + press_rhs.f90 + press_grad.f90.
+
+SPHERICAL HELMHOLTZ SOLVER (NOT Cartesian pressure_big.f90):
+  - RHS: Full spherical anelastic divergence with cos(lat) factors
+  - Solver: FFT in x + sparse-LU in (y,z) per zonal mode (spherical Helmholtz)
+  - Metric: True spherical with EARTH_RADIUS * cos(lat) * dlon for zonal distance
+  - Pressure history: p_prev/p_pprev returned unchanged; actual pressure separate
+
+Differences from gSAM pressure_big.f90 (Cartesian FFT+DCT+Thomas):
+  - JAX uses full spherical metrics; gSAM uses Cartesian approximation
+  - JAX uses sparse-LU in (y,z); gSAM uses DCT in y + Thomas in z
+  - JAX applies spherical imu/cos_v factors in RHS; gSAM uses scalar dx/dy
 """
 
 from __future__ import annotations
@@ -509,31 +519,32 @@ def _solve_pressure_cartesian(
     **kwargs,
 ) -> jax.Array:             # (nz, ny, nx)
     """
-    Solve ∇²p' = rhs using FFT in x + DCT-II in y + Thomas in z.
+    Solve ∇²p' = rhs using FFT in x + DCT-II in y + Thomas in z (CARTESIAN).
 
     Matches gSAM pressure_big.f90:
-      - Cartesian eigenvalues (same approximation gSAM uses globally):
+      - Cartesian eigenvalues (approximation gSAM uses globally):
           λ_x[m] = (2*cos(2πm/nx) − 2) / dx²
           λ_y[k] = (2*cos(πk/ny)  − 2) / dy²
       - DCT-II in y handles Neumann (wall) BCs at south/north edges
       - Thomas tridiagonal solve in z for each (m, k) mode pair
       - (m=0, k=0) singularity: zero RHS + diagonal shift of −1 → p = 0
 
-    Why Cartesian and not spherical:
+    KEPT FOR REFERENCE/TESTING: This solver matches the Cartesian approximation
+    used in gSAM pressure_big.f90, but the active solver (_solve_pressure_spherical)
+    uses true spherical Helmholtz with FFT-x + sparse-LU in (y,z).
+
+    Why Cartesian approximation:
       DCT-II diagonalises only constant-coefficient operators.  The spherical
       y-operator (1/R²cosφ) d/dφ(cosφ dP/dφ) has variable coefficients and
       cannot be diagonalised by DCT-II without an expensive eigenvalue solve.
-      The Cartesian approximation is exact near the equator and is the same
-      approximation gSAM uses for all global runs; the polar filter compensates
+      gSAM uses this Cartesian approximation globally; the polar filter compensates
       at high latitudes.
 
-    Numerical stability advantage over the 2D sparse-LU approach:
-      For each (m,k) the Thomas system diagonal is L_z_diag[l] + λ_x + λ_y.
-      Even for near-zero (m=0,k=1) or (m=1,k=0) eigenvalues (λ ≈ 4e-14 m⁻²),
-      L_z_diag dominates (~8e-6 m⁻²) at every row, so Thomas never encounters
-      a near-zero pivot.  The 2D LU approach sees the (y=1,z=0) barotropic
-      eigenvector as a near-zero eigenvalue of the full matrix and amplifies it
-      by ~10¹³.
+    Advantage over 2D sparse-LU:
+      For each (m,k) the Thomas diagonal is L_z_diag[l] + λ_x + λ_y.
+      Even for near-zero eigenvalues (λ ≈ 4e-14 m⁻²), L_z_diag dominates (~8e-6 m⁻²)
+      at every row, so Thomas never encounters near-zero pivots.  The 2D LU approach
+      can amplify barotropic eigenvectors by ~10¹³.
     """
     from scipy.fft import dct, idct
 
@@ -643,18 +654,25 @@ def _solve_pressure_spherical(
     **kwargs,
 ) -> jax.Array:       # (nz, ny, nx)
     """
-    Solve the spherical anelastic Poisson equation via:
+    Solve the spherical anelastic Poisson equation (ACTIVE SOLVER).
+
+    Uses FFT in x + sparse-LU in (y,z) per zonal mode:
       1. rfft in x  → nm complex modes
       2. For each zonal mode m: solve the (ny×nz) spherical Helmholtz system
              H_m p_m = rhs_m
-         where H_m includes the true cos(lat) meridional operator and the
-         spectral zonal eigenvalue α_m(j) = -4sin²(πm/nx)/(dλ R cosφ_j)².
-         Uses cached sparse LU factorisation built once per grid.
+         where H_m includes:
+           - Zonal eigenvalue: α_m(j) = -4sin²(πm/nx)/(dλ R cosφ_j)²
+           - Meridional operator: (1/R²cosφ) d/dφ(cosφ dP/dφ)
+           - Vertical operator: ρ_w(k)/ρ(k) d²P/dz²
+         Uses cached sparse LU factorisation (computed once per grid).
       3. irfft in x  → physical pressure field
 
-    Consistent with the spherical press_rhs (imu div) and spherical
-    apply_pressure_gradient (imu grad).  For grids near the equator the result
-    is numerically identical to the Cartesian DCT+Thomas solver.
+    DIFFERS FROM gSAM pressure_big.f90 (Cartesian FFT+DCT+Thomas):
+      - Uses spherical Helmholtz operator (not Cartesian approximation)
+      - Solves full (y,z) system with sparse-LU (not separable DCT+Thomas)
+      - Properly handles variable latitude metric factors
+      - Near equator: numerically identical to Cartesian solver
+      - At high latitudes: requires polar filter compensation (same as gSAM)
     """
     rhs_np = np.array(rhs, dtype=np.float64)   # (nz, ny, nx)
     nz, ny, nx = rhs_np.shape
@@ -823,9 +841,12 @@ def pressure_step(
       4. Repeat 1–3 on the residual for ``n_iter`` total iterations
 
     The effective time step for the pressure gradient is ``at * dt``, matching
-    gSAM press_grad.f90 which applies ``u -= dt3(na) * at * ∇p``.  The
-    stored pressure is then the TRUE p (same scaling gSAM uses), so that
-    adamsB's bt, ct coefficients apply cleanly.
+    gSAM press_grad.f90 which applies ``u -= dt3(na) * at * ∇p``.
+
+    PRESSURE HISTORY MANAGEMENT (differs from gSAM):
+      - gSAM: Manages pressure in rotating buffer p(:,:,:,na/nb/nc)
+      - JAX: Returns p_prev and p_pprev unchanged; actual pressure as separate p_total
+      - Caller must manage pressure history update outside this function
     """
     U_cur, V_cur, W_cur = state.U, state.V, state.W
     p_total = jnp.zeros((state.TABS.shape[0], state.TABS.shape[1],

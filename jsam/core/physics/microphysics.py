@@ -72,7 +72,9 @@ class MicroParams:
     donograupel: bool = False
     do_ice_fall: bool = True
     # Khairoutdinov-Kogan (2000) autoconversion
-    doKKauto: bool = False
+    # Note: gSAM IRMA config (prm_debug500) uses doKKauto=.true. for better agreement
+    # with observations; defaulting to True to match oracle behavior
+    doKKauto: bool = True
     doKKaccr: bool = False
     Nc_land:  float = 300.0   # cloud droplet concentration over land  [cm^-3]
     Nc_ocn:   float = 50.0    # cloud droplet concentration over ocean [cm^-3]
@@ -542,10 +544,13 @@ def _fall_col_one(
     dt:       float,
 ) -> tuple:  # (qp_new, cfl_max)
     """
-    MPDATA sedimentation for one species in one column.
+    MPDATA sedimentation for one species in one column with adaptive subcycling.
 
     Matches gSAM precip_fall.f90: upwind pass + anti-diffusive correction
     with non-oscillatory (FCT) flux limiting.
+
+    Adaptive subcycling (gSAM precip_fall.f90:109-118): if CFL > 0.9,
+    use nprec = ceil(CFL/0.9) substeps to maintain stability.
 
     Terminal velocity follows gSAM microphysics.f90:484-486 and
     precip_fall.f90:54,97:
@@ -570,56 +575,79 @@ def _fall_col_one(
 
     # Courant number (dimensionless, positive downward)
     # gSAM: wp = vt*dt/dz (scalar dz * adz → dz_col here)
-    wp = jnp.minimum(1.0, vt * dt / dz_col)
-    cfl = jnp.max(wp)
+    # For subcycling, we compute nprec and scale wp accordingly
+    cfl_raw = vt * dt / dz_col  # unclipped CFL
+    cfl_max = jnp.max(cfl_raw)
 
-    # --- Pre-compute mx/mn from original field (gSAM nonos=.true. line 130-135) ---
-    qp_above = jnp.concatenate([qp_safe[1:], qp_safe[-1:]])
-    qp_below = jnp.concatenate([qp_safe[:1], qp_safe[:-1]])
-    mx0 = jnp.maximum(jnp.maximum(qp_below, qp_above), qp_safe)
-    mn0 = jnp.minimum(jnp.minimum(qp_below, qp_above), qp_safe)
+    # Adaptive subcycling: if CFL > 0.9, use multiple substeps (gSAM line 109-110)
+    nprec = jnp.maximum(1, jnp.ceil(cfl_max / 0.9)).astype(jnp.int32)
+    nprec_float = jnp.asarray(nprec, dtype=jnp.float32)
 
-    # --- Pass 1: first-order upwind (gSAM line 141-149) ---
-    fz = qp_safe * wp
-    fz_top = jnp.concatenate([fz[1:], jnp.zeros((1,))])
-    tmp_qp = qp_safe - (fz_top - fz) * irhoadz
-    tmp_qp = jnp.maximum(0.0, tmp_qp)
+    # Scale velocity for the substeps
+    wp = jnp.minimum(1.0, cfl_raw / nprec_float)  # each substep uses dt/nprec
 
-    # --- Anti-diffusive correction (gSAM line 151-162) ---
-    tmp_flux = tmp_qp * wp
-    tmp_flux_below = jnp.concatenate([tmp_flux[:1], tmp_flux[:-1]])
-    www = 0.5 * (1.0 + wp * irhoadz) * (tmp_flux_below - tmp_flux)
+    def _mpdata_step(qp_current):
+        """Single MPDATA step: upwind + anti-diffusive correction with FCT."""
+        # --- Pre-compute mx/mn from current field (gSAM nonos=.true. line 130-135) ---
+        qp_above = jnp.concatenate([qp_current[1:], qp_current[-1:]])
+        qp_below = jnp.concatenate([qp_current[:1], qp_current[:-1]])
+        mx0 = jnp.maximum(jnp.maximum(qp_below, qp_above), qp_current)
+        mn0 = jnp.minimum(jnp.minimum(qp_below, qp_above), qp_current)
 
-    # --- FCT limiter (gSAM line 167-187) ---
-    tmp_above = jnp.concatenate([tmp_qp[1:], tmp_qp[-1:]])
-    tmp_below = jnp.concatenate([tmp_qp[:1], tmp_qp[:-1]])
+        # --- Pass 1: first-order upwind (gSAM line 141-149) ---
+        fz = qp_current * wp
+        fz_top = jnp.concatenate([fz[1:], jnp.zeros((1,))])
+        tmp_qp = qp_current - (fz_top - fz) * irhoadz
+        tmp_qp = jnp.maximum(0.0, tmp_qp)
 
-    mx = jnp.maximum(jnp.maximum(jnp.maximum(tmp_below, tmp_above), tmp_qp), mx0)
-    mn = jnp.minimum(jnp.minimum(jnp.minimum(tmp_below, tmp_above), tmp_qp), mn0)
+        # --- Anti-diffusive correction (gSAM line 151-162) ---
+        tmp_flux = tmp_qp * wp
+        tmp_flux_below = jnp.concatenate([tmp_flux[:1], tmp_flux[:-1]])
+        www = 0.5 * (1.0 + wp * irhoadz) * (tmp_flux_below - tmp_flux)
 
-    eps_fct = 1e-10
-    www_top = jnp.concatenate([www[1:], jnp.zeros((1,))])
+        # --- FCT limiter (gSAM line 167-187) ---
+        tmp_above = jnp.concatenate([tmp_qp[1:], tmp_qp[-1:]])
+        tmp_below = jnp.concatenate([tmp_qp[:1], tmp_qp[:-1]])
 
-    ppos_www_top = jnp.maximum(0.0, www_top)
-    pneg_www_top = jnp.maximum(0.0, -www_top)
-    ppos_www     = jnp.maximum(0.0, www)
-    pneg_www     = jnp.maximum(0.0, -www)
+        mx = jnp.maximum(jnp.maximum(jnp.maximum(tmp_below, tmp_above), tmp_qp), mx0)
+        mn = jnp.minimum(jnp.minimum(jnp.minimum(tmp_below, tmp_above), tmp_qp), mn0)
 
-    # gSAM: mx(k) = rho(k)*adz(k)*(mx-tmp_qp) / (pneg(www(kc))+ppos(www(k))+eps)
-    mx_lim = rho_col * dz_col * (mx - tmp_qp) / (pneg_www_top + ppos_www + eps_fct)
-    mn_lim = rho_col * dz_col * (tmp_qp - mn) / (ppos_www_top + pneg_www + eps_fct)
+        eps_fct = 1e-10
+        www_top = jnp.concatenate([www[1:], jnp.zeros((1,))])
 
-    mx_below = jnp.concatenate([mx_lim[:1], mx_lim[:-1]])
-    mn_below = jnp.concatenate([mn_lim[:1], mn_lim[:-1]])
+        ppos_www_top = jnp.maximum(0.0, www_top)
+        pneg_www_top = jnp.maximum(0.0, -www_top)
+        ppos_www     = jnp.maximum(0.0, www)
+        pneg_www     = jnp.maximum(0.0, -www)
 
-    fz_corr = (fz
-               + ppos_www * jnp.minimum(1.0, jnp.minimum(mx_lim, mn_below))
-               - pneg_www * jnp.minimum(1.0, jnp.minimum(mx_below, mn_lim)))
-    fz_corr_top = jnp.concatenate([fz_corr[1:], jnp.zeros((1,))])
+        # gSAM: mx(k) = rho(k)*adz(k)*(mx-tmp_qp) / (pneg(www(kc))+ppos(www(k))+eps)
+        mx_lim = rho_col * dz_col * (mx - tmp_qp) / (pneg_www_top + ppos_www + eps_fct)
+        mn_lim = rho_col * dz_col * (tmp_qp - mn) / (ppos_www_top + pneg_www + eps_fct)
 
-    qp_new = jnp.maximum(0.0, qp_safe - (fz_corr_top - fz_corr) * irhoadz)
+        mx_below = jnp.concatenate([mx_lim[:1], mx_lim[:-1]])
+        mn_below = jnp.concatenate([mn_lim[:1], mn_lim[:-1]])
 
-    return qp_new, cfl
+        fz_corr = (fz
+                   + ppos_www * jnp.minimum(1.0, jnp.minimum(mx_lim, mn_below))
+                   - pneg_www * jnp.minimum(1.0, jnp.minimum(mx_below, mn_lim)))
+        fz_corr_top = jnp.concatenate([fz_corr[1:], jnp.zeros((1,))])
+
+        qp_out = jnp.maximum(0.0, qp_current - (fz_corr_top - fz_corr) * irhoadz)
+        return qp_out
+
+    # Run nprec substeps via while_loop (gSAM line 120-244)
+    def _body_fun(carry):
+        i, qp_step = carry
+        qp_step = _mpdata_step(qp_step)
+        return (i + 1, qp_step)
+
+    def _cond_fun(carry):
+        i, qp_step = carry
+        return i < nprec
+
+    _, qp_new = jax.lax.while_loop(_cond_fun, _body_fun, (0, qp_safe))
+
+    return qp_new, cfl_max
 
 
 def precip_fall(
@@ -840,14 +868,21 @@ def micro_proc(
 
     # 3. Saturation adjustment (cloud() in gSAM micro_proc)
     if tabs_phys is not None:
-        # F11 mode: TABS now holds t_after_fall_and_ice.
-        # tabs_dry = t - gamaz  (exact: gSAM cloud.f90 ``tabs = t - gamaz``).
+        # F11 mode: step.py applies the F11 inverse (t → physical TABS) before
+        # calling micro_proc, so TABS here is PHYSICAL temperature, not static
+        # energy.  gSAM's tabs_dry = t - gamaz = TABS_phys - condensate_terms.
+        # We compute it directly from the current physical TABS.
         # Newton initial guess = tabs_phys (physical TABS from previous satadj),
-        # matching gSAM cloud.f90: ``tabs2=tabs; tabs(k)=t(k)-gamaz(k); tabs1=tabs2``.
-        _gamaz_3d = metric["gamaz"][:, None, None]
+        # matching gSAM cloud.f90: ``tabs2=tabs; tabs1=tabs2``.
+        a_pr_m = 1.0 / (params.tprmax - params.tprmin)
+        _omp_m = jnp.clip((TABS - params.tprmin) * a_pr_m, 0.0, 1.0)
+        _qp_m  = QR + QS + QG
+        _tabs_dry = (TABS
+                     - FAC_COND * (QC + _qp_m * _omp_m)
+                     - FAC_SUB  * (QI + _qp_m * (1.0 - _omp_m)))
         TABS, QV, QC, QI = satadj(
             tabs_phys, QV, QC, QI, QR, QS, QG, metric, params,
-            tabs_dry_override=TABS - _gamaz_3d,
+            tabs_dry_override=_tabs_dry,
             tabs_guess=tabs_phys,
         )
     else:

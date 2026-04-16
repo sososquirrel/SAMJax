@@ -61,7 +61,7 @@ from jsam.core.physics.slm.state import SLMState, SLMStatic
 # ---------------------------------------------------------------------------
 # Physical constants (match gSAM ``SRC/params.f90`` / ``SRC/SLM/slm_vars.f90``)
 # ---------------------------------------------------------------------------
-_GGR: float = 9.81       # gravity, m/s²
+_GGR: float = 9.79764    # gravity, m/s² — gSAM consts.f90 ggr (used in fh_calc from slm_vars.f90)
 _RV:  float = 461.5      # gas constant for water vapour, J/kg/K
 
 
