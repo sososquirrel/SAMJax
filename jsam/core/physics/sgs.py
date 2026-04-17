@@ -287,11 +287,11 @@ def _compute_buoy_sgs(
         if _cos_lat_sfc is not None:
             _dx_eff_sfc = jnp.minimum(1000.0, _dx_sfc * _cos_lat_sfc)   # (ny,)
         else:
-            _dx_eff_sfc = jnp.minimum(1000.0, float(_dx_sfc)) * jnp.ones((1,))
+            _dx_eff_sfc = jnp.minimum(1000.0, _dx_sfc) * jnp.ones((1,))
         if _dy_sfc is not None:
             _dy_eff_sfc = jnp.minimum(1000.0, _dy_sfc)   # (ny,)
         else:
-            _dy_eff_sfc = jnp.minimum(1000.0, float(metric.get("dy_lat_ref", _dx_sfc))) * jnp.ones((1,))
+            _dy_eff_sfc = jnp.minimum(1000.0, metric.get("dy_lat_ref", _dx_sfc)) * jnp.ones((1,))
         _coef_sfc = _dx_eff_sfc * _dy_eff_sfc   # (ny,)
         _grd_sfc = (_dz_sfc * _coef_sfc) ** 0.33333   # (ny,)
         # nonlinear inversion (tke_full.f90:114):
@@ -1457,14 +1457,14 @@ def _sgs_coefs(
         if _cos_lat10 is not None:
             _dx_eff10 = jnp.minimum(params.delta_max, _dx_sfc * _cos_lat10)  # (ny,)
         else:
-            _dx_eff10 = jnp.minimum(params.delta_max, float(_dx_sfc)) * jnp.ones((1,))
+            _dx_eff10 = jnp.minimum(params.delta_max, _dx_sfc) * jnp.ones((1,))
         if _dy_sfc is not None:
             _dy_eff10 = jnp.minimum(params.delta_max, _dy_sfc)               # (ny,)
         else:
             _dy_eff10 = jnp.minimum(params.delta_max,
-                                    float(metric.get("dy_lat_ref", _dx_sfc))) * jnp.ones((1,))
+                                    metric.get("dy_lat_ref", _dx_sfc)) * jnp.ones((1,))
         _coef10   = _dx_eff10 * _dy_eff10                                    # (ny,)
-        _grd10    = (float(_dz_ref) * _coef10) ** 0.33333                    # (ny,)
+        _grd10    = (_dz_ref * _coef10) ** 0.33333                    # (ny,)
         # tke_eq = (grd / Cee * max(1e-20, 0.5 * a_prod_bu)) ^ (2/3)  — per (ny, nx)
         _half_apb = jnp.maximum(1e-20, 0.5 * _a_prod_bu)                    # (ny, nx)
         _tke_eq   = (_grd10[:, None] / _Cee * _half_apb) ** (2.0 / 3.0)    # (ny, nx)
