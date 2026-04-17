@@ -1,17 +1,19 @@
 # jsam Debug Context
 
-**Updated**: 2026-04-17 09:28:25
+**Updated**: 2026-04-17 09:55:00
+**Git commit tested**: `cdf8b51` *(uncommitted changes present)*
 **Status**: OK
 **jsam records compared**: 19
-**Max relative error (over all compared stages)**: 0.0000e+00
+**Max relative error**: 0.0000e+00
 
 ## Result: MATCH
 
-All compared stages are within 0.1% of oracle. Pipeline complete!
+All compared stages are within 0.1% of oracle.
+Pipeline will re-run automatically when code changes.
 
 ## Recent Code Changes
 
-### Git log (last 10 commits to jsam/ and scripts/)
+### Git log
 ```
 b42dc7c fix: remove float() conversion in jitted precip_proc
 4565494 fix: restore float() conversion on metric values
@@ -111,9 +113,7 @@ index 118e2f7..16d72bb 100644
 ```
 
 ## Files to Read
-
-1. `automatic_debug/instructions.md` — what you can/cannot do
-2. `automatic_debug/knowledge.md` — what was already tried
-3. The source file listed in **Source** above
-4. `jsam/core/debug_dump.py` — how stages are mapped
-5. `/glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/DEBUG_DUMP_SCHEMA.md`
+1. `automatic_debug/instructions.md`
+2. `automatic_debug/knowledge.md`
+3. Source file listed in **Source file** above
+4. `/glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/DEBUG_DUMP_SCHEMA.md`
