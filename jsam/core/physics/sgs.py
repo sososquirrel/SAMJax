@@ -490,8 +490,10 @@ def diffuse_scalar(
     # Fix 2.5: interpolate tkh to y-face, then cap locally (gSAM lines 65-66)
     tkh_fy   = 0.5 * (tkh_yp[:, :-1, :] + tkh_yp[:, 1:, :])              # (nz,ny+1,nx) y-faces
     if tk_max is not None:
-        # Interpolate tk_max to y-faces for proper shape matching (nz, ny+1, 1)
-        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        # Interpolate tk_max from mass levels (ny) to y-faces (ny+1)
+        # Bottom face: use tk_max at j=0; interior: interpolate; top face: use tk_max at j=ny-1
+        tk_max_interior = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])  # (nz, ny-1, 1)
+        tk_max_yface = jnp.concatenate([tk_max[:, :1, :], tk_max_interior, tk_max[:, -1:, :]], axis=1)  # (nz, ny+1, 1)
         tkh_fy = jnp.minimum(tkh_fy, tk_max_yface)
     # rdy_ref: gSAM rdy2 = 1/dy_ref^2; combined with adyv/muv factor the flux is:
     #   flux = -muv[face] / (dy_v_full[face] * dy_ref) * tkh * df
@@ -677,7 +679,8 @@ def diffuse_momentum(
     # Fix 2.5: cap tk_at_U at y-face before computing flux (gSAM line 71)
     tkU_y_face = 0.5 * (tkU_yp[:, :-1, :] + tkU_yp[:, 1:, :])             # (nz,ny+1,nx+1)
     if tk_max is not None:
-        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_interior = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_yface = jnp.concatenate([tk_max[:, :1, :], tk_max_interior, tk_max[:, -1:, :]], axis=1)
         tkU_y_face = jnp.minimum(tkU_y_face, tk_max_yface)
     fy_U = (-rdy_uw_flux * tkU_y_face
             * (U_yp[:, 1:, :] - U_yp[:, :-1, :]))                        # (nz,ny+1,nx+1)
@@ -718,9 +721,10 @@ def diffuse_momentum(
     tkV_x_face = 0.5 * (tkV_xp[:, :, :-1] + tkV_xp[:, :, 1:])             # (nz,ny+1,nx+1)
     if tk_max is not None:
         # Cap at x-faces (shape: nz, ny+1, nx+1) - tk_max is (nz, ny, 1)
-        # Interpolate tk_max to y-faces for proper broadcasting
-        tk_max_yface_x = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
-        tkV_x_face = jnp.minimum(tkV_x_face, tk_max_yface_x)
+        # Interpolate tk_max to y-faces for proper broadcasting (nz, ny+1, 1)
+        tk_max_interior = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_yface = jnp.concatenate([tk_max[:, :1, :], tk_max_interior, tk_max[:, -1:, :]], axis=1)
+        tkV_x_face = jnp.minimum(tkV_x_face, tk_max_yface)
     fx_V = (-rdx2v * tkV_x_face
             * (V_xp[:, :, 1:] - V_xp[:, :, :-1]))                        # (nz,ny+1,nx+1)
     dVdt = -(fx_V[:, :, 1:] - fx_V[:, :, :-1])                           # (nz,ny+1,nx)
@@ -747,7 +751,8 @@ def diffuse_momentum(
     # Fix 2.5: cap tk_at_V at y-face before computing flux (gSAM line 74)
     tkV_y_face = 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])             # (nz,ny+2,nx)
     if tk_max is not None:
-        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_interior = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_yface = jnp.concatenate([tk_max[:, :1, :], tk_max_interior, tk_max[:, -1:, :]], axis=1)
         tkV_y_face = jnp.minimum(tkV_y_face, tk_max_yface)
     fy_V = (-rdy_v_flux_padded * tkV_y_face
             * (V_yp[:, 1:, :] - V_yp[:, :-1, :]))                        # (nz,ny+2,nx)
@@ -802,7 +807,8 @@ def diffuse_momentum(
     # Fix 2.5: cap tk_at_W at y-face before computing flux (gSAM line 77)
     tkW_y_face = 0.5 * (tkW_yp[:, :-1, :] + tkW_yp[:, 1:, :])             # (nz+1,ny+1,nx)
     if tk_max is not None:
-        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_interior = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_yface = jnp.concatenate([tk_max[:, :1, :], tk_max_interior, tk_max[:, -1:, :]], axis=1)
         tkW_y_face = jnp.minimum(tkW_y_face, tk_max_yface)
     fy_W = (-rdy_uw_flux * tkW_y_face
             * (W_yp[:, 1:, :] - W_yp[:, :-1, :]))                        # (nz+1,ny+1,nx)
