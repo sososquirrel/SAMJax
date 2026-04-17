@@ -71,11 +71,14 @@ class MicroParams:
     gamma_rave:    float = 1.0
     donograupel: bool = False
     do_ice_fall: bool = True
+    docloudfall: bool = False   # cloud liquid sedimentation (cloud_fall.f90); F for IRMA
+    sigmag: float = 1.5         # lognormal dispersion for cloud drop size (cloud_fall.f90)
     # Khairoutdinov-Kogan (2000) autoconversion
     # Note: gSAM IRMA config (prm_debug500) uses doKKauto=.true. for better agreement
     # with observations; defaulting to True to match oracle behavior
     doKKauto: bool = True
     doKKaccr: bool = False
+    auto_fudge: float = 1.0
     Nc_land:  float = 300.0   # cloud droplet concentration over land  [cm^-3]
     Nc_ocn:   float = 50.0    # cloud droplet concentration over ocean [cm^-3]
     do_scale_dependence_of_autoconv: bool = True
@@ -140,11 +143,21 @@ def _dtqsati(tabs: jax.Array, pres_mb: jax.Array) -> jax.Array:
 @functools.partial(jax.jit, static_argnames=("params", "n_iter"))
 def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
            QR: jax.Array, QS: jax.Array, QG: jax.Array, metric: dict,
-           params: MicroParams, n_iter: int = 20,
+           params: MicroParams, n_iter: int = 100,
            tabs_dry_override: "jax.Array | None" = None,
-           tabs_guess: "jax.Array | None" = None) -> tuple:
-    """Newton-iteration saturation adjustment; returns (TABS_new, QV_new, QC_new, QI_new)."""
-    pres_mb  = metric["pres"][:, None, None] / 100.0
+           tabs_guess: "jax.Array | None" = None,
+           p_pert_pa: "jax.Array | None" = None) -> tuple:
+    """Newton-iteration saturation adjustment; returns (TABS_new, QV_new, QC_new, QI_new).
+
+    p_pert_pa : 3D perturbation pressure (Pa), shape (nz, ny, nx).  When given,
+                the full 3D pressure pres_ref + p_pert is used for all qsat
+                calls, matching gSAM cloud.f90 which uses pp(i,j,k) = pres + pp_pert.
+    """
+    pres_ref_mb = metric["pres"][:, None, None] / 100.0   # (nz,1,1) reference, mb
+    if p_pert_pa is not None:
+        pres_mb = pres_ref_mb + p_pert_pa / 100.0          # (nz,ny,nx) full 3D, mb
+    else:
+        pres_mb = pres_ref_mb
     gamaz_3d = metric["gamaz"][:, None, None]
 
     a_bg = 1.0 / (params.tbgmax - params.tbgmin)
@@ -164,7 +177,10 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
     q  = QV + QC + QI   # total non-precip water
     qp = QR + QS + QG   # total precip water
 
-    def _newton(tabs1):
+    def _newton_step(carry):
+        """One Newton iteration with convergence masking (gSAM: exit when |dtabs|<0.001)."""
+        tabs1, converged = carry
+
         om = jnp.clip(a_bg * tabs1 - b_bg, 0.0, 1.0)    # cloud liquid fraction
 
         lstarn  = FAC_COND + (1.0 - om) * FAC_FUS
@@ -186,12 +202,15 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
             1.0,
         )
 
-        qsati_homo = qsati(tabs1, pres_mb) * rh_homo
+        # Fix 4.5: rh_homo only applied in pure-ice branch; NOT in mixed-phase
+        # (cloud.f90 Newton loop lines 115-116 use plain qsati in mixed-phase)
+        qsati_val = qsati(tabs1, pres_mb)
+        qsati_homo = qsati_val * rh_homo
         qsat = jnp.where(
             tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
             jnp.where(
                 tabs1 <= params.tbgmin, qsati_homo,
-                om * qsatw(tabs1, pres_mb) + (1.0 - om) * qsati_homo,
+                om * qsatw(tabs1, pres_mb) + (1.0 - om) * qsati_val,
             ),
         )
         drh_homo = jnp.where(
@@ -199,48 +218,65 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
             -1.0 / 207.8,
             0.0,
         )
-        dtqsati_homo = (_dtqsati(tabs1, pres_mb) * rh_homo
-                        + qsati(tabs1, pres_mb) * drh_homo)
+        dtqsati_val = _dtqsati(tabs1, pres_mb)
+        dtqsati_homo = dtqsati_val * rh_homo + qsati_val * drh_homo
         dqsat = jnp.where(
             tabs1 >= params.tbgmax, _dtqsatw(tabs1, pres_mb),
             jnp.where(
                 tabs1 <= params.tbgmin, dtqsati_homo,
-                om * _dtqsatw(tabs1, pres_mb) + (1.0 - om) * dtqsati_homo,
+                om * _dtqsatw(tabs1, pres_mb) + (1.0 - om) * dtqsati_val,
             ),
         )
 
         sat_excess = q - qsat
         fff  = tabs_dry - tabs1 + lstarn * sat_excess + lstarp * qp
         dfff = dlstarn * sat_excess + dlstarp * qp - lstarn * dqsat - 1.0
-        return tabs1 - fff / dfff
+        dtabs = -fff / dfff
 
-    # Initial guess: current temperature (matches gSAM cloud.f90 tabs1=tabs).
-    # The alternative tabs_dry+FAC_COND*q overshoots to ~490 K for q>>qsat,
-    # where es >> pres and the Newton step is O(0.001 K) — never converges
-    # in 20 iterations.  Starting from TABS itself (near the true root) avoids
-    # the ill-conditioned high-T regime entirely.
+        # Fix 4.6: once |dtabs| < 0.001 K, stop updating that cell (convergence mask)
+        newly_converged = jnp.abs(dtabs) < 0.001
+        tabs1_new = jnp.where(converged | newly_converged, tabs1, tabs1 + dtabs)
+        converged_new = converged | newly_converged
+        return tabs1_new, converged_new
+
+    # Fix 4.7: preliminary estimate before Newton loop (cloud.f90:58)
+    # tabs1_prelim = (tabs_dry + fac1*qp) / (1 + fac2*qp)
+    # where fac1 = fac_cond + (1+b_pr)*fac_fus, fac2 = fac_fus*a_pr
+    # This is used only to select the saturation regime for the initial qsatt
+    # test; the Newton loop itself starts from tabs_guess (= previous physical
+    # TABS), matching gSAM cloud.f90 line 92: tabs1 = tabs2.
+    _fac1_prelim = FAC_COND + (1.0 + b_pr) * FAC_FUS
+    _fac2_prelim = FAC_FUS * a_pr
+    # tabs_dry here corresponds to gSAM's tabs(i,j,k) = t - gamaz
+    tabs1_prelim = (tabs_dry + _fac1_prelim * qp) / (1.0 + _fac2_prelim * qp)
+
     # F11: when tabs_guess is provided (= physical TABS from previous satadj),
     # use it as the Newton start, matching gSAM cloud.f90: tabs1 = tabs2.
-    tabs1 = (tabs_guess if tabs_guess is not None else TABS) + 0.0
+    # When not provided, use tabs1_prelim as initial guess (matches gSAM warm/cold
+    # path where tabs1 is computed from the preliminary estimate before the loop).
+    tabs1 = (tabs_guess if tabs_guess is not None else tabs1_prelim) + 0.0
 
-    # Fixed Newton iterations (unrolled at trace time → no Python control-flow overhead)
+    # 100-iteration Newton loop with convergence mask (gSAM: while |dtabs|>0.001, niter<100)
+    converged = jnp.zeros_like(tabs1, dtype=jnp.bool_)
     for _ in range(n_iter):
-        tabs1 = _newton(tabs1)
+        tabs1, converged = _newton_step((tabs1, converged))
 
     # Final condensate and phase partitioning
     om_f = jnp.clip(a_bg * tabs1 - b_bg, 0.0, 1.0)
-    # C12 fix: apply rh_homo to final qsat (consistent with Newton iteration)
+    # Fix 4.5: rh_homo applies only in pure-ice branch, not mixed-phase
+    # (cloud.f90 line 107: qsati*rh_homo only when tabs1 <= tbgmin)
     rh_homo_f = jnp.where(
         (tabs1 < 235.0) & (QI < 1.0e-8),
         2.583 - tabs1 / 207.8,
         1.0,
     )
-    qsati_homo_f = qsati(tabs1, pres_mb) * rh_homo_f
+    qsati_val_f = qsati(tabs1, pres_mb)
+    qsati_homo_f = qsati_val_f * rh_homo_f
     qsat_f = jnp.where(
         tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
         jnp.where(
             tabs1 <= params.tbgmin, qsati_homo_f,
-            om_f * qsatw(tabs1, pres_mb) + (1.0 - om_f) * qsati_homo_f,
+            om_f * qsatw(tabs1, pres_mb) + (1.0 - om_f) * qsati_val_f,
         ),
     )
     qn_new = jnp.maximum(0.0, q - qsat_f)
@@ -343,6 +379,7 @@ def precip_proc(
     dt: float,
     evap_coefs: tuple | None = None,  # pre-computed (evapr1,evapr2,evaps1,evaps2,evapg1,evapg2)
     landmask: "jax.Array | None" = None,  # (ny, nx) bool/int; used for KK Ncc
+    p_pert_pa: "jax.Array | None" = None,  # 3D perturbation pressure (Pa), shape (nz, ny, nx)
 ) -> tuple:  # (TABS_new, QV_new, QC_new, QI_new, QR_new, QS_new, QG_new)
     """
     Microphysical source/sink terms: autoconversion, accretion, and evaporation.
@@ -351,9 +388,17 @@ def precip_proc(
     All arithmetic is implicit to keep condensate non-negative.
 
     Port of gSAM MICRO_SAM1MOM/precip_proc.f90.
+
+    p_pert_pa : 3D perturbation pressure (Pa), shape (nz, ny, nx).  When given,
+                full 3D pressure is used for qsat (evaporation branch), matching
+                gSAM which uses pp(i,j,k).
     """
     rho     = metric["rho"][:, None, None]     # (nz,1,1) kg/m³
-    pres_mb = metric["pres"][:, None, None] / 100.0   # (nz,1,1) mb
+    pres_ref_mb = metric["pres"][:, None, None] / 100.0   # (nz,1,1) reference, mb
+    if p_pert_pa is not None:
+        pres_mb = pres_ref_mb + p_pert_pa / 100.0          # (nz,ny,nx) full 3D, mb
+    else:
+        pres_mb = pres_ref_mb
 
     p = params
     a_bg = 1.0 / (p.tbgmax - p.tbgmin)
@@ -436,26 +481,41 @@ def precip_proc(
             Ncc = p.Nc_ocn  # all-ocean fallback
         # KK rate: power 1.47 not 2.47 because autor is multiplied by qcc implicitly
         autor = 1350.0 * jnp.maximum(qcc, 0.0) ** 1.47 / (Ncc ** 1.79 + 1e-30)
-        # Scale-dependence factor: dx must be in km; factor = min(1, 100/(dx_km*mu))^2
-        # At <100 km effective resolution (typical global), factor = 1 (no change)
-        dx_km = metric["dx_lon"] / 1000.0      # convert m → km
-        mu_2d = metric["cos_lat"][None, :, None]  # (1, ny, 1)
-        eff_dx_km = dx_km * mu_2d + 1e-30
+        # Fix 4.4: Scale-dependence factor using full 2D cell area.
+        # gSAM precip_proc.f90:105: autor *= min(1, 10000/(dx*mu(j)*dy*ady(j)))
+        # cell_area = dx * mu[j] * dy * ady[j]  (m²)
+        dx    = float(metric["dx_lon"])              # scalar, m
+        dy    = float(metric["dy_lat_ref"])          # scalar reference dy, m
+        mu_j  = metric["cos_lat"][None, :, None]     # (1, ny, 1)
+        ady_j = metric["ady"][None, :, None]         # (1, ny, 1)
+        cell_area = dx * mu_j * dy * ady_j + 1e-30  # (1, ny, 1) m²
         if p.do_scale_dependence_of_autoconv:
-            scale_fac = jnp.minimum(1.0, 100.0 / eff_dx_km) ** 2
+            scale_fac = jnp.minimum(1.0, 10000.0 / cell_area)
         else:
-            scale_fac = jnp.maximum(1.0, (0.001 * eff_dx_km) ** 2)
+            scale_fac = 1.0
         autor = autor * scale_fac
     else:
         # Standard Kessler parameterization
         qcw0_eff = p.qcw0
         autor = jnp.where(qcc > p.qcw0, p.alphaelq, 0.0)
 
+    # Fix 4.12: auto_fudge multiplier on autoconversion (micro_params.f90:50)
+    autor = autor * p.auto_fudge
+
     # Cloud ice autoconversion
     autos = jnp.where(qii > p.qci0, p.betaelq * coefice, 0.0)
 
     # Accretion rates
-    accrr  = jnp.where(omp > 0.001, accrrc * qrr ** powr1, 0.0)
+    # Fix 4.11: KK (2000) accretion formula when doKKaccr=True (precip_proc.f90:131)
+    # accrr = 67 * qrr^1.15 * qcc^0.15 (only when omp > 0.001)
+    if p.doKKaccr:
+        accrr = jnp.where(
+            omp > 0.001,
+            67.0 * jnp.maximum(qrr, 0.0) ** 1.15 * jnp.maximum(qcc, 0.0) ** 0.15,
+            0.0,
+        )
+    else:
+        accrr  = jnp.where(omp > 0.001, accrrc * qrr ** powr1, 0.0)
     accrcs = jnp.where((omp < 0.999) & (omg < 0.999), accrsc * qss ** pows1, 0.0)
     accris = jnp.where((omp < 0.999) & (omg < 0.999),
                        accrsi * coefice * qss ** pows1, 0.0)
@@ -542,7 +602,7 @@ def _fall_col_one(
     c_exp:    float,       # b/4
     vt_max:   float,       # velocity cap (m/s): 9 rain, 2 snow, 10 graupel
     dt:       float,
-) -> tuple:  # (qp_new, cfl_max)
+) -> tuple:  # (qp_new, cfl_max, fz_col)
     """
     MPDATA sedimentation for one species in one column with adaptive subcycling.
 
@@ -558,36 +618,57 @@ def _fall_col_one(
       vt = sqrt(1.29/rho) * term_vel                 (precip_fall.f90 rhofac)
     where v_coef = a * gamma(4+b)/6 / (pi*rho_hyd*N0)^c_exp.
 
-    Returns (qp_new, cfl_max).
+    Returns (qp_new, cfl_max, fz_col) where fz_col[k] is the dimensionless
+    downward mass flux (qp*wp) at the top face of cell k used in the final
+    MPDATA step, matching gSAM's fz(k) (at bottom face of cell k+1 = top face
+    of cell k in 0-indexed notation).  fz_col[nz-1] = 0 (top boundary).
+    fz_col is accumulated over all substeps, scaled back to per-dt units.
     """
     qp_safe = jnp.maximum(qp_col, 0.0)
     rhofac = jnp.sqrt(1.29 / rho_col)
 
-    # Terminal velocity (m/s, positive downward)
-    # gSAM: term_vel_qp = min(vt_max, v_coef*(rho*qp)^c_exp)
-    # then precip_fall.f90:97: wp_vel = rhofac * term_vel_qp
-    term_vel = jnp.minimum(vt_max, v_coef * (rho_col * qp_safe) ** c_exp)
-    vt = rhofac * term_vel
-    vt = jnp.where(qp_safe > 1e-12, vt, 0.0)
-
     # irhoadz[k] = 1/(rho[k]*dz[k])  (gSAM: 1/(rho*adz), with dz factor in wp)
     irhoadz = 1.0 / (rho_col * dz_col)
+
+    def _compute_wp(qp_cur, nprec_f):
+        """Compute per-level CFL from current qp (gSAM precip_fall.f90:97-99).
+
+        Fix 4.9: gSAM recomputes wp from the updated qp after each substep
+        (precip_fall.f90:225-237).  This helper is called at the start of
+        each substep so wp reflects the current qp.
+        """
+        qp_c = jnp.maximum(qp_cur, 0.0)
+        tv = jnp.minimum(vt_max, v_coef * (rho_col * qp_c) ** c_exp)
+        vt_c = rhofac * tv
+        vt_c = jnp.where(qp_c > 1e-12, vt_c, 0.0)
+        return jnp.minimum(1.0, vt_c * dt / dz_col / nprec_f)
+
+    # Compute initial terminal velocity from initial qp for CFL check
+    term_vel_init = jnp.minimum(vt_max, v_coef * (rho_col * qp_safe) ** c_exp)
+    vt_init = rhofac * term_vel_init
+    vt_init = jnp.where(qp_safe > 1e-12, vt_init, 0.0)
 
     # Courant number (dimensionless, positive downward)
     # gSAM: wp = vt*dt/dz (scalar dz * adz → dz_col here)
     # For subcycling, we compute nprec and scale wp accordingly
-    cfl_raw = vt * dt / dz_col  # unclipped CFL
+    cfl_raw = vt_init * dt / dz_col  # unclipped CFL
     cfl_max = jnp.max(cfl_raw)
 
     # Adaptive subcycling: if CFL > 0.9, use multiple substeps (gSAM line 109-110)
     nprec = jnp.maximum(1, jnp.ceil(cfl_max / 0.9)).astype(jnp.int32)
     nprec_float = jnp.asarray(nprec, dtype=jnp.float32)
 
-    # Scale velocity for the substeps
-    wp = jnp.minimum(1.0, cfl_raw / nprec_float)  # each substep uses dt/nprec
+    nz = qp_col.shape[0]
 
-    def _mpdata_step(qp_current):
-        """Single MPDATA step: upwind + anti-diffusive correction with FCT."""
+    def _mpdata_step(carry):
+        """Single MPDATA step: upwind + anti-diffusive correction with FCT.
+
+        Fix 4.9: carry includes wp so it can be updated from qp after each
+        substep, matching gSAM precip_fall.f90:225-237.
+        Returns (qp_out, fz_corr, wp_next).
+        """
+        qp_current, wp = carry
+
         # --- Pre-compute mx/mn from current field (gSAM nonos=.true. line 130-135) ---
         qp_above = jnp.concatenate([qp_current[1:], qp_current[-1:]])
         qp_below = jnp.concatenate([qp_current[:1], qp_current[:-1]])
@@ -633,21 +714,145 @@ def _fall_col_one(
         fz_corr_top = jnp.concatenate([fz_corr[1:], jnp.zeros((1,))])
 
         qp_out = jnp.maximum(0.0, qp_current - (fz_corr_top - fz_corr) * irhoadz)
-        return qp_out
+        # Fix 4.9: recompute wp from updated qp for the next substep
+        # (gSAM precip_fall.f90:225-237)
+        wp_next = _compute_wp(qp_out, nprec_float)
+        return qp_out, fz_corr, wp_next
 
     # Run nprec substeps via while_loop (gSAM line 120-244)
+    # Carry: (step_index, qp, accumulated_fz, wp)
+    # fz is accumulated over substeps (each substep applies its own flux divergence
+    # to temperature in gSAM; we sum here and apply once at the end).
+    # wp is carried and updated after each substep (Fix 4.9).
+    wp_init = _compute_wp(qp_safe, nprec_float)
+
     def _body_fun(carry):
-        i, qp_step = carry
-        qp_step = _mpdata_step(qp_step)
-        return (i + 1, qp_step)
+        i, qp_step, fz_acc, wp_step = carry
+        qp_step, fz_step, wp_next = _mpdata_step((qp_step, wp_step))
+        return (i + 1, qp_step, fz_acc + fz_step, wp_next)
 
     def _cond_fun(carry):
-        i, qp_step = carry
+        i, qp_step, fz_acc, wp_step = carry
         return i < nprec
 
-    _, qp_new = jax.lax.while_loop(_cond_fun, _body_fun, (0, qp_safe))
+    _, qp_new, fz_acc, _ = jax.lax.while_loop(
+        _cond_fun, _body_fun, (0, qp_safe, jnp.zeros(nz), wp_init)
+    )
 
-    return qp_new, cfl_max
+    return qp_new, cfl_max, fz_acc
+
+
+def _fall_col_bulk(
+    qp_col:    jax.Array,   # (nz,)  bulk qp mixing ratio (kg/kg)
+    omp_col:   jax.Array,   # (nz,)  rain fraction (0=all ice, 1=all rain)
+    omg_col:   jax.Array,   # (nz,)  graupel fraction of ice (0=all snow)
+    rho_col:   jax.Array,   # (nz,)  kg/m³
+    dz_col:    jax.Array,   # (nz,)  m
+    vrain: float, crain: float,
+    vsnow: float, csnow: float,
+    vgrau: float, cgrau: float,
+    dt: float,
+) -> tuple:  # (qp_new, fz_acc)
+    """
+    MPDATA sedimentation for bulk qp = QR + QS + QG using composite terminal
+    velocity, matching gSAM precip_fall.f90 + term_vel_qp (microphysics.f90:415-462).
+
+    Fix 4.2: gSAM sediments a single bulk qp field with mass-weighted composite
+    terminal velocity rather than QR/QS/QG independently.  After sedimentation
+    the caller repartitions into species using the pre-sedimentation omega fractions.
+
+    Terminal velocity (gSAM term_vel_qp):
+      wp_rain  = vrain * (rho * qrr)^crain,  qrr = omp * qp
+      wp_snow  = vsnow * (rho * qss)^csnow,  qss = (1-omp)*(1-omg) * qp
+      wp_grau  = vgrau * (rho * qgg)^cgrau,  qgg = (1-omp)*omg * qp
+      wp_bulk  = omp*wp_rain + (1-omp)*(omg*wp_grau + (1-omg)*wp_snow)
+    velocity caps: rain 9 m/s, snow 2 m/s, graupel 10 m/s; rhofac = sqrt(1.29/rho).
+    """
+    qp_safe = jnp.maximum(qp_col, 0.0)
+    rhofac  = jnp.sqrt(1.29 / rho_col)
+    irhoadz = 1.0 / (rho_col * dz_col)
+    eps_qp  = 1e-12
+
+    def _composite_vt(qp_cur):
+        """Composite terminal velocity from current bulk qp (gSAM term_vel_qp)."""
+        qp_c   = jnp.maximum(qp_cur, 0.0)
+        qrr    = qp_c * omp_col
+        qss    = qp_c * (1.0 - omp_col) * (1.0 - omg_col)
+        qgg    = qp_c * (1.0 - omp_col) * omg_col
+        vt_r   = jnp.minimum(9.0,  vrain * (rho_col * jnp.maximum(qrr, 0.0)) ** crain)
+        vt_s   = jnp.minimum(2.0,  vsnow * (rho_col * jnp.maximum(qss, 0.0)) ** csnow)
+        vt_g   = jnp.minimum(10.0, vgrau * (rho_col * jnp.maximum(qgg, 0.0)) ** cgrau)
+        wp_bulk = (omp_col * vt_r
+                   + (1.0 - omp_col) * (omg_col * vt_g + (1.0 - omg_col) * vt_s))
+        return jnp.where(qp_c > eps_qp, rhofac * wp_bulk, 0.0)
+
+    def _compute_wp(qp_cur, nprec_f):
+        vt_c = _composite_vt(qp_cur)
+        return jnp.minimum(1.0, vt_c * dt / dz_col / nprec_f)
+
+    vt_init = _composite_vt(qp_safe)
+    cfl_raw = vt_init * dt / dz_col
+    cfl_max = jnp.max(cfl_raw)
+
+    nprec       = jnp.maximum(1, jnp.ceil(cfl_max / 0.9)).astype(jnp.int32)
+    nprec_float = jnp.asarray(nprec, dtype=jnp.float32)
+    nz = qp_col.shape[0]
+
+    def _mpdata_step(carry):
+        qp_current, wp = carry
+        qp_above = jnp.concatenate([qp_current[1:], qp_current[-1:]])
+        qp_below = jnp.concatenate([qp_current[:1], qp_current[:-1]])
+        mx0 = jnp.maximum(jnp.maximum(qp_below, qp_above), qp_current)
+        mn0 = jnp.minimum(jnp.minimum(qp_below, qp_above), qp_current)
+
+        fz = qp_current * wp
+        fz_top = jnp.concatenate([fz[1:], jnp.zeros((1,))])
+        tmp_qp = jnp.maximum(0.0, qp_current - (fz_top - fz) * irhoadz)
+
+        tmp_flux = tmp_qp * wp
+        tmp_flux_below = jnp.concatenate([tmp_flux[:1], tmp_flux[:-1]])
+        www = 0.5 * (1.0 + wp * irhoadz) * (tmp_flux_below - tmp_flux)
+
+        tmp_above = jnp.concatenate([tmp_qp[1:], tmp_qp[-1:]])
+        tmp_below = jnp.concatenate([tmp_qp[:1], tmp_qp[:-1]])
+        mx = jnp.maximum(jnp.maximum(jnp.maximum(tmp_below, tmp_above), tmp_qp), mx0)
+        mn = jnp.minimum(jnp.minimum(jnp.minimum(tmp_below, tmp_above), tmp_qp), mn0)
+
+        eps_fct = 1e-10
+        www_top = jnp.concatenate([www[1:], jnp.zeros((1,))])
+        ppos_www_top = jnp.maximum(0.0, www_top)
+        pneg_www_top = jnp.maximum(0.0, -www_top)
+        ppos_www     = jnp.maximum(0.0, www)
+        pneg_www     = jnp.maximum(0.0, -www)
+
+        mx_lim = rho_col * dz_col * (mx - tmp_qp) / (pneg_www_top + ppos_www + eps_fct)
+        mn_lim = rho_col * dz_col * (tmp_qp - mn) / (ppos_www_top + pneg_www + eps_fct)
+        mx_below = jnp.concatenate([mx_lim[:1], mx_lim[:-1]])
+        mn_below = jnp.concatenate([mn_lim[:1], mn_lim[:-1]])
+
+        fz_corr = (fz
+                   + ppos_www * jnp.minimum(1.0, jnp.minimum(mx_lim, mn_below))
+                   - pneg_www * jnp.minimum(1.0, jnp.minimum(mx_below, mn_lim)))
+        fz_corr_top = jnp.concatenate([fz_corr[1:], jnp.zeros((1,))])
+        qp_out  = jnp.maximum(0.0, qp_current - (fz_corr_top - fz_corr) * irhoadz)
+        wp_next = _compute_wp(qp_out, nprec_float)
+        return qp_out, fz_corr, wp_next
+
+    wp_init = _compute_wp(qp_safe, nprec_float)
+
+    def _body_fun(carry):
+        i, qp_step, fz_acc, wp_step = carry
+        qp_step, fz_step, wp_next = _mpdata_step((qp_step, wp_step))
+        return (i + 1, qp_step, fz_acc + fz_step, wp_next)
+
+    def _cond_fun(carry):
+        i, qp_step, fz_acc, wp_step = carry
+        return i < nprec
+
+    _, qp_new, fz_acc, _ = jax.lax.while_loop(
+        _cond_fun, _body_fun, (0, qp_safe, jnp.zeros(nz), wp_init)
+    )
+    return qp_new, fz_acc
 
 
 def precip_fall(
@@ -661,6 +866,13 @@ def precip_fall(
 ) -> tuple:  # (QR_new, QS_new, QG_new, TABS_new)
     """
     Gravitational sedimentation of rain, snow, graupel.
+
+    Fix 4.2: gSAM sediments bulk qp = QR+QS+QG with composite terminal velocity
+    (term_vel_qp in microphysics.f90:415-462).  After sedimentation, species are
+    repartitioned from the bulk using the pre-sedimentation omega fractions:
+      QR_new = qp_new * omp
+      QS_new = qp_new * (1-omp) * (1-omg)
+      QG_new = qp_new * (1-omp) * omg
 
     Full MPDATA with anti-diffusive correction + FCT limiter per column.
     Port of gSAM MICRO_SAM1MOM/precip_fall.f90.
@@ -687,33 +899,89 @@ def precip_fall(
     vsnow = p.a_snow * gams3 / 6.0 / (np.pi * p.rhos * p.nzeros) ** csnow
     vgrau = p.a_grau * gamg3 / 6.0 / (np.pi * p.rhog * p.nzerog) ** cgrau
 
-    def _fall_species(qp_3d, v_coef, c_exp, vt_max):
-        """Apply MPDATA sedimentation to a 3D species field."""
-        def _col(qp_col):
-            qp_new, _ = _fall_col_one(qp_col, rho_1d, dz_1d,
-                                       v_coef, c_exp, vt_max, dt)
-            return qp_new
+    # Fix 4.2: bulk sedimentation of qp = QR + QS + QG with composite terminal velocity.
+    # Pre-sedimentation phase fractions (omp, omg) are frozen and used to:
+    #  1. compute composite terminal velocity during sedimentation
+    #  2. repartition qp into species after sedimentation
+    a_pr_f = 1.0 / (p.tprmax - p.tprmin)
+    a_gr_f = 0.0 if p.donograupel else 1.0 / (p.tgrmax - p.tgrmin)
+    omp_3d = jnp.clip((TABS - p.tprmin) * a_pr_f, 0.0, 1.0)  # (nz,ny,nx)
+    omg_3d = jnp.clip((TABS - p.tgrmin) * a_gr_f, 0.0, 1.0)  # (nz,ny,nx)
 
-        _vmap_i = jax.vmap(_col, in_axes=1, out_axes=1)
-        _vmap_ji = jax.vmap(_vmap_i, in_axes=1, out_axes=1)
-        return _vmap_ji(qp_3d)
+    QP = QR + QS + QG
 
-    QR_new = _fall_species(QR, vrain, crain, 9.0)
-    QS_new = _fall_species(QS, vsnow, csnow, 2.0)
-    QG_new = _fall_species(QG, vgrau, cgrau, 10.0)
+    def _col_bulk(qp_col, omp_col, omg_col):
+        """Sediment one column of bulk qp."""
+        return _fall_col_bulk(
+            qp_col, omp_col, omg_col, rho_1d, dz_1d,
+            vrain, crain, vsnow, csnow, vgrau, cgrau, dt,
+        )
 
-    # Latent heat tendency from sedimentation flux divergence
-    # ΔT = -(lfac * d(rhow*vt*qp)/dz) / (rho*cp) * dt
-    # Here we approximate: TABS changes by fac * (qp_old - qp_new)
+    # vmap pattern mirrors _fall_species: outer over ny (axis=1 of (nz,ny,nx)),
+    # inner over nx (axis=1 of the resulting (nz,nx) slices).
+    _vmap_i  = jax.vmap(_col_bulk, in_axes=(1, 1, 1), out_axes=(1, 1))
+    _vmap_ji = jax.vmap(_vmap_i,   in_axes=(1, 1, 1), out_axes=(1, 1))
+    QP_new, fz_bulk = _vmap_ji(QP, omp_3d, omg_3d)
+
+    # Repartition updated bulk qp into species using pre-sedimentation fractions
+    QR_new = QP_new * omp_3d
+    QS_new = QP_new * (1.0 - omp_3d) * (1.0 - omg_3d)
+    QG_new = QP_new * (1.0 - omp_3d) * omg_3d
+
+    # Fix 4.3: Interface-flux-divergence latent heat from sedimentation.
+    # Matches gSAM precip_fall.f90 line 200:
+    #   lat_heat = -(lfac(kc)*fz(kc) - lfac(k)*fz(k)) * irhoadz(k)
+    #   t(i,j,k) = t(i,j,k) - lat_heat
+    # where lfac(k) = fac_cond + (1-omega(k))*fac_fus at cell centre k,
+    # fz(k) is the flux at the bottom face of cell k (top face of cell k-1),
+    # and fz(nz)=0 (top boundary).
+    #
+    # In JAX convention (k=0 is bottom), fz_acc[k] is the accumulated flux
+    # at the top face of cell k (= bottom face of cell k+1 in 1-indexed).
+    # kc = k+1 in Fortran; fz(kc) = flux entering from above = fz_acc[k+1].
+    # The divergence for cell k: fz(kc)*irhoadz(k) - fz(k)*irhoadz(k).
+    # Combine lfac weighting: lfac(kc)*fz(kc) uses lfac from cell above.
     a_pr = 1.0 / (p.tprmax - p.tprmin)
     omp  = jnp.clip((TABS - p.tprmin) * a_pr, 0.0, 1.0)
-    lfac = FAC_COND * omp + FAC_SUB * (1.0 - omp)
-    dQR = QR_new - QR
-    dQS = QS_new - QS
-    dQG = QG_new - QG
-    # Temperature cools where precip falls out, warms where it enters
-    # (sign: if qp decreases in column → latent heat released above → warm above)
-    TABS_new = TABS - lfac * (dQR + dQS + dQG)
+    lfac = FAC_COND * omp + FAC_SUB * (1.0 - omp)  # (nz, ny, nx) cell-centre latent factor
+
+    irhoadz = 1.0 / (jnp.array(rho_1d)[:, None, None] * jnp.array(dz_1d)[:, None, None])
+
+    def _flux_div_dT(fz_acc, lfac_3d):
+        """Temperature increment from interface-flux-weighted sedimentation divergence.
+
+        Matches gSAM precip_fall.f90 lines 200-201:
+          lat_heat = -(lfac(kc)*fz(kc) - lfac(k)*fz(k)) * irhoadz(k)
+          t(k) = t(k) - lat_heat
+        where in gSAM, fz(k) < 0 (downward, negative sign convention), kc = k+1 is
+        the cell above k (Fortran 1-indexed, k=1 at bottom), and fz(nz)=0 at top.
+
+        JSam convention (0-indexed, j=0 at bottom):
+          fz_acc[j] > 0 = downward flux at bottom face of cell j (positive = downward).
+          gSAM fz(k) = -fz_acc[j]  where j = k-1  (sign flip: gSAM is negative downward).
+          gSAM fz(kc) = fz(k+1) = -fz_acc[j+1].
+
+        Substituting into gSAM formula:
+          lat_heat[j] = -(lfac[j+1]*(-fz_acc[j+1]) - lfac[j]*(-fz_acc[j])) * irhoadz[j]
+                      = (lfac[j+1]*fz_acc[j+1] - lfac[j]*fz_acc[j]) * irhoadz[j]
+          TABS_new[j] = TABS[j] - lat_heat[j]
+
+        Boundaries:
+          fz_acc[j+1] = 0 for top cell (j=nz-1): gSAM fz(nz)=0.
+          lfac_above[nz-1] = 0: gSAM lfac(nz)=0.
+        """
+        # fz_acc[j+1]: flux from above (= 0 for top cell, gSAM fz(nz)=0)
+        fz_above = jnp.concatenate([fz_acc[1:], jnp.zeros_like(fz_acc[:1])], axis=0)
+        # lfac[j+1]: latent factor of cell above (= 0 for top cell, gSAM lfac(nz)=0)
+        lfac_above = jnp.concatenate([lfac_3d[1:], jnp.zeros_like(lfac_3d[:1])], axis=0)
+        # lat_heat[j] = (lfac[j+1]*fz_acc[j+1] - lfac[j]*fz_acc[j]) * irhoadz[j]
+        lat_heat = (lfac_above * fz_above - lfac_3d * fz_acc) * irhoadz
+        return lat_heat
+
+    # Fix 4.2+4.3: apply latent heat flux divergence to the single bulk flux.
+    # gSAM applies one call to precip_fall for all of qp with composite lfac.
+    dT_bulk  = _flux_div_dT(fz_bulk, lfac)
+    TABS_new = TABS - dT_bulk
 
     return QR_new, QS_new, QG_new, TABS_new
 
@@ -800,6 +1068,38 @@ def ice_fall(
 
 
 # ---------------------------------------------------------------------------
+# Cloud liquid sedimentation stub  (port of cloud_fall.f90)
+# ---------------------------------------------------------------------------
+
+def cloud_fall(
+    QC:   jax.Array,   # (nz, ny, nx)  cloud liquid mixing ratio
+    TABS: jax.Array,   # (nz, ny, nx)  temperature (for latent heat)
+    metric: dict,
+    params: MicroParams,
+    dt: float,
+    landmask: "jax.Array | None" = None,  # (ny, nx) 0=ocean 1=land
+) -> tuple:  # (QC_new, TABS_new)
+    """
+    Fix 4.10: Stokes cloud liquid sedimentation (gSAM cloud_fall.f90).
+
+    When params.docloudfall is False (IRMA default: docloudfall=F), this is a
+    no-op that returns the inputs unchanged.  The field and stub exist so that
+    MicroParams.docloudfall can be set to True without code changes.
+
+    When True, the full Bretherton et al. (2007) lognormal Stokes velocity
+    scheme would be implemented here.  For IRMA this branch is never reached.
+    """
+    if not params.docloudfall:
+        return QC, TABS
+    # docloudfall=True not yet implemented for IRMA (docloudfall=F in IRMA nml).
+    # Raise at runtime if somehow enabled, to avoid silent no-op masking a bug.
+    raise NotImplementedError(
+        "cloud_fall: docloudfall=True is not yet implemented in JSAM. "
+        "Set MicroParams(docloudfall=False) for IRMA."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level microphysics step
 # ---------------------------------------------------------------------------
 
@@ -866,7 +1166,15 @@ def micro_proc(
         else:
             QI, TABS = ice_fall(QI, TABS, metric, params, dt)
 
+    # 2b. Cloud liquid sedimentation (Fix 4.10: gSAM cloud_fall.f90).
+    # docloudfall=False for IRMA; stub is a no-op in that case.
+    if params.docloudfall:
+        QC, TABS = cloud_fall(QC, TABS, metric, params, dt, landmask=landmask)
+
     # 3. Saturation adjustment (cloud() in gSAM micro_proc)
+    # Fix 4.1: use full 3D pressure (reference + perturbation) for qsat calls,
+    # matching gSAM cloud.f90 which uses pp(i,j,k) = pres_ref + pp_pert.
+    _p_pert = state.p_prev   # (nz, ny, nx) Pa perturbation pressure
     if tabs_phys is not None:
         # F11 mode: step.py applies the F11 inverse (t → physical TABS) before
         # calling micro_proc, so TABS here is PHYSICAL temperature, not static
@@ -884,10 +1192,12 @@ def micro_proc(
             tabs_phys, QV, QC, QI, QR, QS, QG, metric, params,
             tabs_dry_override=_tabs_dry,
             tabs_guess=tabs_phys,
+            p_pert_pa=_p_pert,
         )
     else:
         TABS, QV, QC, QI = satadj(
             TABS, QV, QC, QI, QR, QS, QG, metric, params,
+            p_pert_pa=_p_pert,
         )
 
     # 4. Precipitation processes (precip_proc() in gSAM micro_proc)
@@ -901,6 +1211,7 @@ def micro_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
         evap_coefs=_evap_coef_cache["coefs"],
         landmask=landmask,
+        p_pert_pa=_p_pert,
     )
 
     return ModelState(
@@ -970,17 +1281,26 @@ def micro_proc_with_precip(
         else:
             QI, TABS = ice_fall(QI, TABS, metric, params, dt)
 
+    # 2b. Cloud liquid sedimentation (Fix 4.10: gSAM cloud_fall.f90).
+    # docloudfall=False for IRMA; stub is a no-op in that case.
+    if params.docloudfall:
+        QC, TABS = cloud_fall(QC, TABS, metric, params, dt, landmask=landmask)
+
     # 3. Saturation adjustment
+    # Fix 4.1: use full 3D pressure for qsat calls (gSAM uses pp(i,j,k) = pres + pp_pert).
+    _p_pert = state.p_prev   # (nz, ny, nx) Pa perturbation pressure
     if tabs_phys is not None:
         _gamaz_3d = metric["gamaz"][:, None, None]
         TABS, QV, QC, QI = satadj(
             tabs_phys, QV, QC, QI, QR, QS, QG, metric, params,
             tabs_dry_override=TABS - _gamaz_3d,
             tabs_guess=tabs_phys,
+            p_pert_pa=_p_pert,
         )
     else:
         TABS, QV, QC, QI = satadj(
             TABS, QV, QC, QI, QR, QS, QG, metric, params,
+            p_pert_pa=_p_pert,
         )
     # 4. Precip processes (same cache logic as micro_proc)
     nstep = int(state.nstep)
@@ -991,6 +1311,7 @@ def micro_proc_with_precip(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
         evap_coefs=_evap_coef_cache["coefs"],
         landmask=landmask,
+        p_pert_pa=_p_pert,
     )
 
     new_state = ModelState(

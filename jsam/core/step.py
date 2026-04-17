@@ -8,6 +8,7 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 from jsam.core.state import ModelState
@@ -72,7 +73,7 @@ class StepConfig:
     # day0 is a fractional calendar day (1.xx .. 365.xx) at nstep=0, UT.
     # Set rad_day0=None (default) to disable SW entirely (LW-only, legacy).
     rad_day0:  Optional[float] = None
-    rad_iyear: int = 2017
+    rad_iyear: int = 1999
 
 
 @jax.tree_util.register_pytree_node_class
@@ -251,28 +252,6 @@ def step(
         nstep=state.nstep + 1, time=state.time,
     )
 
-    # Enforce rigid-lid W boundary conditions and match gSAM initialization.
-    # W[0] = W[nz] = 0 (rigid-lid BCs).  jsam's W initialization differs from
-    # gSAM by ~1.3% due to unknown source (precision, interpolation algorithm).
-    # Scale W on step 1 (first step) to match oracle exactly and prevent
-    # cascading errors.
-    W_max_jsam = jnp.max(state.W)
-    W_max_oracle = 1.882216573  # gSAM stage 0 first icycle W_max
-    W_scale = W_max_oracle / jnp.maximum(W_max_jsam, 1e-10)
-    # Use jnp.where instead of if (JAX JIT can't handle Python if with traced values)
-    W_scaled = jnp.where(
-        state.nstep == 1,  # First step (nstep just incremented to 1)
-        state.W * W_scale,  # Apply scaling
-        state.W  # No scaling on other steps
-    )
-    state = ModelState(
-        U=state.U, V=state.V, W=W_scaled,
-        TABS=state.TABS, QV=state.QV, QC=state.QC,
-        QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
-        TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
-        nstep=state.nstep, time=state.time,
-    )
-
     # Enforce W=0 at rigid-lid boundaries (bottom and top)
     W_BC = state.W.at[0, :, :].set(0.0).at[-1, :, :].set(0.0)
     state = ModelState(
@@ -290,6 +269,19 @@ def step(
         state = ls_proc(state, metric, forcing.ls_forcing, dt)
 
     _stage_dump(state, 1, dt, force_nstep=_dump_nstep)  # forcing
+
+    # gSAM main.f90: nudging() called immediately after forcing(), before buoyancy().
+    if config.nudging_params is not None and (
+        forcing.tabs_ref is not None or forcing.qv_ref is not None
+    ):
+        state = nudge_proc(
+            state, metric,
+            tabs_ref=forcing.tabs_ref,
+            qv_ref=forcing.qv_ref,
+            dt=dt,
+            params=config.nudging_params,
+        )
+
     _stage_dump(state, 2, dt, force_nstep=_dump_nstep)  # nudging
 
     # D9 fix: gSAM computes buoyancy BEFORE radiation, so buoyancy sees
@@ -315,12 +307,18 @@ def step(
                     "lat_rad":     metric["lat_rad"],
                     "lon_rad":     metric["lon_rad"],
                 }
+            # Fix 7.3: pass landmask so SW uses Briegleb land albedo over land.
+            _rad_landmask = (
+                np.asarray(forcing.slm_static.landmask)
+                if forcing.slm_static is not None else None
+            )
             # Compute both qrad (for main heating) and lwds (for SLM)
             _new_qrad, _lwds_new = compute_qrad_and_lwds_rrtmg(
                 state, metric, config.rad_rrtmg, forcing.sst,
                 o3vmr=(None if forcing.o3vmr_rrtmg is None
                        else jnp.asarray(forcing.o3vmr_rrtmg)),
                 sw_aux=_sw_aux,
+                landmask=_rad_landmask,
             )
             forcing = PhysicsForcing(
                 tabs0=forcing.tabs0, qv0=forcing.qv0,
@@ -344,17 +342,6 @@ def step(
             )
 
     _stage_dump(state, 4, dt, force_nstep=_dump_nstep)
-
-    if config.nudging_params is not None and (
-        forcing.tabs_ref is not None or forcing.qv_ref is not None
-    ):
-        state = nudge_proc(
-            state, metric,
-            tabs_ref=forcing.tabs_ref,
-            qv_ref=forcing.qv_ref,
-            dt=dt,
-            params=config.nudging_params,
-        )
 
     surface_fluxes: SurfaceFluxes | None = None
     new_slm_state: SLMState | None = forcing.slm_state
@@ -446,19 +433,63 @@ def step(
 
     _U_old, _V_old, _W_old = state.U, state.V, state.W
 
-    _tk = None
-    if config.sgs_params is not None:
-        _fluxbt_sgs = None if surface_fluxes is None else surface_fluxes.shf
-        _fluxbq_sgs = None if surface_fluxes is None else surface_fluxes.lhf
-        _tk, _tkh = _sgs_coefs(
-            state, metric, config.sgs_params, dt, tabs0=forcing.tabs0,
-            fluxbt=_fluxbt_sgs, fluxbq=_fluxbq_sgs,
-        )
-
     nz_s, ny_s, nx_s = state.TABS.shape
     dU_extra = jnp.zeros((nz_s, ny_s, nx_s + 1))
     dV_extra = jnp.zeros((nz_s, ny_s + 1, nx_s))
     dW_extra = jnp.zeros((nz_s + 1, ny_s, nx_s))
+
+    # Fix 1.4: Compute AB-extrapolated advective velocities before calling
+    # advance_momentum and advance_scalars (matching gSAM advect_all_scalars.f90).
+    # Note: advective velocity uses fixed AB2 (0.5, 0.5) on step>1, NOT the
+    # variable AB coefficients used for momentum/scalar advancement.
+    mu     = metric["cos_lat"]
+    muv    = metric["cos_v"]
+    ady    = metric["ady"]
+    rho    = metric["rho"]
+    rhow   = metric["rhow"]
+    dz     = metric["dz"]
+    dx     = metric["dx_lon"]
+    dy_ref = metric["dy_lat_ref"]
+
+    dz_ref = dz[0]
+    adz    = dz / dz_ref
+
+    dtdx = dt / dx
+    dtdy = dt / dy_ref
+    dtdz = dt / dz_ref
+
+    # Current step's mass-flux-weighted velocities (u1, v1, w1 in gSAM)
+    u1_curr = state.U * (rho[:, None, None] * dtdx * adz[:, None, None] * ady[None, :, None])
+    v1_curr = state.V * (rho[:, None, None] * dtdy * adz[:, None, None] * muv[None, :, None])
+    w1_curr = state.W * (rhow[:, None, None] * dtdz * ady[None, :, None] * mu[None, :, None])
+
+    # AB2-extrapolate advective velocity (fixed coefficients, not variable like AB3)
+    # At nstep=1: a1=1, a2=0 (Euler)
+    # At nstep>1: a1=0.5, a2=0.5 (AB2)
+    _nstep_int = int(state.nstep)
+    a1_adv = jnp.where(_nstep_int == 1, 1.0, 0.5)
+    a2_adv = jnp.where(_nstep_int == 1, 0.0, 0.5)
+
+    u1_adv = a1_adv * u1_curr + a2_adv * mom_tends_nm1.U_adv
+    v1_adv = a1_adv * v1_curr + a2_adv * mom_tends_nm1.V_adv
+    w1_adv = a1_adv * w1_curr + a2_adv * mom_tends_nm1.W_adv
+
+    # Convert back to velocities (undo mass-flux weighting)
+    U_adv_for_advection = jnp.where(
+        rho[:, None, None] * dtdx * adz[:, None, None] * ady[None, :, None] != 0,
+        u1_adv / (rho[:, None, None] * dtdx * adz[:, None, None] * ady[None, :, None]),
+        state.U
+    )
+    V_adv_for_advection = jnp.where(
+        rho[:, None, None] * dtdy * adz[:, None, None] * muv[None, :, None] != 0,
+        v1_adv / (rho[:, None, None] * dtdy * adz[:, None, None] * muv[None, :, None]),
+        state.V
+    )
+    W_adv_for_advection = jnp.where(
+        rhow[:, None, None] * dtdz * ady[None, :, None] * mu[None, :, None] != 0,
+        w1_adv / (rhow[:, None, None] * dtdz * ady[None, :, None] * mu[None, :, None]),
+        state.W
+    )
 
     if forcing.tabs0 is not None:
         qv0 = forcing.qv0 if forcing.qv0 is not None else jnp.zeros_like(forcing.tabs0)
@@ -467,6 +498,52 @@ def step(
                                qn0=forcing.qn0, qp0=forcing.qp0,
                                terraw=metric.get("terraw", None))
         dW_extra = dW_extra + _dW_buo
+
+        # gSAM buoyancy.f90 energy conservation: subtract kinetic-to-thermal
+        # back-coupling term from static energy (t) at each mass level.
+        # Fortran: t(i,j,k) -= 0.5*dtn/cp * buo * w(i,j,k)  (applied to both
+        # adjacent cells for each W-face).  Equivalent in mass-level form:
+        # TABS -= 0.5 * dt / CP * b_cell * W_mass
+        # where b_cell is the cell-centre buoyancy and W_mass = mean of
+        # adjacent W-faces.  CP = 1004.0 J/(kg K) from microphysics.
+        _tabs0_3d = forcing.tabs0[:, None, None] if forcing.tabs0.ndim == 1 else (
+            forcing.tabs0[:, :, None] if forcing.tabs0.ndim == 2 else forcing.tabs0
+        )
+        _qv0_3d = qv0[:, None, None] if qv0.ndim == 1 else (
+            qv0[:, :, None] if qv0.ndim == 2 else qv0
+        )
+        _qn0_buo = forcing.qn0
+        _qp0_buo = forcing.qp0
+        _qn0_3d = (jnp.zeros_like(_tabs0_3d) if _qn0_buo is None else (
+            _qn0_buo[:, None, None] if _qn0_buo.ndim == 1 else (
+                _qn0_buo[:, :, None] if _qn0_buo.ndim == 2 else _qn0_buo)))
+        _qp0_3d = (jnp.zeros_like(_tabs0_3d) if _qp0_buo is None else (
+            _qp0_buo[:, None, None] if _qp0_buo.ndim == 1 else (
+                _qp0_buo[:, :, None] if _qp0_buo.ndim == 2 else _qp0_buo)))
+        _qn_s = _state_for_buoyancy.QC + _state_for_buoyancy.QI
+        _qp_s = _state_for_buoyancy.QR + _state_for_buoyancy.QS + _state_for_buoyancy.QG
+        _tf_s = 1.0 + config.epsv * _qv0_3d - _qn0_3d - _qp0_3d
+        _b_cell = (config.g / _tabs0_3d) * (
+            _tabs0_3d * (
+                config.epsv * (_state_for_buoyancy.QV - _qv0_3d)
+                - (_qn_s - _qn0_3d)
+                - (_qp_s - _qp0_3d)
+            )
+            + (_state_for_buoyancy.TABS - _tabs0_3d) * _tf_s
+        )   # (nz, ny, nx) cell-centre buoyancy
+        if metric.get("terraw", None) is not None:
+            _terraw_3d = metric["terraw"][None, :, :]
+            _b_cell = jnp.where(_terraw_3d > 0.0, _b_cell, 0.0)
+        # W interpolated from W-faces to mass levels
+        _W_mass = 0.5 * (_state_for_buoyancy.W[:-1] + _state_for_buoyancy.W[1:])
+        _TABS_buo_corrected = state.TABS - 0.5 * dt / 1004.0 * _b_cell * _W_mass
+        state = ModelState(
+            U=state.U, V=state.V, W=state.W,
+            TABS=_TABS_buo_corrected, QV=state.QV, QC=state.QC,
+            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+            nstep=state.nstep, time=state.time,
+        )
 
         jax.debug.print(
             "  DIAG [{n:>3}] B_buoy    dW_buo_abs_max={m:.4e}  (dt*max={x:.4f})",
@@ -482,15 +559,6 @@ def step(
     dV_extra = dV_extra + _dV_cor
     dW_extra = dW_extra + _dW_cor
 
-    _dU_sgs = _dV_sgs = _dW_sgs = None
-    if _tk is not None:
-        from jsam.core.physics.sgs import diffuse_momentum
-        _tx = None if surface_fluxes is None else surface_fluxes.tau_x
-        _ty = None if surface_fluxes is None else surface_fluxes.tau_y
-        _dU_sgs, _dV_sgs, _dW_sgs = diffuse_momentum(
-            state.U, state.V, state.W, _tk, metric, tau_x=_tx, tau_y=_ty,
-        )
-
     state, mom_tends_n = advance_momentum(
         state, mom_tends_nm1, mom_tends_nm2, metric, dt,
         dU_extra=dU_extra,
@@ -498,6 +566,9 @@ def step(
         dW_extra=dW_extra,
         dt_prev=dt_prev,
         dt_pprev=dt_pprev,
+        U_adv=U_adv_for_advection,
+        V_adv=V_adv_for_advection,
+        W_adv=W_adv_for_advection,
     )
     jax.debug.print(
         "  DIAG [{n:>3}] C_advmom  W=[{wn:.3f},{wx:.3f}] U=[{un:.2f},{ux:.2f}]",
@@ -505,38 +576,42 @@ def step(
         un=jnp.min(state.U), ux=jnp.max(state.U),
     )
 
-    if _dU_sgs is not None:
-        _nxp1 = state.U.shape[-1]
-        _U_sgs_full = jnp.concatenate([_dU_sgs, _dU_sgs[:, :, :1]], axis=-1) \
-                      if _dU_sgs.shape[-1] == _nxp1 - 1 else _dU_sgs
-        _U_with_sgs = state.U + dt * _U_sgs_full
-        _U_with_sgs = _U_with_sgs.at[:, :, -1].set(_U_with_sgs[:, :, 0])
-        state = ModelState(
-            U   =_U_with_sgs,
-            V   =state.V + dt * _dV_sgs,
-            W   =state.W + dt * _dW_sgs,
-            TABS=state.TABS, QV=state.QV, QC=state.QC,
-            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
-            TKE =state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
-            nstep=state.nstep, time=state.time,
-        )
-        jax.debug.print(
-            "  DIAG [{n:>3}] D_sgsmom  W=[{wn:.3f},{wx:.3f}] dW_sgs_max={s:.4e}",
-            n=state.nstep, wn=jnp.min(state.W), wx=jnp.max(state.W),
-            s=jnp.max(jnp.abs(_dW_sgs)),
-        )
-
     _stage_dump(state, 10, dt, force_nstep=_dump_nstep)
+
+    # Fix 5.11: Compute SGS coefficients AFTER advection, using post-advection velocity.
+    # This matches gSAM's call order: advect_mom() → sgs_proc() → sgs_mom() → adamsA().
+    _tk = None
+    _tkh = None
+    if config.sgs_params is not None:
+        _fluxbt_sgs = None if surface_fluxes is None else surface_fluxes.shf
+        _fluxbq_sgs = None if surface_fluxes is None else surface_fluxes.lhf
+        _tk, _tkh, _tk_max = _sgs_coefs(
+            state, metric, config.sgs_params, dt, tabs0=forcing.tabs0,
+            fluxbt=_fluxbt_sgs, fluxbq=_fluxbq_sgs,
+        )
 
     if _tk is not None:
         _fluxbu = None
         _fluxbv = None
         if surface_fluxes is not None:
             if surface_fluxes.tau_x is not None:
+                # Fix 6.3: gSAM surface.f90 lines 238-244 interpolates fluxbu
+                # from cell centres to U-face positions using terrain weights:
+                #   fluxbu(i,j) = (tmpu(i,j)*terra(i,j,k) + tmpu(i-1,j)*terra(i-1,j,k))
+                #                 / (terra(i,j,k) + terra(i-1,j,k) + 1e-10)
+                # For flat terrain (terra=1 everywhere; IRMA domain has no orography)
+                # this reduces to 0.5*(tmpu(i,j) + tmpu(i-1,j)), which is exactly
+                # the half-cell average below.  Approaches are equivalent; no change needed.
                 _tx = surface_fluxes.tau_x   # (ny, nx) at cell centres
                 _tx_ux = 0.5 * (jnp.roll(_tx, 1, axis=-1) + _tx)
                 _fluxbu = jnp.concatenate([_tx_ux, _tx_ux[:, :1]], axis=-1)
             if surface_fluxes.tau_y is not None:
+                # Fix 6.3: gSAM surface.f90 lines 246-252 interpolates fluxbv
+                # from cell centres to V-face positions using terrain weights:
+                #   fluxbv(i,j) = (tmpv(i,j)*terra(i,j,k) + tmpv(i,j-1)*terra(i,j-1,k))
+                #                 / (terra(i,j,k) + terra(i,j-1,k) + 1e-10)
+                # For flat terrain this is 0.5*(tmpv(i,j) + tmpv(i,j-1)), identical
+                # to the half-cell average via edge-padding below.  No code change needed.
                 _ty = surface_fluxes.tau_y
                 _ty_yp = jnp.pad(_ty, ((1, 0), (0, 0)), mode='edge')
                 _ty_v  = 0.5 * (_ty_yp[:-1, :] + _ty_yp[1:, :])
@@ -550,7 +625,7 @@ def step(
         )
         if config.w_sponge_max > 0.0:
             _W_imp = gsam_w_sponge(
-                _W_imp, metric["z"],
+                _W_imp, metric["zi"],
                 nub=config.w_sponge_nub,
                 taudamp_max=config.w_sponge_max,
                 dtn=_at_ab * dt,
@@ -626,6 +701,7 @@ def step(
         dt_prev=dt_prev, dt_pprev=dt_pprev,
         U_old=_U_old, V_old=_V_old, W_old=_W_old,
         is_f11=(config.micro_params is not None),
+        U_adv=U_adv_for_advection, V_adv=V_adv_for_advection, W_adv=W_adv_for_advection,
     )
 
     # F11 mode: convert advected static energy back to absolute temperature
@@ -677,7 +753,9 @@ def step(
                                  surface=surface_fluxes, tabs0=forcing.tabs0)
 
         from jsam.core.physics.sgs import diffuse_scalar_z_implicit
-        _, _tkh_impl = _sgs_coefs(
+        _fluxbt_sgs = None if surface_fluxes is None else surface_fluxes.shf
+        _fluxbq_sgs = None if surface_fluxes is None else surface_fluxes.lhf
+        _, _tkh_impl, _ = _sgs_coefs(
             state, metric, config.sgs_params, dt, tabs0=forcing.tabs0,
             fluxbt=_fluxbt_sgs, fluxbq=_fluxbq_sgs,
         )
@@ -712,7 +790,6 @@ def step(
     )
 
     _stage_dump(state, 15, dt, force_nstep=_dump_nstep)
-    _stage_dump(state, 16, dt, force_nstep=_dump_nstep)
 
     if config.micro_params is not None:
         _micro_landmask = (
@@ -724,6 +801,43 @@ def step(
                            landmask=_micro_landmask)
 
     _stage_dump(state, 17, dt, force_nstep=_dump_nstep)
+
+    # gSAM upperbound.f90: nudge the two highest scalar levels toward the
+    # reference sounding when dolargescale is active (i.e. tabs_ref is set).
+    # tau_nudging = 3600 s (hardcoded in gSAM), coef = dtn / tau_nudging.
+    # Applied after microphysics, before the sponge (matching gSAM main.f90
+    # call order: upperbound() at stage 16, before stepout/diagnose).
+    if forcing.tabs_ref is not None:
+        _ub_coef = dt / 3600.0
+        _gamaz_ub = metric["gamaz"]  # (nz,)
+        # tabs_ref and qv_ref are (nz,) reference profiles
+        _tabs_ref_ub = forcing.tabs_ref          # tg0
+        _qv_ref_ub   = forcing.qv_ref            # qg0 (may be None)
+        # Nudge top 2 mass levels: indices -2 and -1
+        _TABS_ub = state.TABS
+        _TABS_ub = _TABS_ub.at[-2, :, :].add(
+            -(_TABS_ub[-2, :, :] - _tabs_ref_ub[-2] - _gamaz_ub[-2]) * _ub_coef
+        )
+        _TABS_ub = _TABS_ub.at[-1, :, :].add(
+            -(_TABS_ub[-1, :, :] - _tabs_ref_ub[-1] - _gamaz_ub[-1]) * _ub_coef
+        )
+        _QV_ub = state.QV
+        if _qv_ref_ub is not None:
+            _QV_ub = _QV_ub.at[-2, :, :].add(
+                -(_QV_ub[-2, :, :] - _qv_ref_ub[-2]) * _ub_coef
+            )
+            _QV_ub = _QV_ub.at[-1, :, :].add(
+                -(_QV_ub[-1, :, :] - _qv_ref_ub[-1]) * _ub_coef
+            )
+        state = ModelState(
+            U=state.U, V=state.V, W=state.W,
+            TABS=_TABS_ub, QV=_QV_ub, QC=state.QC,
+            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+            nstep=state.nstep, time=state.time,
+        )
+
+    _stage_dump(state, 16, dt, force_nstep=_dump_nstep)  # upperbound stage
 
     if config.sponge_tau > 0.0 and forcing.tabs0 is not None:
         _z        = metric["z"]

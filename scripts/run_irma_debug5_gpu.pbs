@@ -36,6 +36,8 @@ $PYTHON -u scripts/run_irma.py \
     --nrad            90 \
     --co2             400.0 \
     --o3file          "$O3FILE" \
+    --rad-day0        248.0 \
+    --rad-iyear       1999 \
     --debug-dump-dir  "$DEBUGDIR" \
     --float32 \
     --no-polar-filter \

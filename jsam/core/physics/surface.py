@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from jsam.core.state import ModelState
 from jsam.core.physics.sgs import SurfaceFluxes
-from jsam.core.physics.microphysics import qsatw as _qsatw_micro
+from jsam.core.physics.microphysics import qsatw as _qsatw_micro, qsati as _qsati_micro
 
 
 @dataclass(frozen=True)
@@ -127,12 +127,12 @@ import functools
 def bulk_surface_fluxes(state: ModelState, metric: dict, sst: jax.Array,
                         params: BulkParams = BulkParams()) -> SurfaceFluxes:
     """Compute bulk aerodynamic fluxes (shf, lhf, tau_x, tau_y) from lowest-level state."""
-    rho0  = metric["rho"][0]
     pres0 = metric["pres"][0]
-    dz0   = metric["dz"][0]
     z0    = metric["z"][0]
 
-    pres_sfc = pres0 + rho0 * params.g * dz0 * 0.5
+    # Use the bottom interface pressure (presi[0]) for the surface Exner function,
+    # matching gSAM's use of prespoti(k) = (1000/presi(k))^(Rd/cp).
+    pres_sfc = metric["presi"][0]   # Pa, bottom interface level
 
     exner0   = (pres0    / params.p00) ** (params.Rd / params.cp)
     exner_s  = (pres_sfc / params.p00) ** (params.Rd / params.cp)
@@ -154,7 +154,12 @@ def bulk_surface_fluxes(state: ModelState, metric: dict, sst: jax.Array,
 
     delt  = thbot - ts
 
-    qs_sfc = params.salt_factor * _qsatw_micro(sst_safe, pres_sfc / 100.0)
+    pres_sfc_mb = pres_sfc / 100.0   # Pa → hPa (mb) for saturation functions
+    qs_water = params.salt_factor * _qsatw_micro(sst_safe, pres_sfc_mb)
+    qs_ice   = _qsati_micro(sst_safe, pres_sfc_mb)
+    # gSAM surface.f90 line 70-76: use ice saturation when SST < 271 K (sea ice),
+    # liquid saturation with salt factor otherwise.
+    qs_sfc = jnp.where(sst_safe < 271.0, qs_ice, qs_water)
     delq   = QV0 - qs_sfc
 
     rdn, rhn, ren = _neutral_coeffs(vmag, delt)

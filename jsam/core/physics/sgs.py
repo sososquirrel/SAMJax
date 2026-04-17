@@ -126,6 +126,20 @@ def shear_prod(U: jax.Array, V: jax.Array, W: jax.Array, metric: dict) -> jax.Ar
         (dvdz_bel_jp1 + dwdy_below)**2 + (dvdz_bel_j  + dwdy_below)**2
     )
 
+    # Fix 2.8: surface boundary correction for uw/vw cross-terms.
+    # gSAM shear_prod3D.f90:90-95: at k=0 (surface level), only the upward
+    # (above) interface exists; the downward (below) terms are absent.
+    # Interior: 0.25*(above_ip1² + above_i² + below_ip1² + below_i²)
+    # Surface:  0.5 *(above_ip1² + above_i²)   [coefficient 0.5, not 0.25]
+    cross_uw_sfc = 0.5 * (
+        (dudz_ab_ip1[0]  + dwdx_above[0])**2 + (dudz_ab_i[0]   + dwdx_above[0])**2
+    )
+    cross_vw_sfc = 0.5 * (
+        (dvdz_ab_jp1[0]  + dwdy_above[0])**2 + (dvdz_ab_j[0]   + dwdy_above[0])**2
+    )
+    cross_uw = cross_uw.at[0].set(cross_uw_sfc)
+    cross_vw = cross_vw.at[0].set(cross_vw_sfc)
+
     return diag + cross_uv + cross_uw + cross_vw
 
 
@@ -231,10 +245,12 @@ def _compute_buoy_sgs(
              + (1.0 - omn) * qsati(tabs_if_sat, presi_if))
     bbb_s = (1.0 + EPSV * qsatt + qsatt - qtot_if - qp_if
              + 1.61 * tabs_if_sat * dqsat) / (1.0 + lstarn * dqsat)
-    tabs_k = tabs_if_sat
+    # Fix 2.7: gSAM tke_full.f90:225-226 uses tabs(i,j,k) (cell-centre of lower
+    # cell kb) for precipitation drag terms — not the face-averaged tabs_if_sat.
+    tabs_k = TABS[kb]
     buoy_sat = betdz * (
         bbb_s * (t_se[kc] - t_se[kb])
-        + (bbb_s * lstarn - (1.0 + lstarn * dqsat) * tabs_if_sat)
+        + (bbb_s * lstarn - (1.0 + lstarn * dqsat) * tabs_k)
             * (qtot[kc] - qtot[kb])
         + (bbb_s * FAC_COND - (1.0 + FAC_COND * dqsat) * tabs_k)
             * (qpl[kc] - qpl[kb])
@@ -243,14 +259,48 @@ def _compute_buoy_sgs(
 
     buoy_face = jnp.where(is_sat, buoy_sat, buoy_unsat)
 
-    # D14 fix: gSAM tke_full.f90:96-118 — at the surface, buoy_sgs is derived
-    # from surface heat/moisture fluxes rather than finite-differenced profiles.
-    #   buoy_sgs(k=1) = bet(1) * (fluxbt + EPSV*tabs0(1)*fluxbq)
+    # Fix 2.1 + 2.6: gSAM tke_full.f90:96-118 — at the surface, buoy_sgs is
+    # derived from surface fluxes using the nonlinear Smagorinsky inversion.
+    # gSAM uses SST (sstxy) not the reference temperature tabs0[0].
+    #   a_prod_bu = bet(k) * fluxbt + bet(k) * epsv * (t00+sst) * fluxbq
+    # (bbb=1+epsv*qv_sfc multiplied in gSAM but dropped here; consistent with
+    #  gSAM comment that only works for positive flux.)
+    #   if a_prod_bu > 0: buoy_below = -(a_prod_bu^2 * Ce / (Ck^3 * Pr * grd^4))^(1/3)
+    #   else:             buoy_below = 0
     if fluxbt is not None:
+        _Ck_sfc = 0.1
+        _Cs_sfc = 0.19
+        _Pr_sfc = 1.0
+        _Ce_sfc = _Ck_sfc**3 / _Cs_sfc**4
         _bet0 = g / tabs0[0]
-        _fbt = fluxbt   # (ny,nx)  K·m/s
         _fbq = fluxbq if fluxbq is not None else jnp.zeros_like(fluxbt)
-        _buoy_sfc = _bet0 * (_fbt + EPSV * tabs0[0] * _fbq)   # (ny,nx)
+        # Fix 2.6: use local SST if available; falls back to tabs0[0]
+        _sst = metric.get("sst", None)
+        _sst_val = _sst if _sst is not None else tabs0[0]
+        _a_prod_bu = _bet0 * (fluxbt + EPSV * _sst_val * _fbq)   # (ny,nx)
+        # grd at surface level k=0: coef(j) = min(delta_max, dx*mu) * min(delta_max, dy*ady)
+        # dz_ref*adz(k=0) ≈ dz[0] (adz[0] = 1 in flat terrain with uniform vertical grid)
+        _dz_sfc = dz_ref   # dz_ref = metric["dz_ref"] already in scope (JAX array)
+        _dx_sfc = metric["dx_lon"]
+        _cos_lat_sfc = metric.get("cos_lat", None)
+        _dy_sfc = metric.get("dy_lat", None)
+        if _cos_lat_sfc is not None:
+            _dx_eff_sfc = jnp.minimum(1000.0, _dx_sfc * _cos_lat_sfc)   # (ny,)
+        else:
+            _dx_eff_sfc = jnp.minimum(1000.0, float(_dx_sfc)) * jnp.ones((1,))
+        if _dy_sfc is not None:
+            _dy_eff_sfc = jnp.minimum(1000.0, _dy_sfc)   # (ny,)
+        else:
+            _dy_eff_sfc = jnp.minimum(1000.0, float(metric.get("dy_lat_ref", _dx_sfc))) * jnp.ones((1,))
+        _coef_sfc = _dx_eff_sfc * _dy_eff_sfc   # (ny,)
+        _grd_sfc = (_dz_sfc * _coef_sfc) ** 0.33333   # (ny,)
+        # nonlinear inversion (tke_full.f90:114):
+        #   buoy_sgs_below = -(a_prod_bu^2 * Ce / (Ck^3 * Pr * grd^4))^(1/3)
+        _grd4 = (_grd_sfc[:, None]) ** 4   # (ny, 1) — broadcast over nx
+        _buoy_unstable = -(
+            (_a_prod_bu**2 * _Ce_sfc / (_Ck_sfc**3 * _Pr_sfc * _grd4))**0.3333
+        )
+        _buoy_sfc = jnp.where(_a_prod_bu > 0.0, _buoy_unstable, 0.0)
         buoy_face = buoy_face.at[0].set(_buoy_sfc)
 
     return jnp.concatenate(
@@ -375,12 +425,16 @@ def diffuse_scalar(
     metric: dict,
     fluxb:  jax.Array | None = None,   # (ny, nx) surface flux (kg/m² s or K·m/s)
     fluxt:  jax.Array | None = None,   # (ny, nx) top flux
+    tk_max: jax.Array | None = None,   # Fix 2.5: (nz,ny,1) per-face stability cap
 ) -> jax.Array:
     """
     Explicit SGS diffusion tendency d(field)/dt (same units as field / s).
     Horizontal: second-order centred with imu² metric in x.
     Vertical:   anelastic flux form with rho/rhow weighting.
     BCs: zero-flux at y-walls; fluxb/fluxt at z-walls (default 0).
+
+    Fix 2.5: clamp tkh locally at each face before flux computation
+    (matches gSAM per-face tkmax clamping in diffuse_scalar3D.f90:51-52, 65-66, 106).
     """
     dx  = metric["dx_lon"]
     dy  = metric["dy_lat"]   # (ny,) per-row
@@ -401,29 +455,57 @@ def diffuse_scalar(
     else:
         imu2 = 1.0
     rdx2_j   = rdx2 * imu2                                                # (1, ny, 1) or scalar
+    # Fix 2.5: interpolate tkh to x-face, then cap locally (gSAM lines 51-52)
     tkh_fx   = 0.5 * (tkh_xp[:, :, :-1] + tkh_xp[:, :, 1:])              # (nz,ny,nx+1) x-faces
+    if tk_max is not None:
+        # Cap at x-faces (shape: nz, ny, nx+1) - tk_max is (nz, ny, 1)
+        tkh_fx = jnp.minimum(tkh_fx, tk_max)
     flx_x    = -rdx2_j * tkh_fx * (field_xp[:, :, 1:] - field_xp[:, :, :-1])  # (nz,ny,nx+1)
     dfdt     = -(flx_x[:, :, 1:] - flx_x[:, :, :-1])                     # (nz,ny,nx)
 
-    # ---- Horizontal y-direction (non-uniform) ----
+    # ---- Horizontal y-direction (non-uniform, with spherical metrics) ----
+    # Fix 2.2: gSAM diffuse_scalar3D.f90:63-64 applies spherical corrections:
+    #   flux: rdy5 = rdy2 / adyv(jc) * muv(jc)  → flux *= muv[face] / adyv[face]
+    #   div:  rdy5 = 1/(ady(j)*mu(j))            → div  /= mu[cell]
+    # Since dy_v_full = adyv * dy_ref and dy = ady * dy_ref, the combined formula is:
+    #   flux = -muv[face] / (dy_v_full * dy_ref) * tkh * df
+    #   dfdt -= (flux_n - flux_s) / (dy * mu)
     # Pad field and tkh in y with edge (Neumann → zero flux at walls).
-    # Non-uniform form: flux at v-face uses dy_v = 0.5*(dy[j-1]+dy[j]);
-    # divergence at mass cell uses dy_row[j].  On a uniform grid both
-    # equal dy so this collapses to rdy² = 1/dy².
     field_yp = jnp.pad(field, ((0, 0), (1, 1), (0, 0)), mode='edge')      # (nz,ny+2,nx)
     tkh_yp   = jnp.pad(tkh,   ((0, 0), (1, 1), (0, 0)), mode='edge')
     dy_v_int = 0.5 * (dy[:-1] + dy[1:])                                   # (ny-1,)
     # v-face spacings at every face (ny+1):  at boundaries duplicate edge.
     dy_v_full = jnp.concatenate([dy_v_int[:1], dy_v_int, dy_v_int[-1:]])  # (ny+1,)
-    inv_dy_v  = (1.0 / dy_v_full)[None, :, None]                          # (1, ny+1, 1)
-    inv_dy_r  = (1.0 / dy)[None, :, None]                                 # (1, ny, 1)
+    # Fix 2.2: muv factor at each y-face (cos_v shape ny+1)
+    cos_lat_s = metric.get("cos_lat", None)
+    cos_v_s   = metric.get("cos_v", None)
+    if cos_v_s is not None:
+        muv_face = cos_v_s[None, :, None]                                  # (1, ny+1, 1)
+    else:
+        muv_face = 1.0
+    if cos_lat_s is not None:
+        mu_cell = cos_lat_s[None, :, None]                                 # (1, ny, 1)
+    else:
+        mu_cell = 1.0
+    # Fix 2.5: interpolate tkh to y-face, then cap locally (gSAM lines 65-66)
     tkh_fy   = 0.5 * (tkh_yp[:, :-1, :] + tkh_yp[:, 1:, :])              # (nz,ny+1,nx) y-faces
-    flx_y    = -inv_dy_v * tkh_fy * (field_yp[:, 1:, :] - field_yp[:, :-1, :])   # (nz,ny+1,nx)
-    dfdt     = dfdt - inv_dy_r * (flx_y[:, 1:, :] - flx_y[:, :-1, :])
+    if tk_max is not None:
+        # Interpolate tk_max to y-faces for proper shape matching (nz, ny+1, 1)
+        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tkh_fy = jnp.minimum(tkh_fy, tk_max_yface)
+    # rdy_ref: gSAM rdy2 = 1/dy_ref^2; combined with adyv/muv factor the flux is:
+    #   flux = -muv[face] / (dy_v_full[face] * dy_ref) * tkh * df
+    dy_ref_s  = metric["dy_lat_ref"]                                       # scalar
+    flx_y    = (-muv_face / (dy_v_full[None, :, None] * dy_ref_s)
+                * tkh_fy * (field_yp[:, 1:, :] - field_yp[:, :-1, :]))    # (nz,ny+1,nx)
+    dfdt     = dfdt - (flx_y[:, 1:, :] - flx_y[:, :-1, :]) / (dy[None, :, None] * mu_cell)
 
     # ---- Vertical — anelastic: d(rhow*tkh*dfield/dz)/(rho*dz) ----
     # Interior fluxes at w-faces 1..nz-1
+    # Fix 2.5: interpolate tkh to z-face, then cap locally (gSAM line 106)
     tkh_fz    = 0.5 * (tkh[:-1, :, :] + tkh[1:, :, :])                    # (nz-1,ny,nx)
+    if tk_max is not None:
+        tkh_fz = jnp.minimum(tkh_fz, tk_max[:-1, :, :])                   # cap interior z-faces only
     dz_face   = dzw_[1:-1][:, None, None]                                  # (nz-1,1,1)
     rhow_int  = rhow[1:-1][:, None, None]                                  # (nz-1,1,1)
     flx_z_int = (-rhow_int * tkh_fz
@@ -460,6 +542,7 @@ def diffuse_momentum(
     metric: dict,
     tau_x: jax.Array | None = None,  # (ny, nx) surface x-stress (m²/s²)
     tau_y: jax.Array | None = None,  # (ny, nx) surface y-stress (m²/s²)
+    tk_max: jax.Array | None = None, # Fix 2.5: (nz,ny,1) per-face stability cap
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Returns (dU/dt, dV/dt, dW/dt) tendencies from SGS diffusion (s⁻²).
@@ -470,6 +553,9 @@ def diffuse_momentum(
     tau_x, tau_y: surface (bottom) momentum flux (m²/s²), positive upward.
     They are interpolated from cell-centre positions to U/V staggered faces.
     Default (None) = zero-flux bottom BC.
+
+    Fix 2.5: clamp tk locally at each face before flux computation
+    (matches gSAM per-face tkmax clamping in diffuse_mom3D.f90:42, 45, 48, 71, 74, 77, 119, 122, 125).
     """
     dx  = metric["dx_lon"]
     # Gap 8 (2026-04-12): dy_lat is now per-row.  SGS momentum diffusion is
@@ -503,7 +589,48 @@ def diffuse_momentum(
     rdx2u = rdx2_base * imu2                         # for U grid (ny rows)
     rdx2v = rdx2_base * imuv2                        # for V grid (ny+1 rows) — match Fortran imuv(j)
     rdx2w = rdx2_base * imu2                         # for W grid (ny rows)
-    rdy2  = 1.0 / dy_ref**2
+
+    # Fix 2.3: spherical y-metrics for momentum diffusion.
+    # gSAM diffuse_mom3D.f90:65-67:
+    #   rdy2u = rdy2/adyv(jc)*muv(jc)  (at face between cells j and j+1)
+    #   rdy2v = rdy2/ady(j)*mu(j)       (at mass cell j, for V-flux between V-rows j and j+1)
+    #   rdy2w = rdy2/adyv(jc)*muv(jc)
+    # gSAM divergence (lines 91-93):
+    #   rdy2u = 1/(ady(j)*mu(j))        (at mass cell j)
+    #   rdy2v = 1/(adyv(j)*muv(j))      (at V-face j, between cells j-1 and j)
+    #   rdy2w = 1/(ady(j)*mu(j))
+    ady_m  = metric.get("ady", None)   # (ny,) mass-cell spacing ratios
+    if ady_m is not None and cos_lat is not None:
+        # adyv (ny+1,): V-face spacing ratios; interior = 0.5*(ady[j]+ady[j+1])
+        adyv_int_m = 0.5 * (ady_m[:-1] + ady_m[1:])                      # (ny-1,)
+        adyv_m = jnp.concatenate([ady_m[:1], adyv_int_m, ady_m[-1:]])    # (ny+1,)
+        # muv at V-faces (ny+1,) — use cos_v if available, else interpolate
+        if cos_v_metric is not None:
+            muv_m = cos_v_metric                                           # (ny+1,)
+        else:
+            cos_v_int = 0.5 * (cos_lat[:-1] + cos_lat[1:])
+            muv_m = jnp.concatenate([cos_lat[:1], cos_v_int, cos_lat[-1:]])
+        # dy_v_m (ny+1,): V-face physical spacings in metres = adyv * dy_ref
+        dy_v_m = adyv_m * dy_ref                                           # (ny+1,)
+        # dy_row_m (ny,): mass-cell physical spacings in metres = ady * dy_ref
+        dy_row_m = ady_m * dy_ref                                          # (ny,)
+        # U/W flux factor at V-face: muv[face] / (dy_v[face] * dy_ref)
+        rdy_uw_flux = (muv_m / (dy_v_m * dy_ref))[None, :, None]         # (1, ny+1, 1)
+        # U/W divergence factor at mass cell: 1 / (dy_row[j] * mu[j])
+        rdy_uw_div  = (1.0 / (dy_row_m * cos_lat))[None, :, None]        # (1, ny, 1)
+        # V flux factor at mass cell j (between V-rows j and j+1):
+        #   rdy2v = rdy2/ady(j)*mu(j) = mu(j) / (dy_row(j) * dy_ref)
+        rdy_v_flux  = (cos_lat / (dy_row_m * dy_ref))[None, :, None]     # (1, ny, 1)
+        # V divergence factor at V-face j (between cells j-1 and j):
+        #   1 / (adyv(j) * muv(j))
+        rdy_v_div   = (1.0 / (adyv_m * muv_m))[None, :, None]            # (1, ny+1, 1)
+    else:
+        # Fallback: Cartesian (no spherical corrections)
+        rdy2_scalar = 1.0 / dy_ref**2
+        rdy_uw_flux = rdy2_scalar
+        rdy_uw_div  = 1.0 / dy_ref
+        rdy_v_flux  = rdy2_scalar
+        rdy_v_div   = 1.0 / dy_ref
 
     # Helper: interpolate cell-centre tk to U x-faces (periodic in x)
     # tk_Ux[k,j,i] ≈ mean of cell tk to the left and right of U-face i
@@ -534,21 +661,35 @@ def diffuse_momentum(
     # ======== dU/dt: shape (nz, ny, nx+1) ========
 
     # x: flux between adjacent U-faces at cell centres (periodic)
-    F_ux = -rdx2u * tk * (U[:, :, 1:] - U[:, :, :-1])                    # (nz,ny,nx)  F[i] at cell i
+    # Fix 2.5: cap tk locally at x-flux computation (gSAM line 42)
+    tk_x = tk
+    if tk_max is not None:
+        # Cap at x-faces (shape: nz, ny, nx+1) - tk_max is (nz, ny, 1)
+        tk_x = jnp.minimum(tk_x, tk_max)
+    F_ux = -rdx2u * tk_x * (U[:, :, 1:] - U[:, :, :-1])                    # (nz,ny,nx)  F[i] at cell i
     dUdt = jnp.roll(F_ux, 1, axis=2) - F_ux                               # (nz,ny,nx)  = F[i-1]-F[i]
     dUdt = jnp.concatenate([dUdt, dUdt[:, :, :1]], axis=2)                # (nz,ny,nx+1) periodic
 
     # y: flux at y-interfaces between U-face rows (Neumann at poles)
+    # Fix 2.3: flux uses rdy2u=muv[face]/(dy_v[face]*dy_ref); div uses 1/(dy_row*mu)
     U_yp = jnp.pad(U, ((0, 0), (1, 1), (0, 0)), mode='edge')              # (nz,ny+2,nx+1)
     tkU_yp = jnp.pad(tk_at_U, ((0, 0), (1, 1), (0, 0)), mode='edge')     # (nz,ny+2,nx+1)
-    fy_U = (-rdy2 * 0.5 * (tkU_yp[:, :-1, :] + tkU_yp[:, 1:, :])
+    # Fix 2.5: cap tk_at_U at y-face before computing flux (gSAM line 71)
+    tkU_y_face = 0.5 * (tkU_yp[:, :-1, :] + tkU_yp[:, 1:, :])             # (nz,ny+1,nx+1)
+    if tk_max is not None:
+        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tkU_y_face = jnp.minimum(tkU_y_face, tk_max_yface)
+    fy_U = (-rdy_uw_flux * tkU_y_face
             * (U_yp[:, 1:, :] - U_yp[:, :-1, :]))                        # (nz,ny+1,nx+1)
-    dUdt = dUdt - (fy_U[:, 1:, :] - fy_U[:, :-1, :])
+    dUdt = dUdt - rdy_uw_div * (fy_U[:, 1:, :] - fy_U[:, :-1, :])
 
     # z: anelastic flux between U levels (zero-flux at top/bottom)
     dzw_int  = dzw_[1:-1][:, None, None]                                  # (nz-1,1,1)
     rhow_int = rhow[1:-1][:, None, None]                                   # (nz-1,1,1)
     tkUz = 0.5 * (tk_at_U[:-1, :, :] + tk_at_U[1:, :, :])                # (nz-1,ny,nx+1) at interior w-faces
+    # Fix 2.5: cap tkUz at z-face before computing flux (gSAM line 119)
+    if tk_max is not None:
+        tkUz = jnp.minimum(tkUz, tk_max[:-1, :, :])
     fz_Uint = -rhow_int * tkUz * (U[1:, :, :] - U[:-1, :, :]) / dzw_int  # (nz-1,ny,nx+1)
     # Surface (bottom) flux for U: interpolate tau_x from cell centres to U x-faces
     if tau_x is None:
@@ -573,7 +714,14 @@ def diffuse_momentum(
     tkV_xp = jnp.concatenate(
         [tk_at_V[:, :, -1:], tk_at_V, tk_at_V[:, :, :1]], axis=2
     )                                                                      # (nz,ny+1,nx+2)
-    fx_V = (-rdx2v * 0.5 * (tkV_xp[:, :, :-1] + tkV_xp[:, :, 1:])
+    # Fix 2.5: cap tk_at_V at x-face before computing flux (gSAM line 45)
+    tkV_x_face = 0.5 * (tkV_xp[:, :, :-1] + tkV_xp[:, :, 1:])             # (nz,ny+1,nx+1)
+    if tk_max is not None:
+        # Cap at x-faces (shape: nz, ny+1, nx+1) - tk_max is (nz, ny, 1)
+        # Interpolate tk_max to y-faces for proper broadcasting
+        tk_max_yface_x = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tkV_x_face = jnp.minimum(tkV_x_face, tk_max_yface_x)
+    fx_V = (-rdx2v * tkV_x_face
             * (V_xp[:, :, 1:] - V_xp[:, :, :-1]))                        # (nz,ny+1,nx+1)
     dVdt = -(fx_V[:, :, 1:] - fx_V[:, :, :-1])                           # (nz,ny+1,nx)
 
@@ -588,12 +736,28 @@ def diffuse_momentum(
         [-V[:, 1:2, :], V, -V[:, -2:-1, :]], axis=1,
     )                                                                      # (nz,ny+3,nx)
     tkV_yp = jnp.pad(tk_at_V, ((0, 0), (1, 1), (0, 0)), mode='edge')     # (nz,ny+3,nx)
-    fy_V = (-rdy2 * 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])
+    # Fix 2.3: V y-flux uses rdy2v=mu[cell]/(dy_row[cell]*dy_ref); div uses 1/(adyv[face]*muv[face])
+    # V_yp has ny+3 rows; fy_V flux at ny+2 faces, face j connects V_yp[j] and V_yp[j+1].
+    # Face j=1..ny connects V[j-1] and V[j], so the flux factor is at mass cell j-1.
+    # rdy_v_flux shape (1,ny,1): pad to (1,ny+2,1) with edge so padded[j] = rdy_v_flux[j-1 clipped].
+    if hasattr(rdy_v_flux, 'shape'):
+        rdy_v_flux_padded = jnp.pad(rdy_v_flux, ((0, 0), (1, 1), (0, 0)), mode='edge')  # (1,ny+2,1)
+    else:
+        rdy_v_flux_padded = rdy_v_flux                                     # scalar fallback
+    # Fix 2.5: cap tk_at_V at y-face before computing flux (gSAM line 74)
+    tkV_y_face = 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])             # (nz,ny+2,nx)
+    if tk_max is not None:
+        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tkV_y_face = jnp.minimum(tkV_y_face, tk_max_yface)
+    fy_V = (-rdy_v_flux_padded * tkV_y_face
             * (V_yp[:, 1:, :] - V_yp[:, :-1, :]))                        # (nz,ny+2,nx)
-    dVdt = dVdt - (fy_V[:, 1:, :] - fy_V[:, :-1, :])                     # (nz,ny+1,nx)
+    dVdt = dVdt - rdy_v_div * (fy_V[:, 1:, :] - fy_V[:, :-1, :])         # (nz,ny+1,nx)
 
     # z: anelastic
     tkVz = 0.5 * (tk_at_V[:-1, :, :] + tk_at_V[1:, :, :])                # (nz-1,ny+1,nx)
+    # Fix 2.5: cap tkVz at z-face before computing flux (gSAM line 122)
+    if tk_max is not None:
+        tkVz = jnp.minimum(tkVz, tk_max[:-1, :, :])
     fz_Vint = -rhow_int * tkVz * (V[1:, :, :] - V[:-1, :, :]) / dzw_int  # (nz-1,ny+1,nx)
     # Surface (bottom) flux for V: interpolate tau_y from cell centres to V y-faces
     if tau_y is None:
@@ -620,22 +784,39 @@ def diffuse_momentum(
     tkW_xp = jnp.concatenate(
         [tk_at_W[:, :, -1:], tk_at_W, tk_at_W[:, :, :1]], axis=2
     )                                                                      # (nz+1,ny,nx+2)
-    fx_W = (-rdx2w * 0.5 * (tkW_xp[:, :, :-1] + tkW_xp[:, :, 1:])
+    # Fix 2.5: cap tk_at_W at x-face before computing flux (gSAM line 48)
+    tkW_x_face = 0.5 * (tkW_xp[:, :, :-1] + tkW_xp[:, :, 1:])             # (nz+1,ny,nx+1)
+    if tk_max is not None:
+        # Cap at x-faces (shape: nz+1, ny, nx+1) - tk_max is (nz, ny, 1)
+        # Need to extend tk_max to nz+1 dimension first
+        tk_max_extended = jnp.concatenate([tk_max, tk_max[-1:, :, :]], axis=0)
+        tkW_x_face = jnp.minimum(tkW_x_face, tk_max_extended)
+    fx_W = (-rdx2w * tkW_x_face
             * (W_xp[:, :, 1:] - W_xp[:, :, :-1]))                        # (nz+1,ny,nx+1)
     dWdt = -(fx_W[:, :, 1:] - fx_W[:, :, :-1])                           # (nz+1,ny,nx)
 
     # y: Neumann pad
+    # Fix 2.3: W y-flux uses rdy2w=muv[face]/(dy_v[face]*dy_ref); div uses 1/(dy_row*mu)
     W_yp  = jnp.pad(W, ((0, 0), (1, 1), (0, 0)), mode='edge')             # (nz+1,ny+2,nx)
     tkW_yp = jnp.pad(tk_at_W, ((0, 0), (1, 1), (0, 0)), mode='edge')     # (nz+1,ny+2,nx)
-    fy_W = (-rdy2 * 0.5 * (tkW_yp[:, :-1, :] + tkW_yp[:, 1:, :])
+    # Fix 2.5: cap tk_at_W at y-face before computing flux (gSAM line 77)
+    tkW_y_face = 0.5 * (tkW_yp[:, :-1, :] + tkW_yp[:, 1:, :])             # (nz+1,ny+1,nx)
+    if tk_max is not None:
+        tk_max_yface = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tkW_y_face = jnp.minimum(tkW_y_face, tk_max_yface)
+    fy_W = (-rdy_uw_flux * tkW_y_face
             * (W_yp[:, 1:, :] - W_yp[:, :-1, :]))                        # (nz+1,ny+1,nx)
-    dWdt = dWdt - (fy_W[:, 1:, :] - fy_W[:, :-1, :])
+    dWdt = dWdt - rdy_uw_div * (fy_W[:, 1:, :] - fy_W[:, :-1, :])
 
     # z: second-difference of W at w-face positions (W is already at w-faces)
-    # Flux between W[k] and W[k+1]: use tk_at_W averaged across those two faces
+    # gSAM diffuse_mom3D.f90:124 uses tkz=tk(i,j,k) directly (cell-centre),
+    # not a face average.  Flux at face between W[k] and W[k+1] uses tk[k].
     dW_dz = W[1:, :, :] - W[:-1, :, :]                                    # (nz,ny,nx)
-    tk_Wz2 = 0.5 * (tk_at_W[:-1, :, :] + tk_at_W[1:, :, :])              # (nz,ny,nx)
-    fz_Wint = -tk_Wz2 * dW_dz / dz[:, None, None]                         # (nz,ny,nx)
+    # Fix 2.5: cap tk at z-flux computation (gSAM line 125)
+    tk_z = tk
+    if tk_max is not None:
+        tk_z = jnp.minimum(tk_z, tk_max)
+    fz_Wint = -tk_z * dW_dz / dz[:, None, None]                              # (nz,ny,nx)
     # D24 fix: gSAM diffuse_mom3D.f90:137 zeros fwz(i,j,2) — the flux at the
     # lowest interior W face (between W[1] and W[2], 0-indexed = fz_Wint[1]).
     fz_Wint = fz_Wint.at[1].set(0.0)
@@ -678,13 +859,39 @@ def diffuse_momentum_horiz(
 
     # C8 fix: apply imu(j)^2 = 1/cos(lat)^2 metric to x-direction
     cos_lat = metric.get("cos_lat", None)
+    cos_v_h = metric.get("cos_v", None)
     rdx2_base = (1.0 / dx)**2
     if cos_lat is not None:
         imu2 = (1.0 / cos_lat[None, :, None]) ** 2   # (1, ny, 1)
     else:
         imu2 = 1.0
-    rdx2 = rdx2_base * imu2
-    rdy2 = 1.0 / dy_ref**2
+    if cos_v_h is not None:
+        imuv2_h = (1.0 / cos_v_h[None, :, None]) ** 2   # (1, ny+1, 1)
+    else:
+        imuv2_h = imu2
+    rdx2   = rdx2_base * imu2
+    rdx2_v = rdx2_base * imuv2_h   # for V x-diffusion
+
+    # Fix 2.3: spherical y-metrics (same as diffuse_momentum)
+    ady_h = metric.get("ady", None)
+    if ady_h is not None and cos_lat is not None:
+        adyv_int_h = 0.5 * (ady_h[:-1] + ady_h[1:])
+        adyv_h = jnp.concatenate([ady_h[:1], adyv_int_h, ady_h[-1:]])
+        muv_h  = cos_v_h if cos_v_h is not None else jnp.concatenate(
+            [cos_lat[:1], 0.5 * (cos_lat[:-1] + cos_lat[1:]), cos_lat[-1:]]
+        )
+        dy_v_h    = adyv_h * dy_ref
+        dy_row_h  = ady_h * dy_ref
+        rdy_uw_flux_h = (muv_h / (dy_v_h * dy_ref))[None, :, None]
+        rdy_uw_div_h  = (1.0 / (dy_row_h * cos_lat))[None, :, None]
+        rdy_v_flux_h  = (cos_lat / (dy_row_h * dy_ref))[None, :, None]
+        rdy_v_div_h   = (1.0 / (adyv_h * muv_h))[None, :, None]
+    else:
+        rdy2_s = 1.0 / dy_ref**2
+        rdy_uw_flux_h = rdy2_s
+        rdy_uw_div_h  = 1.0 / dy_ref
+        rdy_v_flux_h  = rdy2_s
+        rdy_v_div_h   = 1.0 / dy_ref
 
     # Interpolate tk to staggered positions
     tk_Ux = 0.5 * (jnp.roll(tk, 1, axis=2) + tk)
@@ -702,28 +909,34 @@ def diffuse_momentum_horiz(
     dUdt = jnp.roll(F_ux, 1, axis=2) - F_ux
     dUdt = jnp.concatenate([dUdt, dUdt[:, :, :1]], axis=2)
 
+    # Fix 2.3: U y-flux uses muv[face]/(dy_v[face]*dy_ref); div uses 1/(dy_row*mu)
     U_yp = jnp.pad(U, ((0, 0), (1, 1), (0, 0)), mode='edge')
     tkU_yp = jnp.pad(tk_at_U, ((0, 0), (1, 1), (0, 0)), mode='edge')
-    fy_U = (-rdy2 * 0.5 * (tkU_yp[:, :-1, :] + tkU_yp[:, 1:, :])
+    fy_U = (-rdy_uw_flux_h * 0.5 * (tkU_yp[:, :-1, :] + tkU_yp[:, 1:, :])
             * (U_yp[:, 1:, :] - U_yp[:, :-1, :]))
-    dUdt = dUdt - (fy_U[:, 1:, :] - fy_U[:, :-1, :])
+    dUdt = dUdt - rdy_uw_div_h * (fy_U[:, 1:, :] - fy_U[:, :-1, :])
 
     # ======== dV/dt (horiz only) ========
     V_xp = jnp.concatenate([V[:, :, -1:], V, V[:, :, :1]], axis=2)
     tkV_xp = jnp.concatenate(
         [tk_at_V[:, :, -1:], tk_at_V, tk_at_V[:, :, :1]], axis=2)
-    fx_V = (-rdx2 * 0.5 * (tkV_xp[:, :, :-1] + tkV_xp[:, :, 1:])
+    fx_V = (-rdx2_v * 0.5 * (tkV_xp[:, :, :-1] + tkV_xp[:, :, 1:])
             * (V_xp[:, :, 1:] - V_xp[:, :, :-1]))
     dVdt = -(fx_V[:, :, 1:] - fx_V[:, :, :-1])
 
     # Antisymmetric wall mirror for V (gSAM boundaries.f90:101-129).
+    # Fix 2.3: V y-flux uses mu[cell]/(dy_row[cell]*dy_ref); div uses 1/(adyv[face]*muv[face])
     V_yp = jnp.concatenate(
         [-V[:, 1:2, :], V, -V[:, -2:-1, :]], axis=1,
     )
     tkV_yp = jnp.pad(tk_at_V, ((0, 0), (1, 1), (0, 0)), mode='edge')
-    fy_V = (-rdy2 * 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])
+    if hasattr(rdy_v_flux_h, 'shape'):
+        rdy_v_flux_h_padded = jnp.pad(rdy_v_flux_h, ((0, 0), (1, 1), (0, 0)), mode='edge')
+    else:
+        rdy_v_flux_h_padded = rdy_v_flux_h
+    fy_V = (-rdy_v_flux_h_padded * 0.5 * (tkV_yp[:, :-1, :] + tkV_yp[:, 1:, :])
             * (V_yp[:, 1:, :] - V_yp[:, :-1, :]))
-    dVdt = dVdt - (fy_V[:, 1:, :] - fy_V[:, :-1, :])
+    dVdt = dVdt - rdy_v_div_h * (fy_V[:, 1:, :] - fy_V[:, :-1, :])
     dVdt = dVdt.at[:, 0, :].set(0.0).at[:, -1, :].set(0.0)
 
     # ======== dW/dt (horiz only) ========
@@ -734,11 +947,12 @@ def diffuse_momentum_horiz(
             * (W_xp[:, :, 1:] - W_xp[:, :, :-1]))
     dWdt = -(fx_W[:, :, 1:] - fx_W[:, :, :-1])
 
+    # Fix 2.3: W y-flux uses muv[face]/(dy_v[face]*dy_ref); div uses 1/(dy_row*mu)
     W_yp  = jnp.pad(W, ((0, 0), (1, 1), (0, 0)), mode='edge')
     tkW_yp = jnp.pad(tk_at_W, ((0, 0), (1, 1), (0, 0)), mode='edge')
-    fy_W = (-rdy2 * 0.5 * (tkW_yp[:, :-1, :] + tkW_yp[:, 1:, :])
+    fy_W = (-rdy_uw_flux_h * 0.5 * (tkW_yp[:, :-1, :] + tkW_yp[:, 1:, :])
             * (W_yp[:, 1:, :] - W_yp[:, :-1, :]))
-    dWdt = dWdt - (fy_W[:, 1:, :] - fy_W[:, :-1, :])
+    dWdt = dWdt - rdy_uw_div_h * (fy_W[:, 1:, :] - fy_W[:, :-1, :])
 
     dWdt = dWdt.at[0, :, :].set(0.0).at[-1, :, :].set(0.0)
 
@@ -1107,10 +1321,9 @@ def sgs_proc(
     def2       = shear_prod(U, V, W, metric)
     tk, tkh    = smag_viscosity(def2, metric, params)
 
-    # C9 fix: per-(j,k) 3D CFL stability cap (replaces global dz-only cap)
+    # C9 fix: per-(j,k) 3D CFL stability cap; Fix 2.5: passed into diffusion
+    # functions for local clamping at each face rather than global pre-cap.
     tk_max = _tkmax_3d(metric, dt)
-    tk     = jnp.minimum(tk,  tk_max)
-    tkh    = jnp.minimum(tkh, tk_max)
 
     # Unpack surface fluxes (None → zero BC handled inside diffuse_* functions)
     shf   = None if surface is None else surface.shf
@@ -1119,16 +1332,17 @@ def sgs_proc(
     tau_y = None if surface is None else surface.tau_y
 
     # Scalar diffusion tendencies
-    dTABS = diffuse_scalar(state.TABS, tkh, metric, fluxb=shf)
-    dQV   = diffuse_scalar(state.QV,   tkh, metric, fluxb=lhf)
-    dQC   = diffuse_scalar(state.QC,   tkh, metric)
-    dQI   = diffuse_scalar(state.QI,   tkh, metric)
-    dQR   = diffuse_scalar(state.QR,   tkh, metric)
-    dQS   = diffuse_scalar(state.QS,   tkh, metric)
-    dQG   = diffuse_scalar(state.QG,   tkh, metric)
+    dTABS = diffuse_scalar(state.TABS, tkh, metric, fluxb=shf,  tk_max=tk_max)
+    dQV   = diffuse_scalar(state.QV,   tkh, metric, fluxb=lhf,  tk_max=tk_max)
+    dQC   = diffuse_scalar(state.QC,   tkh, metric, tk_max=tk_max)
+    dQI   = diffuse_scalar(state.QI,   tkh, metric, tk_max=tk_max)
+    dQR   = diffuse_scalar(state.QR,   tkh, metric, tk_max=tk_max)
+    dQS   = diffuse_scalar(state.QS,   tkh, metric, tk_max=tk_max)
+    dQG   = diffuse_scalar(state.QG,   tkh, metric, tk_max=tk_max)
 
     # Momentum diffusion tendencies
-    dU, dV, dW = diffuse_momentum(U, V, W, tk, metric, tau_x=tau_x, tau_y=tau_y)
+    dU, dV, dW = diffuse_momentum(U, V, W, tk, metric, tau_x=tau_x, tau_y=tau_y,
+                                   tk_max=tk_max)
 
     return ModelState(
         U    = U     + dt * dU,
@@ -1159,7 +1373,7 @@ def _tkmax_3d(metric: dict, dt: float) -> jax.Array:
 
     Matches gSAM SGS_TKE.SAM/tke_full.f90:
         cx = dx^2/dt;  cy = dy^2/dt;  cz = (dz*min(adzw_lo,adzw_hi))^2/dt
-        tkmax = 0.09 / (1/cx + 1/cy + 1/cz)
+        tkmax = 0.46 / (1/cx + 1/cy + 1/cz)
 
     With the C8 imu metric, effective dx in x is dx*cos(lat).
     Returns (nz, ny, 1) array.
@@ -1181,7 +1395,7 @@ def _tkmax_3d(metric: dict, dt: float) -> jax.Array:
     dz_eff = jnp.minimum(dzw_lo, dzw_hi)
     cz = (dz_eff ** 2 / dt)[:, None, None]                # (nz, 1, 1)
 
-    return 0.09 / (1.0 / cx + 1.0 / cy + 1.0 / cz)       # (nz, ny, 1)
+    return 0.46 / (1.0 / cx + 1.0 / cy + 1.0 / cz)       # (nz, ny, 1)
 
 
 def _sgs_coefs(
@@ -1204,11 +1418,62 @@ def _sgs_coefs(
                                QR=state.QR, QS=state.QS, QG=state.QG,
                                tk_prev=state.TKE,
                                fluxbt=fluxbt, fluxbq=fluxbq)
-    # C9 fix: per-(j,k) stability cap instead of global dz-only cap
+    # C9 fix: per-(j,k) stability cap — computed here and applied locally inside
+    # diffusion functions (Fix 2.5) rather than globally pre-capping tk/tkh.
     tk_max = _tkmax_3d(metric, dt)
-    tk     = jnp.minimum(tk,  tk_max)
-    tkh    = jnp.minimum(tkh, tk_max)
-    return tk, tkh
+
+    # Fix 2.10: gSAM tke_full.f90:51-89 — at nstep==1, floor tk at surface level
+    # with the equilibrium value implied by surface buoyancy fluxes so the smix
+    # limiter does not start from zero when the surface buoyancy flux is positive.
+    #   tke_eq  = (grd / Cee * max(1e-20, 0.5*a_prod_bu)) ** (2/3)
+    #   tk_eq   = Ck * grd * sqrt(tke_eq)
+    # where a_prod_bu is the surface buoyancy production (same formula as Fix 2.1).
+    if fluxbt is not None and tabs0 is not None:
+        from jsam.core.physics.microphysics import G_GRAV
+        _Ck    = params.Ck
+        _Cs    = params.Cs
+        _Ce    = _Ck**3 / _Cs**4          # Ces in gSAM (= Ce for tke_full)
+        _Ce1   = _Ce / 0.7 * 0.19
+        _Ce2   = _Ce / 0.7 * 0.51
+        _Cee   = _Ce1 + _Ce2              # smix = grd at equilibrium → ratio = 1
+        EPSV   = 0.61
+        _bet0  = G_GRAV / tabs0[0]        # bet at surface level
+        _fbq   = fluxbq if fluxbq is not None else jnp.zeros_like(fluxbt)
+        _sst   = metric.get("sst", None)
+        _sst_val = _sst if _sst is not None else tabs0[0]
+        # Surface buoyancy production: a_prod_bu = bet * fluxbt + bet * epsv * sst * fluxbq
+        _a_prod_bu = _bet0 * (fluxbt + EPSV * _sst_val * _fbq)   # (ny, nx)
+        # grd at surface: (dz[0] * coef(j))^(1/3), coef = min(delta_max,dx*mu)*min(delta_max,dy)
+        _dz_ref    = metric["dz_ref"]
+        _dx_sfc    = metric["dx_lon"]
+        _cos_lat10 = metric.get("cos_lat", None)
+        _dy_sfc    = metric.get("dy_lat", None)
+        if _cos_lat10 is not None:
+            _dx_eff10 = jnp.minimum(params.delta_max, _dx_sfc * _cos_lat10)  # (ny,)
+        else:
+            _dx_eff10 = jnp.minimum(params.delta_max, float(_dx_sfc)) * jnp.ones((1,))
+        if _dy_sfc is not None:
+            _dy_eff10 = jnp.minimum(params.delta_max, _dy_sfc)               # (ny,)
+        else:
+            _dy_eff10 = jnp.minimum(params.delta_max,
+                                    float(metric.get("dy_lat_ref", _dx_sfc))) * jnp.ones((1,))
+        _coef10   = _dx_eff10 * _dy_eff10                                    # (ny,)
+        _grd10    = (float(_dz_ref) * _coef10) ** 0.33333                    # (ny,)
+        # tke_eq = (grd / Cee * max(1e-20, 0.5 * a_prod_bu)) ^ (2/3)  — per (ny, nx)
+        _half_apb = jnp.maximum(1e-20, 0.5 * _a_prod_bu)                    # (ny, nx)
+        _tke_eq   = (_grd10[:, None] / _Cee * _half_apb) ** (2.0 / 3.0)    # (ny, nx)
+        # tk_eq at surface (k=0): Ck * grd * sqrt(tke_eq)
+        _tk_eq    = _Ck * _grd10[:, None] * jnp.sqrt(_tke_eq)               # (ny, nx)
+        # Apply only when a_prod_bu > 0 (equilibrium only for unstable surface)
+        _tk_eq    = jnp.where(_a_prod_bu > 0.0, _tk_eq, 0.0)
+        # Floor tk[0] with equilibrium when nstep == 1 (JIT-compatible via jnp.where)
+        tk_eq_3d  = jnp.maximum(tk[0], _tk_eq)                              # (ny, nx)
+        tk_sfc    = jnp.where(state.nstep == 1, tk_eq_3d, tk[0])
+        tk        = tk.at[0].set(tk_sfc)
+        # tkh follows Pr * tk
+        tkh       = tkh.at[0].set(params.Pr * tk[0])
+
+    return tk, tkh, tk_max
 
 
 @functools.partial(jax.jit, static_argnames=("params",))
@@ -1227,11 +1492,12 @@ def sgs_mom_proc(
     Scalars are left unchanged.
     """
     U, V, W = state.U, state.V, state.W
-    tk, _   = _sgs_coefs(state, metric, params, dt)
+    tk, _, tk_max = _sgs_coefs(state, metric, params, dt)
 
     tau_x = None if surface is None else surface.tau_x
     tau_y = None if surface is None else surface.tau_y
-    dU, dV, dW = diffuse_momentum(U, V, W, tk, metric, tau_x=tau_x, tau_y=tau_y)
+    dU, dV, dW = diffuse_momentum(U, V, W, tk, metric, tau_x=tau_x, tau_y=tau_y,
+                                   tk_max=tk_max)
 
     return ModelState(
         U    = U + dt * dU,
@@ -1267,18 +1533,18 @@ def sgs_scalars_proc(
     matching gSAM operator order: advect_all_scalars → sgs_scalars.
     Momentum fields are left unchanged.
     """
-    _, tkh  = _sgs_coefs(state, metric, params, dt, tabs0=tabs0)
+    _, tkh, tk_max = _sgs_coefs(state, metric, params, dt, tabs0=tabs0)
 
     shf   = None if surface is None else surface.shf
     lhf   = None if surface is None else surface.lhf
 
-    dTABS = diffuse_scalar(state.TABS, tkh, metric, fluxb=shf)
-    dQV   = diffuse_scalar(state.QV,   tkh, metric, fluxb=lhf)
-    dQC   = diffuse_scalar(state.QC,   tkh, metric)
-    dQI   = diffuse_scalar(state.QI,   tkh, metric)
-    dQR   = diffuse_scalar(state.QR,   tkh, metric)
-    dQS   = diffuse_scalar(state.QS,   tkh, metric)
-    dQG   = diffuse_scalar(state.QG,   tkh, metric)
+    dTABS = diffuse_scalar(state.TABS, tkh, metric, fluxb=shf,  tk_max=tk_max)
+    dQV   = diffuse_scalar(state.QV,   tkh, metric, fluxb=lhf,  tk_max=tk_max)
+    dQC   = diffuse_scalar(state.QC,   tkh, metric, tk_max=tk_max)
+    dQI   = diffuse_scalar(state.QI,   tkh, metric, tk_max=tk_max)
+    dQR   = diffuse_scalar(state.QR,   tkh, metric, tk_max=tk_max)
+    dQS   = diffuse_scalar(state.QS,   tkh, metric, tk_max=tk_max)
+    dQG   = diffuse_scalar(state.QG,   tkh, metric, tk_max=tk_max)
 
     return ModelState(
         U    = state.U,

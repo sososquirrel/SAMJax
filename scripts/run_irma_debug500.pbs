@@ -30,14 +30,16 @@ echo "Host: $(hostname)"
 echo "GPUs: $(nvidia-smi -L 2>/dev/null || echo 'none')"
 
 $PYTHON -u scripts/run_irma.py \
-    --nsteps          30 \
-    --output-interval 30 \
+    --nsteps          500 \
+    --output-interval 500 \
     --out-dir         "$OUTDIR" \
     --casename        jsam_IRMA_debug500 \
     --rad             rrtmg \
     --nrad            90 \
     --co2             400.0 \
     --o3file          "$O3FILE" \
+    --rad-day0        248.0 \
+    --rad-iyear       1999 \
     --debug-dump-dir  "$DEBUGDIR" \
     --float32 \
     --no-polar-filter \

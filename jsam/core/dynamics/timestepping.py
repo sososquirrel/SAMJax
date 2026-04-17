@@ -109,6 +109,9 @@ def advance_scalars(
     V_old:    "jax.Array | None" = None,
     W_old:    "jax.Array | None" = None,
     is_f11:   bool = False,
+    U_adv:    "jax.Array | None" = None,
+    V_adv:    "jax.Array | None" = None,
+    W_adv:    "jax.Array | None" = None,
 ) -> tuple:
     """Advance scalars (TABS, QV, QC, QI, QR, QS, QG) by one step.
 
@@ -117,11 +120,16 @@ def advance_scalars(
                 (already includes gamaz and condensate compensation).
                 If False, state.TABS is physical temperature and we compute
                 static energy s_n = TABS + gamaz - condensate.
+        U_adv, V_adv, W_adv: AB-extrapolated advective velocities (Fix 1.4).
+                If provided, use these for advection instead of U_old/state.U.
     """
     from jsam.core.state import ModelState
 
     nstep = state.nstep
-    if U_old is not None:
+    if U_adv is not None and V_adv is not None and W_adv is not None:
+        # Fix 1.4: Use AB-extrapolated advective velocities
+        U, V, W = U_adv, V_adv, W_adv
+    elif U_old is not None:
         U = 0.5 * (U_old + state.U)
         V = 0.5 * (V_old + state.V)
         W = 0.5 * (W_old + state.W)
@@ -187,14 +195,17 @@ def advance_scalars(
 
 @dataclass
 class MomentumTendencies:
-    """Momentum tendencies from one timestep (U, V, W)."""
+    """Momentum tendencies from one timestep (U, V, W) and AB-weighted advective fluxes."""
 
     U: jax.Array
     V: jax.Array
     W: jax.Array
+    U_adv: jax.Array  # AB-weighted mass-flux velocity for U (u1 in gSAM)
+    V_adv: jax.Array  # AB-weighted mass-flux velocity for V (v1 in gSAM)
+    W_adv: jax.Array  # AB-weighted mass-flux velocity for W (w1 in gSAM)
 
     def tree_flatten(self):
-        return [self.U, self.V, self.W], None
+        return [self.U, self.V, self.W, self.U_adv, self.V_adv, self.W_adv], None
 
     @classmethod
     def tree_unflatten(cls, _, children):
@@ -207,6 +218,9 @@ class MomentumTendencies:
             U=jnp.zeros((nz, ny, nx + 1)),
             V=jnp.zeros((nz, ny + 1, nx)),
             W=jnp.zeros((nz + 1, ny, nx)),
+            U_adv=jnp.zeros((nz, ny, nx + 1)),
+            V_adv=jnp.zeros((nz, ny + 1, nx)),
+            W_adv=jnp.zeros((nz + 1, ny, nx)),
         )
 
 
@@ -229,17 +243,67 @@ def advance_momentum(
     dW_extra: "jax.Array | None" = None,
     dt_prev:  float | None       = None,
     dt_pprev: float | None       = None,
+    U_adv:    "jax.Array | None" = None,
+    V_adv:    "jax.Array | None" = None,
+    W_adv:    "jax.Array | None" = None,
 ) -> tuple:
-    """Advance U, V, W by one AB2 step with 3rd-order upwind advection."""
+    """Advance U, V, W by one AB2 step with 3rd-order upwind advection.
+
+    Fix 1.4: Uses AB2-extrapolated advective velocities passed in as U_adv/V_adv/W_adv.
+    These should be computed in step.py using fixed AB2 coefficients (not variable AB3):
+        u1_curr = U * (rho * dt/dx * adz * ady)
+        a1 = 1.0 if nstep==1 else 0.5
+        a2 = 0.0 if nstep==1 else 0.5
+        u1_adv = a1 * u1_curr + a2 * u1_prev (from mom_tends_nm1.U_adv)
+        U_adv = u1_adv / (rho * dt/dx * adz * ady)
+    Stores current step's u1_curr in mom_tends_n.U_adv/V_adv/W_adv for next step's extrapolation.
+    """
     from jsam.core.state import ModelState
 
     nstep = state.nstep
     U, V, W = state.U, state.V, state.W
-    U_adv, V_adv, W_adv = advect_momentum(U, V, W, metric, dt)
+
+    # If AB-extrapolated velocities not provided, use current state (for backward compat)
+    if U_adv is None:
+        U_adv = U
+    if V_adv is None:
+        V_adv = V
+    if W_adv is None:
+        W_adv = W
+
+    # Compute the mass-flux-weighted advective velocities for storage in mom_tends_n
+    # These are what step.py computed; we need to store them for the next step
+    mu     = metric["cos_lat"]
+    muv    = metric["cos_v"]
+    ady    = metric["ady"]
+    rho    = metric["rho"]
+    rhow   = metric["rhow"]
+    dz     = metric["dz"]
+    dx     = metric["dx_lon"]
+    dy_ref = metric["dy_lat_ref"]
+
+    dz_ref = dz[0]
+    adz    = dz / dz_ref
+
+    dtdx = dt / dx
+    dtdy = dt / dy_ref
+    dtdz = dt / dz_ref
+
+    # Current step's mass-flux-weighted velocities (these will be used in next step)
+    u1_curr = U * (rho[:, None, None] * dtdx * adz[:, None, None] * ady[None, :, None])
+    v1_curr = V * (rho[:, None, None] * dtdy * adz[:, None, None] * muv[None, :, None])
+    w1_curr = W * (rhow[:, None, None] * dtdz * ady[None, :, None] * mu[None, :, None])
+
+    U_adv_for_advection, V_adv_for_advection, W_adv_for_advection = advect_momentum(
+        U_adv, V_adv, W_adv, metric, dt
+    )
     mom_tends_n = MomentumTendencies(
-        U=(U_adv - U) / dt + (dU_extra if dU_extra is not None else 0.0),
-        V=(V_adv - V) / dt + (dV_extra if dV_extra is not None else 0.0),
-        W=(W_adv - W) / dt + (dW_extra if dW_extra is not None else 0.0),
+        U=(U_adv_for_advection - U) / dt + (dU_extra if dU_extra is not None else 0.0),
+        V=(V_adv_for_advection - V) / dt + (dV_extra if dV_extra is not None else 0.0),
+        W=(W_adv_for_advection - W) / dt + (dW_extra if dW_extra is not None else 0.0),
+        U_adv=u1_curr,
+        V_adv=v1_curr,
+        W_adv=w1_curr,
     )
 
     def _step(phi, tn, tnm1, tnm2):

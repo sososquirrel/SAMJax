@@ -6,6 +6,7 @@ from __future__ import annotations
 import struct
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import jax
@@ -141,6 +142,40 @@ def _cam_ocean_albedo(coszen: np.ndarray, ts: np.ndarray) -> tuple[np.ndarray, n
     return asdir, asdif, aldir, aldif
 
 
+def _cam_land_albedo(
+    coszen: np.ndarray,
+    land_alb_vis: Optional[float] = None,
+    land_alb_nir: Optional[float] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute land albedos (asdir, asdif, aldir, aldif).
+
+    Fix 7.3: When ``land_alb_vis`` / ``land_alb_nir`` are provided (from
+    ``RadRRTMGConfig``), those fixed values are used for all land columns
+    (approximating the gSAM SLM albedo_slm output for tropical vegetation).
+    When not provided, falls back to the Briegleb (1992) land-type-I formula
+    from gSAM cam_rad_parameterizations.f90 albedo() non-SLM branch:
+        asdir = 1.4 * 0.06 / (1 + 0.8 * coszrs)   asdif = 1.2 * 0.06
+        aldir = 1.4 * 0.24 / (1 + 0.8 * coszrs)   aldif = 1.2 * 0.24
+    All albedo components are zeroed when coszen <= 0 (night side).
+    """
+    cz = np.asarray(coszen, dtype=np.float64)
+    day = cz > 0.0
+    if land_alb_vis is not None and land_alb_nir is not None:
+        # Fixed config-driven albedo: same for direct and diffuse.
+        asdir = np.where(day, float(land_alb_vis), 0.0)
+        asdif = np.where(day, float(land_alb_vis), 0.0)
+        aldir = np.where(day, float(land_alb_nir), 0.0)
+        aldif = np.where(day, float(land_alb_nir), 0.0)
+    else:
+        # Briegleb (1992) land-type-I (gSAM non-SLM fallback).
+        cz_d  = np.where(day, cz, 1.0)   # avoid divide-by-zero; masked below
+        asdir = np.where(day, 1.4 * 0.06 / (1.0 + 0.8 * cz_d), 0.0)
+        asdif = np.where(day, 1.2 * 0.06, 0.0)
+        aldir = np.where(day, 1.4 * 0.24 / (1.0 + 0.8 * cz_d), 0.0)
+        aldif = np.where(day, 1.2 * 0.24, 0.0)
+    return asdir, asdif, aldir, aldif
+
+
 _CP_DAIR_DEFAULT = 1004.64
 
 
@@ -150,18 +185,141 @@ _CP_DAIR_DEFAULT = 1004.64
 
 @dataclass(frozen=True)
 class RadRRTMGConfig:
-    """RRTMG config: cpdair, emissivity, trace gas VMRs (space/time-uniform)."""
+    """RRTMG config: cpdair, emissivity, trace gas VMRs (space/time-uniform).
+
+    Fix 7.5: VMR defaults match gSAM rrtmg_lw.nc MLS reference atmosphere
+    surface values (AbsorberAmountMLS, bottom level):
+      CO2  = 3.55e-4   (was 3.67e-4; nc file: 3.55e-4 uniform)
+      CH4  = 1.70e-6   (was 1.80e-6; nc file: 1.70e-6 at surface)
+      N2O  = 3.20e-7   (unchanged; matches nc file surface value)
+      O2   = 0.209     (unchanged; nc file: uniform)
+      CFCs = 0.0       (nc file values are masked/missing → gSAM zeroes them)
+    """
     cpdair:    float = 1004.64
     emis:      float = 0.98
     land_emis: float = 1.0
-    co2_vmr:   float = 3.670e-4
-    ch4_vmr:   float = 1.8e-6
+    # Fix 7.3: land surface albedo for SW (approximates gSAM SLM albedo_slm).
+    # asdir/asdif use land_alb_vis (0.2-0.7 µm), aldir/aldif use land_alb_nir
+    # (0.7-5.0 µm).  Applied only when landmask is non-None.
+    # Defaults: tropical broadleaf vegetation from gSAM slm_vars.f90
+    # (albedovis_v ~0.09, albedonir_v ~0.16; soil adds ~0.01 each).
+    land_alb_vis: float = 0.10   # UV-vis direct+diffuse over land
+    land_alb_nir: float = 0.20   # NIR direct+diffuse over land
+    co2_vmr:   float = 3.55e-4   # Fix 7.5: gSAM rrtmg_lw.nc MLS value
+    ch4_vmr:   float = 1.70e-6   # Fix 7.5: gSAM rrtmg_lw.nc surface value
     n2o_vmr:   float = 320e-9
     o2_vmr:    float = 0.209
     cfc11_vmr: float = 0.0
     cfc12_vmr: float = 0.0
     cfc22_vmr: float = 0.0
     ccl4_vmr:  float = 0.0
+    # Fix 7.5: path to rrtmg_lw.nc for altitude-dependent trace gas profiles
+    # (gSAM tracesini() reads this file for CO2, CH4, N2O, O2, CFCs).
+    # When None, uniform VMRs above are used as a fallback.
+    trace_gas_file: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Fix 7.5 — Altitude-dependent trace gas profiles from rrtmg_lw.nc
+# ---------------------------------------------------------------------------
+
+# Absorber order in AbsorberAmountMLS (from rrtmg_lw.nc, dimension Absorber=12)
+# Index by name; these are the gases RRTMG expects as vertical profiles.
+_RRTMG_NC_GAS_ORDER = [
+    "N2", "CCL4", "CFC11", "CFC12", "CFC22", "H2O", "CO2", "O3",
+    "N2O", "CO", "CH4", "O2",
+]
+
+# Cache so we don't re-read the file on every call.
+_TRACE_GAS_PROFILE_CACHE: dict[str, dict] = {}
+
+
+def load_rrtmg_trace_gas_profiles(nc_file: str) -> dict:
+    """Load altitude-dependent trace gas profiles from rrtmg_lw.nc.
+
+    Reads AbsorberAmountMLS (ppmv) on the standard MLS pressure grid and
+    returns a dict with keys 'pres_hpa' (nPress,) and per-gas arrays (nPress,)
+    for CO2, CH4, N2O, O2, CFC11, CFC12, CFC22, CCL4.  Values are in VMR
+    (not ppmv), matching how gSAM tracesini() stores them after reading.
+    Masked (missing) values are replaced with 0.0 (gSAM's CFC/CCL4 behaviour).
+
+    Mirrors gSAM rad.f90 tracesini() which reads this same file and
+    interpolates onto model levels via mass-path integration.
+    """
+    if nc_file in _TRACE_GAS_PROFILE_CACHE:
+        return _TRACE_GAS_PROFILE_CACHE[nc_file]
+
+    try:
+        import netCDF4 as nc4
+    except ImportError:
+        raise ImportError("netCDF4 is required to load trace gas profiles from rrtmg_lw.nc")
+
+    ds = nc4.Dataset(nc_file)
+    try:
+        pres_hpa = np.array(ds.variables["Pressure"][:], dtype=np.float64)  # (nPress,)
+        tr_raw   = np.ma.filled(                                              # (nPress, 12) ppmv
+            ds.variables["AbsorberAmountMLS"][:].astype(np.float64), fill_value=0.0
+        )
+        names_raw = ds.variables["AbsorberNames"][:]
+        names = ["".join(b.decode() if isinstance(b, (bytes, np.bytes_)) else b
+                         for b in row).strip()
+                 for row in names_raw]
+    finally:
+        ds.close()
+
+    # Map name → column index in AbsorberAmountMLS
+    name_to_idx = {n: i for i, n in enumerate(names)}
+
+    def _get(gas: str) -> np.ndarray:
+        if gas not in name_to_idx:
+            return np.zeros_like(pres_hpa)
+        col = tr_raw[:, name_to_idx[gas]]
+        # Clamp pathological values (gSAM: where trace > 2: trace = 0)
+        col = np.where(col > 2.0, 0.0, col)
+        return col  # already in VMR (rrtmg_lw.nc stores ppmv units labelled
+                    # as VMR by convention — same as what RRTMG expects)
+
+    result = {
+        "pres_hpa": pres_hpa,
+        "CO2":   _get("CO2"),
+        "CH4":   _get("CH4"),
+        "N2O":   _get("N2O"),
+        "O2":    _get("O2"),
+        "CFC11": _get("CFC11"),
+        "CFC12": _get("CFC12"),
+        "CFC22": _get("CFC22"),
+        "CCL4":  _get("CCL4"),
+    }
+    _TRACE_GAS_PROFILE_CACHE[nc_file] = result
+    return result
+
+
+def _interp_trace_profiles(
+    profiles:    dict,           # from load_rrtmg_trace_gas_profiles
+    play_hpa:    np.ndarray,     # (nlay,) target layer pressures sfc→TOA
+    ncol:        int,
+) -> dict:
+    """Interpolate rrtmg_lw.nc trace gas profiles onto model layer pressures.
+
+    Mirrors gSAM tracesini() mass-path integration: for each model level
+    we compute the mean VMR from a path-integral over the MLS sounding.
+    Here we use a simpler log-p linear interpolation (same result for smooth
+    profiles) and broadcast to (ncol, nlay).
+
+    Returns dict of (ncol, nlay) float64 arrays for each gas.
+    """
+    src_p   = profiles["pres_hpa"]  # (nPress,) — may be top→sfc or sfc→top
+    # Ensure ascending pressure order (sfc→TOA) for interp
+    order   = np.argsort(src_p)
+    src_lnp = np.log(src_p[order])
+    tgt_lnp = np.log(np.asarray(play_hpa, dtype=np.float64))
+
+    out = {}
+    for gas in ("CO2", "CH4", "N2O", "O2", "CFC11", "CFC12", "CFC22", "CCL4"):
+        src_vals = profiles[gas][order]
+        col_1d   = np.interp(tgt_lnp, src_lnp, src_vals)   # (nlay,)
+        out[gas]  = np.broadcast_to(col_1d[None, :], (ncol, len(play_hpa))).copy()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +528,8 @@ def _rrtmg_lw_numpy(
     reice:     np.ndarray,   # (ncol, nlay)  µm
     reliq:     np.ndarray,   # (ncol, nlay)  µm
     cfg:       RadRRTMGConfig,
+    emis_1d:   Optional[np.ndarray] = None,   # (ncol,) per-column emissivity; None → cfg.emis
+    trace_profiles: Optional[dict]  = None,   # Fix 7.5: from load_rrtmg_trace_gas_profiles
 ) -> np.ndarray:
     """Call the f2py-built RRTMG_LW for one batch of columns."""
     _ensure_initialized(cfg.cpdair)
@@ -378,16 +538,32 @@ def _rrtmg_lw_numpy(
     def _f(val):
         return np.full((ncol, nlay), float(val), dtype=np.float64)
 
-    co2    = _f(cfg.co2_vmr)
-    ch4    = _f(cfg.ch4_vmr)
-    n2o    = _f(cfg.n2o_vmr)
-    o2     = _f(cfg.o2_vmr)
-    cfc11  = _f(cfg.cfc11_vmr)
-    cfc12  = _f(cfg.cfc12_vmr)
-    cfc22  = _f(cfg.cfc22_vmr)
-    ccl4   = _f(cfg.ccl4_vmr)
+    # Fix 7.5: use altitude-dependent profiles when available, else uniform VMR.
+    if trace_profiles is not None:
+        tp = _interp_trace_profiles(trace_profiles, play_hpa[0], ncol)
+        co2   = tp["CO2"].astype(np.float64)
+        ch4   = tp["CH4"].astype(np.float64)
+        n2o   = tp["N2O"].astype(np.float64)
+        o2    = tp["O2"].astype(np.float64)
+        cfc11 = tp["CFC11"].astype(np.float64)
+        cfc12 = tp["CFC12"].astype(np.float64)
+        cfc22 = tp["CFC22"].astype(np.float64)
+        ccl4  = tp["CCL4"].astype(np.float64)
+    else:
+        co2    = _f(cfg.co2_vmr)
+        ch4    = _f(cfg.ch4_vmr)
+        n2o    = _f(cfg.n2o_vmr)
+        o2     = _f(cfg.o2_vmr)
+        cfc11  = _f(cfg.cfc11_vmr)
+        cfc12  = _f(cfg.cfc12_vmr)
+        cfc22  = _f(cfg.cfc22_vmr)
+        ccl4   = _f(cfg.ccl4_vmr)
 
-    emis   = np.full((ncol, 16), float(cfg.emis), dtype=np.float64)
+    # Fix 7.4: per-column emissivity (1.0 over land, cfg.emis over ocean).
+    if emis_1d is not None:
+        emis = np.repeat(emis_1d[:, None].astype(np.float64), 16, axis=1)  # (ncol, 16)
+    else:
+        emis = np.full((ncol, 16), float(cfg.emis), dtype=np.float64)
 
     # Clear-sky taucld/tauaer placeholders (RRTMG ignores them when
     # inflglw=2 and uses its own optics derived from c(i|l)cewp + re).
@@ -452,6 +628,7 @@ def _rrtmg_sw_numpy(
     reice:     np.ndarray,   # (ncol, nlay)  um
     reliq:     np.ndarray,   # (ncol, nlay)  um
     cfg:       RadRRTMGConfig,
+    trace_profiles: Optional[dict] = None,   # Fix 7.5: from load_rrtmg_trace_gas_profiles
 ) -> tuple[np.ndarray, np.ndarray]:
     """Call the f2py-built RRTMG_SW for one batch of columns.
 
@@ -468,10 +645,18 @@ def _rrtmg_sw_numpy(
     def _f(val):
         return np.full((ncol, nlay), float(val), dtype=np.float64)
 
-    co2 = _f(cfg.co2_vmr)
-    ch4 = _f(cfg.ch4_vmr)
-    n2o = _f(cfg.n2o_vmr)
-    o2  = _f(cfg.o2_vmr)
+    # Fix 7.5: altitude-dependent trace gas profiles when available.
+    if trace_profiles is not None:
+        tp  = _interp_trace_profiles(trace_profiles, play_hpa[0], ncol)
+        co2 = tp["CO2"].astype(np.float64)
+        ch4 = tp["CH4"].astype(np.float64)
+        n2o = tp["N2O"].astype(np.float64)
+        o2  = tp["O2"].astype(np.float64)
+    else:
+        co2 = _f(cfg.co2_vmr)
+        ch4 = _f(cfg.ch4_vmr)
+        n2o = _f(cfg.n2o_vmr)
+        o2  = _f(cfg.o2_vmr)
 
     # Sky-condition placeholders (RRTMG ignores when inflgsw=2).
     taucld = np.zeros((_NBNDSW, ncol, nlay), dtype=np.float64)
@@ -665,10 +850,29 @@ def _compute_dTABS_dt_host(
         aldir_col  = np.asarray(sw_inputs["aldir"], dtype=np.float64)
         aldif_col  = np.asarray(sw_inputs["aldif"], dtype=np.float64)
 
-    # C11 fix: layer mass for flux-divergence heating rate (gSAM rad.f90:722-730)
-    # layerM = dp / g  (kg/m²) for each real layer
-    dp_real = plev[:, :-1] - plev[:, 1:]  # (ncol, nz) hPa
-    layerM_real = 100.0 * dp_real / _G_GRAV  # (ncol, nz) kg/m²
+    # Fix 7.4: per-column surface emissivity.
+    # gSAM rad.f90:641-644: emissivity = emis_water over ocean (landtype==0),
+    # 1.0 over land.  Build a (ncol,) array; pass into each LW chunk.
+    emis_col = np.full(ncol, float(cfg.emis), dtype=np.float64)
+    if landmask is not None:
+        land_col_flat = landmask.reshape(ncol)  # (ncol,) — reuse if already computed
+        emis_col = np.where(land_col_flat != 0, cfg.land_emis, emis_col)
+
+    # Fix 7.6: layer mass for flux-divergence heating rate.
+    # gSAM rad.f90:450  layerM = rho(k)*adz(k)*dz  (where adz*dz == dz_actual)
+    # i.e. layerM = rho * dz_actual  (kg/m²), broadcast to (ncol, nz).
+    _rho_1d = np.asarray(metric["rho"], dtype=np.float64)   # (nz,)
+    _dz_1d  = np.asarray(metric["dz"],  dtype=np.float64)   # (nz,) actual layer thickness
+    layerM_real = np.broadcast_to(
+        (_rho_1d * _dz_1d)[None, :], (ncol, nz)
+    ).copy()   # (ncol, nz) kg/m²
+
+    # Fix 7.5: load altitude-dependent trace gas profiles if configured.
+    # Mirrors gSAM tracesini() which reads rrtmg_lw.nc once at init and
+    # interpolates CO2, CH4, N2O, O2, CFC11/12/22, CCL4 onto model levels.
+    _trace_profiles: Optional[dict] = None
+    if cfg.trace_gas_file is not None:
+        _trace_profiles = load_rrtmg_trace_gas_profiles(cfg.trace_gas_file)
 
     for i0 in range(0, ncol, _CHUNK_NCOL):
         i1 = min(i0 + _CHUNK_NCOL, ncol)
@@ -681,6 +885,8 @@ def _compute_dTABS_dt_host(
             cicewp=cicewp_ext[i0:i1], cliqwp=cliqwp_ext[i0:i1],
             reice=reice_ext[i0:i1],   reliq=reliq_ext[i0:i1],
             cfg=cfg,
+            emis_1d=emis_col[i0:i1],
+            trace_profiles=_trace_profiles,
         )
         # C11 fix: compute heating rate from flux divergence for real layers
         # HR = (Fup[k] - Fup[k+1] + Fdown[k+1] - Fdown[k]) / (cp * layerM)
@@ -709,6 +915,7 @@ def _compute_dTABS_dt_host(
                 cicewp=cicewp_ext[i0:i1], cliqwp=cliqwp_ext[i0:i1],
                 reice=reice_ext[i0:i1],   reliq=reliq_ext[i0:i1],
                 cfg=cfg,
+                trace_profiles=_trace_profiles,
             )
             # C11 fix: SW heating from flux divergence too
             sw_up = sw_uflx_ext[:, :nz+1]
@@ -718,11 +925,7 @@ def _compute_dTABS_dt_host(
                         cfg.cpdair * layerM_real[i0:i1])
             hr_K_per_day[i0:i1] += sw_hr_Ks * 86400.0
 
-    # Safety clip: physically-realised heating should be within ±50 K/day.
-    # SW peaks near ~5 K/day in cloud tops, LW around -25 K/d at the top of
-    # a deep cloud, so ±50 is a generous guardrail for coarse/edge cases.
-    np.clip(hr_K_per_day, -50.0, 50.0, out=hr_K_per_day)
-
+    # No clamp applied — gSAM has no such limit on heating rates.
     dTABS_dt_col = hr_K_per_day / 86400.0
     lwds_2d = lwds_col.reshape(ny, nx).astype(np.float64)
     return dTABS_dt_col.T.reshape(nz, ny, nx), lwds_2d
@@ -735,20 +938,28 @@ def _compute_dTABS_dt_only_host(*args, **kwargs):
 
 
 def _build_sw_inputs_host(
-    TABS_host: np.ndarray,     # (nz, ny, nx)
-    sst_host:  np.ndarray,     # (ny, nx)
-    lat_rad:   np.ndarray,     # (ny,)
-    lon_rad:   np.ndarray,     # (nx,)
-    day_of_year: float,        # UT fractional day (gSAM dayForSW)
-    iyear: int,                # calendar year for shr_orb_params
+    TABS_host:   np.ndarray,              # (nz, ny, nx)
+    sst_host:    np.ndarray,              # (ny, nx)
+    lat_rad:     np.ndarray,              # (ny,)
+    lon_rad:     np.ndarray,              # (nx,)
+    day_of_year: float,                   # UT fractional day (gSAM dayForSW)
+    iyear:       int,                     # calendar year for shr_orb_params
+    landmask:    Optional[np.ndarray] = None,   # (ny, nx) non-zero over land
+    cfg:         Optional["RadRRTMGConfig"] = None,
 ) -> dict:
     """
     Build the per-column SW inputs consumed by :func:`_rrtmg_sw_numpy`:
       coszen, eccf, asdir/asdif/aldir/aldif.
 
-    Matches gSAM rad.f90 lines 804-832: orbital decl -> per-column cosine
-    zenith -> CAM ocean albedo.  ``sst`` is used as surface skin T for
-    the albedo branch (gSAM passes surfaceT which equals SST over ocean).
+    Fix 7.3: When ``landmask`` is provided, land columns use either:
+      - cfg.land_alb_vis / cfg.land_alb_nir (fixed values; approximates gSAM
+        SLM albedo_slm for vegetated tropical land), or
+      - the Briegleb (1992) land-type-I formula from gSAM
+        cam_rad_parameterizations.f90 albedo() non-SLM branch when cfg is None.
+    Ocean/sea-ice columns use the CAM zenith+SST formula.
+    Matches gSAM rad.f90 lines 821-832 (when SLM=.false.: call albedo(ocean=.false.)).
+    When SLM=.true. gSAM calls albedo_slm() with per-point vegetation/soil maps;
+    cfg.land_alb_vis / cfg.land_alb_nir provide a bulk approximation of that.
     """
     nz, ny, nx = TABS_host.shape
     ncol = ny * nx
@@ -763,6 +974,20 @@ def _build_sw_inputs_host(
         tsfc_col = np.where(nan_sfc, TABS_bot, tsfc_col)
 
     asdir, asdif, aldir, aldif = _cam_ocean_albedo(coszen, tsfc_col)
+
+    # Fix 7.3: override land columns with config-driven or Briegleb land albedo.
+    if landmask is not None:
+        land_col = landmask.reshape(ncol) != 0   # (ncol,) bool
+        if land_col.any():
+            _vis = cfg.land_alb_vis if cfg is not None else None
+            _nir = cfg.land_alb_nir if cfg is not None else None
+            la_asdir, la_asdif, la_aldir, la_aldif = _cam_land_albedo(
+                coszen, land_alb_vis=_vis, land_alb_nir=_nir,
+            )
+            asdir = np.where(land_col, la_asdir, asdir)
+            asdif = np.where(land_col, la_asdif, asdif)
+            aldir = np.where(land_col, la_aldir, aldir)
+            aldif = np.where(land_col, la_aldif, aldif)
 
     return {
         "coszen": coszen,
@@ -817,6 +1042,7 @@ def compute_qrad_rrtmg(
     sst:     jax.Array,          # (ny, nx)  K — per-column surface temperature
     o3vmr:   Optional[np.ndarray] = None,
     sw_aux:  Optional[dict] = None,
+    landmask: Optional[np.ndarray] = None,  # (ny, nx) non-zero over land
 ) -> jax.Array:                  # (nz, ny, nx) K/s heating rate
     """
     Compute RRTMG radiative heating rates (LW, and LW+SW when ``sw_aux`` is
@@ -838,6 +1064,10 @@ def compute_qrad_rrtmg(
       - ``lat_rad``     (ny,) mass-cell latitudes in radians
       - ``lon_rad``     (nx,) mass-cell longitudes in radians
     If omitted, only the LW call is performed (legacy behaviour).
+
+    Fix 7.3: ``landmask`` (ny, nx) non-zero over land. When provided, land
+    columns use the Briegleb (1992) land-type-I SW albedo formula instead of
+    the ocean formula. Also controls emissivity (1.0 over land) and liquid Re.
     """
     plev_hpa = build_plev_hpa(metric)                               # (nz+1,)
     play_hpa = 0.5 * (plev_hpa[:-1] + plev_hpa[1:])                 # (nz,)
@@ -847,6 +1077,7 @@ def compute_qrad_rrtmg(
         o3vmr_arr = np.asarray(o3vmr, dtype=np.float64)
 
     nz, ny, nx = state.TABS.shape
+    _landmask = None if landmask is None else np.asarray(landmask)
 
     _sw_day   = None if sw_aux is None else float(sw_aux["day_of_year"])
     _sw_year  = None if sw_aux is None else int(sw_aux["iyear"])
@@ -860,6 +1091,7 @@ def compute_qrad_rrtmg(
         if _sw_day is not None:
             sw_in = _build_sw_inputs_host(
                 TABS_h, sst_h, _sw_lat, _sw_lon, _sw_day, _sw_year,
+                landmask=_landmask, cfg=config,
             )
         dTABS_dt, _lwds = _compute_dTABS_dt_host(
             TABS_host=TABS_h,
@@ -872,6 +1104,7 @@ def compute_qrad_rrtmg(
             o3vmr    =o3vmr_arr,
             cfg=config,
             sw_inputs=sw_in,
+            landmask =_landmask,
         )
         return dTABS_dt.astype(np.float32)
 
@@ -889,10 +1122,16 @@ def compute_qrad_and_lwds_rrtmg(
     config:  RadRRTMGConfig,
     sst:     jax.Array,          # (ny, nx) K
     o3vmr:   Optional[np.ndarray] = None,
+    sw_aux:  Optional[dict] = None,
+    landmask: Optional[np.ndarray] = None,  # (ny, nx) non-zero over land
 ) -> tuple[jax.Array, jax.Array]:
     """Same as :func:`compute_qrad_rrtmg` but also returns the surface
     down-welling LW flux ``lwds`` as an ``(ny, nx)`` array (W/m²), needed
     by the SLM radiative balance.
+
+    Fix 7.3: ``landmask`` (ny, nx) non-zero over land. When provided and
+    ``sw_aux`` is given, land columns use the Briegleb SW albedo formula.
+    Also controls LW emissivity (1.0 over land) and liquid effective radius.
     """
     plev_hpa = build_plev_hpa(metric)
     play_hpa = 0.5 * (plev_hpa[:-1] + plev_hpa[1:])
@@ -902,18 +1141,34 @@ def compute_qrad_and_lwds_rrtmg(
         o3vmr_arr = np.asarray(o3vmr, dtype=np.float64)
 
     nz, ny, nx = state.TABS.shape
+    _landmask = None if landmask is None else np.asarray(landmask)
+
+    _sw_day   = None if sw_aux is None else float(sw_aux["day_of_year"])
+    _sw_year  = None if sw_aux is None else int(sw_aux["iyear"])
+    _sw_lat   = None if sw_aux is None else np.asarray(sw_aux["lat_rad"], dtype=np.float64)
+    _sw_lon   = None if sw_aux is None else np.asarray(sw_aux["lon_rad"], dtype=np.float64)
 
     def _host_callback(TABS_np, QV_np, QC_np, QI_np, sst_np):
+        TABS_h = np.asarray(TABS_np, dtype=np.float64)
+        sst_h  = np.asarray(sst_np,  dtype=np.float64)
+        sw_in = None
+        if _sw_day is not None:
+            sw_in = _build_sw_inputs_host(
+                TABS_h, sst_h, _sw_lat, _sw_lon, _sw_day, _sw_year,
+                landmask=_landmask,
+            )
         dTABS_dt, lwds = _compute_dTABS_dt_host(
-            TABS_host=np.asarray(TABS_np, dtype=np.float64),
+            TABS_host=TABS_h,
             QV_host  =np.asarray(QV_np,   dtype=np.float64),
             QC_host  =np.asarray(QC_np,   dtype=np.float64),
             QI_host  =np.asarray(QI_np,   dtype=np.float64),
-            sst_host =np.asarray(sst_np,  dtype=np.float64),
+            sst_host =sst_h,
             play_hpa =play_hpa.astype(np.float64),
             plev_hpa =plev_hpa.astype(np.float64),
             o3vmr    =o3vmr_arr,
             cfg=config,
+            sw_inputs=sw_in,
+            landmask =_landmask,
         )
         return (
             dTABS_dt.astype(np.float32),

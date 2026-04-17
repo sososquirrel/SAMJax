@@ -777,11 +777,23 @@ def era5_init(
     """
     from jsam.core.dynamics.pressure import build_metric
 
-    from jsam.io.gsam_era5_init import era5_state_gsam
+    from jsam.io.gsam_era5_init import (
+        era5_state_from_gsam_init_binary,
+        era5_state_gsam,
+    )
 
     grid   = era5_grid(lat, lon, z, zi, dt, rda_root)
     metric = build_metric(grid, polar_filter=polar_filter)
-    state  = era5_state_gsam(grid, metric, dt, rda_root)
+
+    # Prefer the pre-processed gSAM binary (identical source data to gSAM).
+    # Canonical location: same directory as gSAM GLOBAL_DATA/BIN_D.
+    _GSAM_BIN_DIR = Path("/glade/u/home/sabramian/gSAM1.8.7/GLOBAL_DATA/BIN_D")
+    _bin_path = _GSAM_BIN_DIR / f"init_era5_{dt.strftime('%Y%m%d%H')}_GLOBAL.bin"
+    if _bin_path.exists():
+        state = era5_state_from_gsam_init_binary(_bin_path, grid, metric)
+    else:
+        print(f"[era5_init] gSAM binary not found at {_bin_path}, falling back to ERA5 netCDF")
+        state = era5_state_gsam(grid, metric, dt, rda_root)
     sst    = era5_sst(grid, dt, rda_root)
 
     ls_forcing = None

@@ -130,3 +130,381 @@ All automation tools are ready to use. Just need to:
 - OR fix the pressure solver
 - Then run full convergence test with `python run_iteration.py` in a `/loop`
 
+
+## Iteration 12 — 2026-04-16 15:29:42
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 13 — 2026-04-16 15:30:36
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 14 — 2026-04-16 15:31:07
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 15 — 2026-04-16 15:32:36
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 16 — 2026-04-16 15:35:39
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 17 — 2026-04-16 15:40:42
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 18 — 2026-04-16 15:45:48
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 19 — 2026-04-16 15:50:52
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 20 — 2026-04-16 15:55:55
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 21 — 2026-04-16 16:00:58
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 22 — 2026-04-16 16:06:02
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 23 — 2026-04-16 16:11:06
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 24 — 2026-04-16 16:16:15
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 25 — 2026-04-16 16:21:21
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 26 — 2026-04-16 16:26:25
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 27 — 2026-04-16 16:31:30
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 28 — 2026-04-16 16:36:36
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 29 — 2026-04-16 16:41:39
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 30 — 2026-04-16 16:46:43
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 31 — 2026-04-16 16:51:47
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 32 — 2026-04-16 16:56:51
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 33 — 2026-04-16 17:01:56
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 34 — 2026-04-16 17:06:59
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 35 — 2026-04-16 17:12:03
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 36 — 2026-04-16 17:17:07
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 37 — 2026-04-16 17:22:13
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 38 — 2026-04-16 17:27:17
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 39 — 2026-04-16 17:32:22
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.33e-02))
+**Result**: Stage 0 diverges (max rel err: 1.33e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 40 — 2026-04-16 17:37:27
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.83e-02))
+**Result**: Stage 0 diverges (max rel err: 1.83e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 41 — 2026-04-16 17:42:31
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.83e-02))
+**Result**: Stage 0 diverges (max rel err: 1.83e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 42 — 2026-04-16 17:47:35
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.83e-02))
+**Result**: Stage 0 diverges (max rel err: 1.83e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 43 — 2026-04-16 17:52:41
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.83e-02))
+**Result**: Stage 0 diverges (max rel err: 1.83e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 44 — 2026-04-16 17:58:06
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.83e-02))
+**Result**: Stage 0 diverges (max rel err: 1.83e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 45 — 2026-04-16 18:03:14
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 9.63e-02))
+**Result**: Stage 0 diverges (max rel err: 9.63e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 46 — 2026-04-16 18:08:19
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 9.63e-02))
+**Result**: Stage 0 diverges (max rel err: 9.63e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 47 — 2026-04-16 18:13:33
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 48 — 2026-04-16 18:18:37
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 49 — 2026-04-16 18:23:42
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 50 — 2026-04-16 18:28:48
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 51 — 2026-04-16 18:33:52
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 52 — 2026-04-16 18:38:56
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 53 — 2026-04-16 18:44:03
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 54 — 2026-04-16 18:49:08
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 55 — 2026-04-16 18:54:12
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 56 — 2026-04-16 18:59:16
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 57 — 2026-04-16 19:04:20
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 58 — 2026-04-16 19:09:26
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 59 — 2026-04-16 19:14:45
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 60 — 2026-04-16 19:19:48
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 61 — 2026-04-16 19:24:53
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 62 — 2026-04-16 19:29:56
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 63 — 2026-04-16 19:35:00
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 64 — 2026-04-16 19:40:04
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 65 — 2026-04-16 19:45:09
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 66 — 2026-04-16 19:50:13
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 67 — 2026-04-16 19:55:19
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 68 — 2026-04-16 20:00:27
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 69 — 2026-04-16 20:05:31
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 70 — 2026-04-16 20:10:34
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 71 — 2026-04-16 20:15:39
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 72 — 2026-04-16 20:20:45
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 73 — 2026-04-16 20:25:50
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0
+
+## Iteration 74 — 2026-04-16 20:30:54
+**Changed**: (pending — fix needed for Stage 0 diverges (max rel err: 1.14e-02))
+**Result**: Stage 0 diverges (max rel err: 1.14e-02)
+**Root cause**: (to be identified)
+**Next**: Investigate stage 0

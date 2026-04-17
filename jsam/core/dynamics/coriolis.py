@@ -44,14 +44,34 @@ def coriolis_tend(
 
     V_s = V[:, :ny,     :]
     V_n = V[:, 1:ny + 1, :]
-    V_s_w = jnp.roll(V_s, +1, axis=-1)
-    V_n_w = jnp.roll(V_n, +1, axis=-1)
 
     adyv_s = adyv[None, :ny,     None]
     adyv_n = adyv[None, 1:ny + 1, None]
     ady3   = ady[None, :, None]
 
-    v_bar = (adyv_s * (V_s + V_s_w) + adyv_n * (V_n + V_n_w)) / (4.0 * ady3)
+    # Fix 9.1: gSAM coriolis.f90 lines 29-30 clamps the V-interpolation
+    # stencil indices at the two pole rows so that the 4-point V average for
+    # dudt does not reference out-of-domain V rows:
+    #   if(j+jt.eq.1)     jb = 2    ! south pole: south arm j=1(1-idx) → j=2(1-idx)
+    #   if(j+jt.eq.ny_gl) jc = ny   ! north pole: north arm j=ny+1(1-idx) → j=ny(1-idx)
+    # In 0-indexed JSAM terms (mass-level loop j = 0..ny-1):
+    #   j=0    (south pole): V_s[:,0,:]   = V[:,0,:]   → clamp to V[:,1,:]
+    #                        adyv_s at j=0 = adyv[0]    → clamp to adyv[1]
+    #   j=ny-1 (north pole): V_n[:,ny-1,:]= V[:,ny,:]  → clamp to V[:,ny-1,:]
+    #                        adyv_n at j=ny-1 = adyv[ny] → clamp to adyv[ny-1]
+    # Without clamping the pole-boundary rows V[:,0,:] and V[:,ny,:] (which are
+    # zero at hard-wall pole boundaries) enter v_bar and produce incorrect dU
+    # at the pole rows.
+    V_s_cl = V_s.at[:, 0,    :].set(V[:, 1,    :])   # south pole jb clamp
+    V_n_cl = V_n.at[:, ny-1, :].set(V[:, ny-1, :])   # north pole jc clamp (V[:,ny]→V[:,ny-1])
+    adyv_s_cl = adyv_s.at[0, 0,    0].set(adyv[1])    # south pole adyv[0] → adyv[1]
+    adyv_n_cl = adyv_n.at[0, ny-1, 0].set(adyv[ny-1]) # north pole adyv[ny] → adyv[ny-1]
+
+    V_s_cl_w = jnp.roll(V_s_cl, +1, axis=-1)
+    V_n_cl_w = jnp.roll(V_n_cl, +1, axis=-1)
+
+    v_bar = (adyv_s_cl * (V_s_cl + V_s_cl_w)
+             + adyv_n_cl * (V_n_cl + V_n_cl_w)) / (4.0 * ady3)
     dU = (f3 + U_left * tanr3) * v_bar
 
     def _q(u):

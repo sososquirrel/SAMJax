@@ -3,10 +3,18 @@
     "allow": [
       "Bash(git commit -m ' *)",
       "Bash(qstat)",
-      "Bash(git commit -m 'Fix FCT scale factor: apply iadz weighting to vertical flux term *)"
+      "Bash(git commit -m 'Fix FCT scale factor: apply iadz weighting to vertical flux term *)",
+      "Bash(tee /tmp/test_era5_init.log)",
+      "Bash(xargs cat *)",
+      "Bash(awk '{print $5}')",
+      "Bash(awk -F',' 'NR>1 && $1==1 {print $1,$2,$3}' /glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug/globals.csv)",
+      "Bash(awk -F',' 'NR>1 && $1==1 {print $1,$2,$3}' /glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/debug/globals.csv)",
+      "Bash(python3 -m py_compile jsam/core/physics/sgs.py)",
+      "Bash(sacct -j 3191590 -o jobid,state,exitcode)"
     ],
     "additionalDirectories": [
-      "/glade/derecho/scratch/sabramian"
+      "/glade/derecho/scratch/sabramian",
+      "/tmp"
     ]
   }
 }

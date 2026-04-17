@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 GSAM = "/glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/debug/globals.csv"
-JSAM = "/glade/derecho/scratch/sabramian/jsam_IRMA_test_f11_fix2/debug/globals.csv"
+JSAM = "/glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug/globals.csv"
 
 g = pd.read_csv(GSAM)
 j = pd.read_csv(JSAM)

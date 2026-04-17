@@ -44,6 +44,7 @@ Replace the ``era5_state`` call inside :func:`~jsam.io.era5.era5_init` with::
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import jax.numpy as jnp
@@ -53,9 +54,11 @@ from jsam.core.state import ModelState
 from jsam.io.era5 import (
     RDA_ROOT,
     _G,
+    _ERA5_P_HPA,
     _read_pl_snapshot,
     era5_latlon,
     interp_horiz,
+    _gsam_reference_column,
 )
 
 # ---------------------------------------------------------------------------
@@ -206,11 +209,252 @@ def _micro_set(
 # Public API
 # ---------------------------------------------------------------------------
 
+def era5_state_from_gsam_init_binary(
+    bin_path: Path | str,
+    grid: LatLonGrid,
+    metric: dict,
+    ug: float = 0.0,
+    vg: float = 0.0,
+) -> ModelState:
+    """
+    Initialise ModelState from the actual gSAM ERA5 init binary.
+
+    Reads the raw ERA5-resolution fields from
+    ``init_era5_YYYYMMDDHHH_GLOBAL.bin`` at float32 precision (exactly as
+    gSAM does), then applies the same height-based vertical interpolation,
+    bilinear horizontal interpolation, omega→w conversion, and micro_set
+    post-processing as :func:`era5_state_gsam`.
+
+    Using the binary rather than ERA5 netCDF eliminates any float32/float64
+    discrepancy in the source ``zr`` heights, giving bit-identical
+    interpolation results to gSAM.
+
+    Parameters
+    ----------
+    bin_path : Path or str
+        Path to ``init_era5_YYYYMMDDHHH_GLOBAL.bin``  (gSAM format).
+    grid : :class:`~jsam.core.grid.latlon.LatLonGrid`
+    metric : dict from build_metric  (provides ``"pres"`` in Pa)
+
+    Returns
+    -------
+    :class:`~jsam.core.state.ModelState`
+    """
+    from jsam.io.era5_binary import read_gsam_init_binary
+
+    bin_path = Path(bin_path)
+    print(f"[era5_state_from_gsam_init_binary] Loading from {bin_path} ...")
+
+    data = read_gsam_init_binary(bin_path)
+
+    nzm = len(grid.z)
+    ny  = len(grid.lat)
+    nx  = len(grid.lon)
+    zi  = np.asarray(grid.zi)
+    z   = np.asarray(grid.z)
+
+    # adz(k) = dz(k) / dz_ref
+    dz_ref = zi[1] - zi[0]
+    adz    = np.diff(zi) / dz_ref   # (nzm,)
+
+    # gamaz(k) = ggr/cp * z(k)
+    gamaz = _GGR / _CP * z          # (nzm,)
+
+    # pres_hpa for micro_set 50-hPa threshold (from metric)
+    pres_hpa = np.array(metric["pres"]) / 100.0   # (nzm,)
+
+    # Source grid from binary (float32, S→N, ascending height)
+    lonr = data['lon'].astype(np.float64)   # (1440,)
+    latr = data['lat'].astype(np.float64)   # (721,)
+    zr   = data['zr'].astype(np.float64)    # (37,) ascending heights [m]
+
+    # ── Vertical interpolation (height-based, matching gSAM read_field3D) ──
+    print("[era5_state_from_gsam_init_binary] Height-based vertical interpolation ...")
+
+    # Scalar fields at mass-grid heights z[k]
+    T_vi    = _interp_height_3d(data['TABS'].astype(np.float64), zr, z)
+    Q_vi    = np.maximum(0.0, _interp_height_3d(data['QV'].astype(np.float64),  zr, z))
+    CLWC_vi = np.maximum(0.0, _interp_height_3d(data['QCL'].astype(np.float64), zr, z))
+    CIWC_vi = np.maximum(0.0, _interp_height_3d(data['QCI'].astype(np.float64), zr, z))
+    U_vi    = _interp_height_3d(data['U'].astype(np.float64),    zr, z)
+    V_vi    = _interp_height_3d(data['V'].astype(np.float64),    zr, z)
+
+    # Omega at interface heights zi[1:nzm] = zi(2:nzm) in Fortran (73 values)
+    # gSAM setdata.f90:392: read_field3D(…w…,zi(2:nzm),…,nzm-1)
+    zi_iface = zi[1:nzm]
+    OMEGA_vi = _interp_height_3d(data['W'].astype(np.float64), zr, zi_iface)  # (73,721,1440)
+
+    # ── Horizontal interpolation ──────────────────────────────────────────────
+    print("[era5_state_from_gsam_init_binary] Bilinear horizontal interpolation ...")
+
+    TABS_m  = interp_horiz(T_vi,    latr, lonr, grid.lat, grid.lon)
+    QV_m    = interp_horiz(Q_vi,    latr, lonr, grid.lat, grid.lon)
+    QCL_m   = interp_horiz(CLWC_vi, latr, lonr, grid.lat, grid.lon)
+    QCI_m   = interp_horiz(CIWC_vi, latr, lonr, grid.lat, grid.lon)
+    del T_vi, Q_vi, CLWC_vi, CIWC_vi
+
+    # U: stagger longitude lonu = lon - dlon/2 (gSAM setgrid.f90 C-grid west face)
+    dlon  = float(grid.lon[1] - grid.lon[0])
+    lonu  = (np.asarray(grid.lon) - 0.5 * dlon) % 360.0
+    U_hi  = interp_horiz(U_vi, latr, lonr, grid.lat, lonu)
+    del U_vi
+
+    # V: stagger latitude lat_v
+    lat_v = np.asarray(grid.lat_v)
+    V_hi  = interp_horiz(V_vi, latr, lonr, lat_v, grid.lon)
+    del V_vi
+
+    # Omega at interface heights → mass-grid lat/lon
+    OMEGA_hi = interp_horiz(OMEGA_vi, latr, lonr, grid.lat, grid.lon)  # (73, ny, nx)
+    del OMEGA_vi
+
+    # ── micro_set (before rho recompute, same as gSAM diagnose order) ─────────
+    print("[era5_state_from_gsam_init_binary] Applying micro_set ...")
+    QCL_new, QCI_new, QV_new, _ = _micro_set(
+        TABS_m, QCL_m, QCI_m, QV_m, pres_hpa, gamaz
+    )
+    # Save original TABS for (a) Newton starting point in satadj and
+    # (b) tabs0_diag for hydrostatic recompute (gSAM diagnose uses pre-satadj TABS).
+    TABS_m_presatadj = TABS_m.copy()
+
+    # ── Recompute rho/rhow from actual TABS (gSAM diagnose + pres recompute) ──
+    # gSAM setdata.f90:424-485: after micro_set, calls diagnose() which sets
+    # tabs0(k) = area-weighted horiz mean of tabs, then recomputes presi/pres/rho/rhow.
+    # This is the rho used in the omega→w conversion at lines 487-495.
+    print("[era5_state_from_gsam_init_binary] Recomputing rho from diagnosed tabs0 ...")
+
+    # tabs0: area-weighted horizontal mean of TABS_m (matches gSAM diagnose.f90)
+    cos_lat = np.cos(np.deg2rad(np.asarray(grid.lat)))
+    wgt = cos_lat / cos_lat.sum()
+    tabs0_diag = np.sum(np.mean(TABS_m, axis=2) * wgt[None, :], axis=1)  # (nzm,)
+
+    # pres0 and pres_seed from binary's zin/presin (float32, same as gSAM uses)
+    zin_f32    = data['zin']    # (37,) float32, ascending heights
+    presin_f32 = data['presin'] # (37,) float32, ascending hPa
+    # pres0: log-linear extrapolation to z=0 (below surface level zin[0]≈97m)
+    pres0_bin = float(np.exp(
+        float(np.log(presin_f32[0]))
+        + (float(np.log(presin_f32[1])) - float(np.log(presin_f32[0])))
+          / (float(zin_f32[1]) - float(zin_f32[0]))
+          * (0.0 - float(zin_f32[0]))
+    ))
+    # pres_seed: log-linear interp of presin at zin to model heights z
+    kk = np.searchsorted(zin_f32.astype(np.float64), z, side='right') - 1
+    kk = np.clip(kk, 0, len(zin_f32) - 2)
+    ln_p_seed = (np.log(presin_f32[kk].astype(np.float64))
+                 + (np.log(presin_f32[kk + 1].astype(np.float64))
+                    - np.log(presin_f32[kk].astype(np.float64)))
+                   / (zin_f32[kk + 1].astype(np.float64) - zin_f32[kk].astype(np.float64))
+                   * (z - zin_f32[kk].astype(np.float64)))
+    pres_seed = np.exp(ln_p_seed)
+
+    ref = _gsam_reference_column(z=z, zi=zi, tabs0=tabs0_diag,
+                                  pres0=pres0_bin, pres_seed=pres_seed)
+    rho  = ref['rho']
+    rhow = np.zeros(nzm + 1, dtype=np.float64)
+    rhow[1:-1] = (rho[:-1] * adz[1:] + rho[1:] * adz[:-1]) / (adz[:-1] + adz[1:])
+    rhow[0]    = 2.0 * rho[0]  - rhow[1]
+    rhow[-1]   = 2.0 * rho[-1] - rhow[-2]
+
+    # ── Omega → W conversion (setdata.f90:487-495) ────────────────────────────
+    # W_arr[1:nzm] holds omega at interface heights zi[1:nzm] (73 levels).
+    # gSAM formula (descending k=nzm..2, vectorised as single pass):
+    #   w(k) = -(adz(k)*omega(k) + adz(k-1)*omega(k-1)) / (adz(k)+adz(k-1)) / (rhow(k)*ggr)
+    # Python k_py = 1..73: omega(k)=W_arr[k_py] at zi[k_py], omega(k-1)=W_arr[k_py-1]
+    # W_arr[0] = 0 (surface BC), W_arr[74] = 0 (top BC).
+    W_arr = np.zeros((nzm + 1, ny, nx), dtype=np.float64)
+    W_arr[1:nzm] = OMEGA_hi   # (73, ny, nx) — omega at zi[1:74]
+    del OMEGA_hi
+
+    adz_k   = adz[1:nzm, None, None]    # adz[1..73] = Fortran adz(2..nzm)
+    adz_km1 = adz[0:nzm-1, None, None]  # adz[0..72] = Fortran adz(1..nzm-1)
+    rhow_k  = rhow[1:nzm, None, None]   # rhow[1..73] = Fortran rhow(2..nzm)
+    W_arr[1:nzm] = (
+        -(adz_k * W_arr[1:nzm] + adz_km1 * W_arr[0:nzm-1])
+        / (adz_k + adz_km1)
+        / (rhow_k * _GGR)
+    )
+
+    # ── micro_init saturation adjustment (gSAM setdata.f90 → micro_init → cloud → micro_diagnose)
+    # gSAM sequence: micro_set (415) → diagnose (424) → hydrostatic pres recompute →
+    #   omega→w (487) → micro_init (530) → cloud.f90 (satadj) → micro_diagnose.
+    # This evaporates oversaturated condensate to thermodynamic equilibrium,
+    # reducing QCL_max from ~2.81e-3 to ~7.67e-4.
+    #
+    # gSAM cloud.f90:
+    #   tabs2 = tabs(i,j,k)              — save original TABS as Newton starting point
+    #   tabs(i,j,k) = t - gamaz          — tabs_dry = TABS - fac_cond*qcl - fac_sub*qci
+    #   q = qv + qcl + qci               — total non-precip water
+    #   Newton (niter<100) using pp(i,j,k)=pres(k) (hydrostatic 1D reference, hPa)
+    #   → qn = max(0, q - qsat)          — condensate at equilibrium
+    #   micro_diagnose: qcl=qn*om, qci=qn*(1-om), qv=q-qn
+    print("[era5_state_from_gsam_init_binary] Applying saturation adjustment (micro_init) ...")
+    from jsam.core.physics.microphysics import satadj as _satadj, MicroParams as _MicroParams
+    _micro_params = _MicroParams()
+    _zeros_3d = jnp.zeros((nzm, ny, nx), dtype=jnp.float64)
+    # gSAM cloud.f90 uses pp(i,j,k) = pres(k) — the hydrostatically RECOMPUTED pressure
+    # from diagnose.f90, not the original metric pressure. Patch metric with ref['pres'] (Pa).
+    _metric_satadj = {**metric, "pres": ref['pres'] * 100.0}   # hPa → Pa
+    _TABS_sa, _QV_sa, _QC_sa, _QI_sa = _satadj(
+        jnp.array(TABS_m,   dtype=jnp.float64),
+        jnp.array(QV_new,   dtype=jnp.float64),
+        jnp.array(QCL_new,  dtype=jnp.float64),
+        jnp.array(QCI_new,  dtype=jnp.float64),
+        _zeros_3d, _zeros_3d, _zeros_3d,   # QR=QS=QG=0 for ERA5 init
+        metric=_metric_satadj,
+        params=_micro_params,
+        n_iter=100,
+        # gSAM cloud.f90: Newton starting point = original TABS (before tabs=t-gamaz overwrite)
+        tabs_guess=jnp.array(TABS_m_presatadj, dtype=jnp.float64),
+    )
+    TABS_m  = np.array(_TABS_sa)
+    QV_new  = np.array(_QV_sa)
+    QCL_new = np.array(_QC_sa)
+    QCI_new = np.array(_QI_sa)
+    del _TABS_sa, _QV_sa, _QC_sa, _QI_sa, _zeros_3d, TABS_m_presatadj, _metric_satadj
+
+    # ── U stagger: periodic east column ──────────────────────────────────────
+    U_stag = np.empty((nzm, ny, nx + 1), dtype=np.float64)
+    U_stag[:, :, :-1] = U_hi
+    U_stag[:, :,  -1] = U_hi[:, :, 0]
+    del U_hi
+
+    # ── Fix 8.1: subtract domain translation velocities (setdata.f90:455-456) ─
+    # gSAM: u(i,j,k) -= ug;  v(i,j,k) -= vg
+    # ug and vg default to 0 in params.f90 and are not set for IRMA.
+    if ug != 0.0:
+        U_stag -= ug
+    if vg != 0.0:
+        V_hi   -= vg
+
+    # ── Build ModelState ──────────────────────────────────────────────────────
+    print("[era5_state_from_gsam_init_binary] Building ModelState ...")
+    return ModelState(
+        U    = jnp.array(U_stag,   dtype=jnp.float64),
+        V    = jnp.array(V_hi,     dtype=jnp.float64),
+        W    = jnp.array(W_arr,    dtype=jnp.float64),
+        TABS = jnp.array(TABS_m,   dtype=jnp.float64),
+        QV   = jnp.array(QV_new,   dtype=jnp.float64),
+        QC   = jnp.array(QCL_new,  dtype=jnp.float64),
+        QI   = jnp.array(QCI_new,  dtype=jnp.float64),
+        QR   = jnp.zeros((nzm, ny, nx), dtype=jnp.float64),
+        QS   = jnp.zeros((nzm, ny, nx), dtype=jnp.float64),
+        QG   = jnp.zeros((nzm, ny, nx), dtype=jnp.float64),
+        TKE  = jnp.zeros((nzm, ny, nx), dtype=jnp.float64),
+        p_prev  = jnp.zeros((nzm, ny, nx), dtype=jnp.float64),
+        p_pprev = jnp.zeros((nzm, ny, nx), dtype=jnp.float64),
+        nstep = jnp.int32(0),
+        time  = jnp.float64(0.0),
+    )
+
+
 def era5_state_gsam(
     grid:     LatLonGrid,
     metric:   dict,
     dt:       datetime,
     rda_root: str = RDA_ROOT,
+    ug:       float = 0.0,
+    vg:       float = 0.0,
 ) -> ModelState:
     """
     Initialise a :class:`~jsam.core.state.ModelState` from ERA5 netCDF,
@@ -319,9 +563,9 @@ def era5_state_gsam(
     QCI_m   = interp_horiz(CIWC_vi, era5_lat_sn, era5_lon, grid.lat, grid.lon)
     del T_vi, Q_vi, CLWC_vi, CIWC_vi
 
-    # U: interpolate to stagger longitudes lonu = lon + dlon/2 (periodic)
+    # U: interpolate to stagger longitudes lonu = lon - dlon/2 (gSAM setgrid.f90:335)
     dlon  = float(grid.lon[1] - grid.lon[0])          # 0.25°
-    lonu  = (np.asarray(grid.lon) + 0.5 * dlon) % 360.0   # (nx,)
+    lonu  = (np.asarray(grid.lon) - 0.5 * dlon) % 360.0   # (nx,)
     U_hi  = interp_horiz(U_vi, era5_lat_sn, era5_lon, grid.lat, lonu)  # (74,ny,nx)
     del U_vi
 
@@ -334,30 +578,52 @@ def era5_state_gsam(
     OMEGA_hi = interp_horiz(OMEGA_vi, era5_lat_sn, era5_lon, grid.lat, grid.lon)  # (73,ny,nx)
     del OMEGA_vi
 
+    # ── micro_set (gSAM setdata.f90:415) ─────────────────────────────────────
+    # Called before diagnose/pres recompute; uses metric pres_hpa as seed.
+    print("[era5_state_gsam] Applying micro_set ...")
+    QCL_new, QCI_new, QV_new, _ = _micro_set(
+        TABS_m, QCL_m, QCI_m, QV_m, pres_hpa, gamaz
+    )
+    # Save original TABS for (a) Newton starting point in satadj (gSAM cloud.f90 tabs2) and
+    # (b) hydrostatic recompute (gSAM diagnose uses pre-satadj TABS, micro_init comes later).
+    TABS_m_presatadj = TABS_m.copy()
+
+    # ── Fix 8.2: hydrostatic pressure recompute (setdata.f90:424-484) ────────
+    # gSAM: diagnose() sets tabs0 = area-weighted domain mean of tabs (424),
+    # then hydrostatically recomputes presi/pres/rho/rhow (427-436, 465, 476-484).
+    # This must happen BEFORE omega→w (487-495) because rhow enters the formula.
+    print("[era5_state_gsam] Hydrostatic pressure recompute from diagnosed tabs0 ...")
+    cos_lat_w = np.cos(np.deg2rad(np.asarray(grid.lat)))   # (ny,)
+    wgt       = cos_lat_w / cos_lat_w.sum()
+    tabs0     = np.sum(np.mean(TABS_m, axis=2) * wgt[None, :], axis=1)  # (nzm,)
+
+    # pres0: log-linear extrapolation of ERA5 pressure levels to z=0
+    # (mirrors gSAM setdata.f90:368 applied to the global-mean ERA5 columns).
+    p_hpa_bt  = _ERA5_P_HPA[::-1]    # (37,) ascending hPa (surface→top)
+    pres0_hpa = float(np.exp(
+        np.interp(0.0, zr_bt, np.log(p_hpa_bt),
+                  left=np.log(p_hpa_bt[0]), right=np.log(p_hpa_bt[-1]))
+    ))
+    # pres_seed: log-interp of ERA5 levels at model cell-centre heights
+    pres_seed_hpa = np.exp(
+        np.interp(z, zr_bt, np.log(p_hpa_bt),
+                  left=np.log(p_hpa_bt[0]), right=np.log(p_hpa_bt[-1]))
+    )
+    ref = _gsam_reference_column(z=z, zi=zi, tabs0=tabs0,
+                                  pres0=pres0_hpa, pres_seed=pres_seed_hpa)
+    # Replace rhow with the hydrostatically consistent values (setdata.f90:476-484)
+    rhow = ref['rhow']    # (nzm+1,)
+
     # ── omega → w conversion  (gSAM setdata.f90:487-495) ─────────────────────
-    #
     #   do k = nzm, 2, -1          ! Fortran k = 74..2
     #     w(:,:,k) = -(adz(k)*w(:,:,k) + adz(k-1)*w(:,:,k-1)) &
     #                /(adz(k)+adz(k-1)) / (rhow(k)*ggr)
     #   end do
-    #   w(:,:,1)  = 0.
-    #   w(:,:,nz) = 0.
-    #
-    # Python mapping: Fortran k → Python W[k-1].
-    # Each update at Fortran k uses w(:,:,k) and w(:,:,k-1) — the *original*
-    # omega at those levels (k-1 is never modified before k is processed in a
-    # descending loop).  The entire loop is therefore a single vectorised pass.
-    #
-    # W_arr indices:  W_arr[0]     = surface  (zi[0] = 0 m)
-    #                 W_arr[1:74]  = converted w at zi[1:74]
-    #                 W_arr[74]    = top       (zi[74])
+    # Uses hydrostatically recomputed rhow from Fix 8.2 above.
     W_arr = np.zeros((nzm + 1, ny, nx), dtype=np.float64)
     W_arr[1:nzm] = OMEGA_hi   # (73, ny, nx) — raw omega before conversion
     del OMEGA_hi
 
-    # Vectorised update (k_py = 1..73, corresponding to Fortran k = 2..74):
-    #   W[k] = -(adz[k]*W[k] + adz[k-1]*W[k-1]) / (adz[k]+adz[k-1]) / (rhow[k]*ggr)
-    # All right-hand-side quantities are the *original* omega values.
     adz_k   = adz[1:nzm, None, None]       # (73,1,1) — adz(2:nzm) Fortran
     adz_km1 = adz[0:nzm-1, None, None]     # (73,1,1) — adz(1:nzm-1) Fortran
     rhow_k  = rhow[1:nzm, None, None]      # (73,1,1) — rhow(2:nzm) Fortran
@@ -368,19 +634,47 @@ def era5_state_gsam(
     )
     # W_arr[0] and W_arr[nzm] remain 0 (surface / rigid-lid BCs)
 
+    # ── micro_init saturation adjustment (gSAM setdata.f90 → micro_init → cloud → micro_diagnose)
+    # gSAM sequence: micro_set (415) → diagnose/pres recompute (424) → omega→w (487)
+    #   → micro_init (530) → cloud.f90 (Newton satadj) → micro_diagnose.
+    # Matches the same step in era5_state_from_gsam_init_binary; see that function for rationale.
+    print("[era5_state_gsam] Applying saturation adjustment (micro_init) ...")
+    from jsam.core.physics.microphysics import satadj as _satadj, MicroParams as _MicroParams
+    _micro_params = _MicroParams()
+    _zeros_3d = jnp.zeros((nzm, ny, nx), dtype=jnp.float64)
+    # gSAM cloud.f90 uses pres(k) after hydrostatic recompute (diagnose.f90)
+    _metric_satadj = {**metric, "pres": ref['pres'] * 100.0}   # hPa → Pa
+    _TABS_sa, _QV_sa, _QC_sa, _QI_sa = _satadj(
+        jnp.array(TABS_m,           dtype=jnp.float64),
+        jnp.array(QV_new,           dtype=jnp.float64),
+        jnp.array(QCL_new,          dtype=jnp.float64),
+        jnp.array(QCI_new,          dtype=jnp.float64),
+        _zeros_3d, _zeros_3d, _zeros_3d,   # QR=QS=QG=0 for ERA5 init
+        metric=_metric_satadj,
+        params=_micro_params,
+        n_iter=100,
+        # gSAM cloud.f90: Newton starting point = original TABS (before tabs=t-gamaz overwrite)
+        tabs_guess=jnp.array(TABS_m_presatadj, dtype=jnp.float64),
+    )
+    TABS_m  = np.array(_TABS_sa)
+    QV_new  = np.array(_QV_sa)
+    QCL_new = np.array(_QC_sa)
+    QCI_new = np.array(_QI_sa)
+    del _TABS_sa, _QV_sa, _QC_sa, _QI_sa, _zeros_3d, TABS_m_presatadj, _metric_satadj
+
     # ── U stagger: append periodic east column ────────────────────────────────
-    # gSAM U(nx+1, ny, nzm): the (nx+1)-th face is the east face of the last
-    # cell = west face of the first cell (periodic).
     U_stag = np.empty((nzm, ny, nx + 1), dtype=np.float64)
     U_stag[:, :, :-1] = U_hi
     U_stag[:, :,  -1] = U_hi[:, :, 0]    # periodic duplicate
     del U_hi
 
-    # ── micro_set post-processing ──────────────────────────────────────────────
-    print("[era5_state_gsam] Applying micro_set ...")
-    QCL_new, QCI_new, QV_new, _ = _micro_set(
-        TABS_m, QCL_m, QCI_m, QV_m, pres_hpa, gamaz
-    )
+    # ── Fix 8.1: subtract domain translation velocities (setdata.f90:455-456) ─
+    # gSAM: u(i,j,k) -= ug;  v(i,j,k) -= vg
+    # ug and vg default to 0 in params.f90; not set for IRMA.
+    if ug != 0.0:
+        U_stag -= ug
+    if vg != 0.0:
+        V_hi   -= vg
 
     # ── Build ModelState ──────────────────────────────────────────────────────
     print("[era5_state_gsam] Building ModelState ...")
@@ -401,3 +695,51 @@ def era5_state_gsam(
         nstep = jnp.int32(0),
         time  = jnp.float64(0.0),
     )
+
+
+_GSAM_BIN_ROOT = "/glade/u/home/sabramian/gSAM1.8.7/GLOBAL_DATA/BIN_D"
+
+
+def era5_state_gsam_with_caching(
+    grid: LatLonGrid,
+    metric: dict,
+    dt: datetime,
+    rda_root: str = RDA_ROOT,
+    cache_dir: Path | str | None = None,
+    gsam_bin_root: str = _GSAM_BIN_ROOT,
+) -> ModelState:
+    """
+    Initialise ModelState from the gSAM ERA5 init binary when available,
+    otherwise fall back to computing from ERA5 netCDF.
+
+    Priority order:
+    1. gSAM init binary  (``init_era5_YYYYMMDDHHH_GLOBAL.bin`` in gsam_bin_root)
+       — uses float32 source data identical to what gSAM itself reads, giving
+       bit-for-bit matching initialization.
+    2. ERA5 netCDF       (computed by :func:`era5_state_gsam`)
+
+    Parameters
+    ----------
+    grid         : :class:`~jsam.core.grid.latlon.LatLonGrid`
+    metric       : dict from build_metric
+    dt           : ERA5 analysis datetime
+    rda_root     : path to NCAR RDA ERA5 netCDF archive
+    cache_dir    : unused (kept for API compatibility)
+    gsam_bin_root: directory containing gSAM init binaries
+
+    Returns
+    -------
+    :class:`~jsam.core.state.ModelState`
+    """
+    bin_name = f"init_era5_{dt.strftime('%Y%m%d%H')}_GLOBAL.bin"
+
+    # Priority 1: gSAM init binary (exact match to gSAM initialization)
+    gsam_bin = Path(gsam_bin_root) / bin_name
+    if gsam_bin.exists():
+        print(f"[era5_state_gsam_with_caching] Using gSAM binary: {gsam_bin}")
+        return era5_state_from_gsam_init_binary(gsam_bin, grid, metric)
+
+    # Priority 2: compute from ERA5 netCDF
+    print(f"[era5_state_gsam_with_caching] gSAM binary not found at {gsam_bin}, "
+          f"computing from ERA5 netCDF ...")
+    return era5_state_gsam(grid, metric, dt, rda_root)

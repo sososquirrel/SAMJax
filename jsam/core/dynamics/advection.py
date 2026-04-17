@@ -70,12 +70,18 @@ def _advect_scalar_jit(
     ady   = metric["ady"][:, None]
     ady3  = ady[None, :, :]
     adz   = (dz / dz[0])[:, None, None]
+    mu    = metric["cos_lat"]          # shape (ny,)
+    muv   = metric["cos_v"]            # shape (ny+1,)
 
     cu_w = U[:, :, :-1]   * dt / dx * adz * ady3
     cu_e = jnp.roll(cu_w, -1, axis=2)
-    cv_s = V[:, 0:ny,   :] * dt / dy3 * adz * ady3
-    cv_n = V[:, 1:ny+1, :] * dt / dy3 * adz * ady3
-    cw_t = W[1:nz+1, :, :] * dt * iadz
+    # Fix 1.5: cv uses muv (cos-lat at V-points), not ady
+    cv_s = V[:, 0:ny,   :] * dt / dy3 * adz * muv[None, :ny,    None]
+    cv_n = V[:, 1:ny+1, :] * dt / dy3 * adz * muv[None, 1:ny+1, None]
+    # Fix 1.3/1.5: cw includes ady*mu factors (rhow cancels: w1=w*rhow*dt/dz*ady*mu,
+    # then cw=w1/(rhow*adz_actual) = w*dt/dz_actual*ady*mu, matching gSAM face_z)
+    ady1d = metric["ady"]                                     # shape (ny,), raw 1-D
+    cw_t = W[1:nz+1, :, :] * dt * iadz * ady1d[None, :, None] * mu[None, :, None]
 
     # ------------------------------------------------------------------ #
     # MACHO predictor — compute high-order face values                    #
@@ -110,19 +116,163 @@ def _advect_scalar_jit(
         fy_n_in = jnp.concatenate([fy_s_in[:, 1:, :], fy_s_in[:, -1:, :]], axis=1)
         return fadv_in + _adv_cn(cv_s, cv_n) * (fy_s_in - fy_n_in), fy_n_in
 
+    # Fix 1.2: non-uniform vertical grid stencil matching gSAM face_5th_z.
+    # Build 1-D adz and adzw arrays (nzm = nz levels).
+    # adz[k] = dz[k]/dz[0]; adzw[0]=adz[0], adzw[k]=0.5*(adz[k-1]+adz[k]) for k=1..nzm-1,
+    # adzw[nzm]=adz[nzm-1].  (Fortran adz(k_f) = adz1d[k_f-1], same for adzw.)
+    adz1d  = dz / dz[0]                                            # shape (nz,)
+    adzw1d = jnp.concatenate([
+        adz1d[:1],
+        0.5 * (adz1d[:-1] + adz1d[1:]),
+        adz1d[-1:],
+    ])                                                              # shape (nz+1,)
+
     def _face_z(fadv_in):
+        # Non-uniform vertical grid stencil matching gSAM face_5th_z / face_3rd_z / face_2nd_z.
+        # Pad 3 levels on each side (edge-replicate).  fp[k+3] = fadv_in[k].
         fp = jnp.pad(fadv_in, ((3, 3), (0, 0), (0, 0)), mode='edge')
-        fz_t_in = _face5(
-            fp[1:nz+1], fp[2:nz+2], fp[3:nz+3],
-            fp[4:nz+4], fp[5:nz+5], fp[6:nz+6],
-            cw_t,
+
+        # Index mapping: Fortran face index i = Python k+1.
+        # Fortran adz(i)   -> adz1d[k];   adz(i-1) -> adz1d[k-1]; adz(i-2) -> adz1d[k-2]
+        #         adz(i+1) -> adz1d[k+1]
+        # Fortran adzw(i-2)-> adzw1d[k-1]; adzw(i-1)->adzw1d[k]; adzw(i)->adzw1d[k+1];
+        #         adzw(i+1)->adzw1d[k+2];  adzw(i+2)->adzw1d[k+3]  (adzw1d has nz+1 entries)
+        k_idx = jnp.arange(nz)
+
+        az_i   = adz1d[jnp.clip(k_idx,     0, nz - 1)]   # adz(i)
+        az_im1 = adz1d[jnp.clip(k_idx - 1, 0, nz - 1)]   # adz(i-1)
+        az_im2 = adz1d[jnp.clip(k_idx - 2, 0, nz - 1)]   # adz(i-2)
+        az_ip1 = adz1d[jnp.clip(k_idx + 1, 0, nz - 1)]   # adz(i+1)
+
+        aw_im2 = adzw1d[jnp.clip(k_idx - 1, 0, nz)]      # adzw(i-2)
+        aw_im1 = adzw1d[jnp.clip(k_idx,     0, nz)]       # adzw(i-1)
+        aw_i   = adzw1d[jnp.clip(k_idx + 1, 0, nz)]       # adzw(i)
+        aw_ip1 = adzw1d[jnp.clip(k_idx + 2, 0, nz)]       # adzw(i+1)
+        aw_ip2 = adzw1d[jnp.clip(k_idx + 3, 0, nz)]       # adzw(i+2)
+
+        def _b(x): return x[:, None, None]   # broadcast (nz,) -> (nz,1,1)
+
+        cn = cw_t   # shape (nz, ny, nx)
+
+        # Stencil slices (same for all order variants)
+        f_im3 = fp[0:nz]; f_im2 = fp[1:nz+1]; f_im1 = fp[2:nz+2]
+        f_i   = fp[3:nz+3]; f_ip1 = fp[4:nz+4]; f_ip2 = fp[5:nz+5]
+
+        # Precompute inverse denominators
+        iaw_i   = 1.0 / _b(aw_i)
+        iaz_i   = 1.0 / _b(az_i)
+        iaz_im1 = 1.0 / _b(az_im1)
+        iaz_ip1 = 1.0 / _b(az_ip1)
+        iaz_im2 = 1.0 / _b(az_im2)
+
+        # --- Shared linear term (also face_2nd_z entire result) ---
+        # face_2nd_z = 0.5*(f_i + f_im1 - cn*adz(i)/adzw(i)*(f_i-f_im1))
+        lin = f_i + f_im1 - cn * _b(az_i) * iaw_i * (f_i - f_im1)  # inner (without 0.5)
+
+        # --- face_3rd_z non-uniform (Fortran: face_3rd_z, used at k=2 and k=nz-2) ---
+        # Fortran returns 0.5*(lin_inner + positive_3rd + negative_3rd + sign*(pos-neg))
+        # positive_3rd = 1/6*(cn^2*adz(i)^2/adzw(i)/adzw(i-1)-1)
+        #               *(adzw(i-1)/adz(i-1)*(f_i-f_im1) - adzw(i)/adz(i-1)*(f_im1-f_im2))
+        # negative_3rd = 1/6*(cn^2*adz(i)^2*adzw(i)/adzw(i+1)-1)
+        #               *(adzw(i)/adz(i)*(f_ip1-f_i) - adzw(i+1)/adz(i)*(f_i-f_im1))
+        p3 = ((1.0/6.0) * (cn*cn * _b(az_i*az_i) * iaw_i / _b(aw_im1) - 1.0)
+              * (_b(aw_im1) * iaz_im1 * (f_i - f_im1) - _b(aw_i) * iaz_im1 * (f_im1 - f_im2)))
+        n3 = ((1.0/6.0) * (cn*cn * _b(az_i*az_i) * _b(aw_i) / _b(aw_ip1) - 1.0)
+              * (_b(aw_i) * iaz_i * (f_ip1 - f_i) - _b(aw_ip1) * iaz_i * (f_i - f_im1)))
+        fz3 = 0.5 * (lin + p3 + n3 + jnp.sign(cn) * (p3 - n3))
+
+        # --- face_5th_z non-uniform (interior levels k=3..nz-3) ---
+        # Fortran returns 0.5*(lin_inner + c3 + c_asym + p5 + n5 + sign*(p5-n5))
+        # (a) 3rd-order correction (Fortran line 170-172):
+        # +1/3*(cn^2*adz(i)^2/adzw(i+1)/adzw(i-1)-1)
+        #      *(adzw(i-1)/(adz(i)+adz(i-1))*(f_ip1-f_i) - adzw(i+1)/(adz(i)+adz(i-1))*(f_im1-f_im2))
+        denom3 = _b(az_i + az_im1)
+        c3_coeff = (1.0/3.0) * (cn*cn * _b(az_i*az_i) / (_b(aw_ip1) * _b(aw_im1)) - 1.0)
+        c3 = c3_coeff * (_b(aw_im1) / denom3 * (f_ip1 - f_i)
+                        - _b(aw_ip1) / denom3 * (f_im1 - f_im2))
+
+        # (b) Asymmetric 5th correction (Fortran line 173-176):
+        # -1/12*(cn^2*adz(i)^2*adzw(i-1)/adzw(i+1)-1)*cn*adz(i)/adzw(i)
+        #      *(adzw(i-1)/adz(i)*(f_ip1-f_i)
+        #        - adzw(i+1)*adzw(i-1)*(adz(i-1)+adz(i))/adzw(i)/adz(i)/adz(i-1)*(f_i-f_im1)
+        #        + adzw(i+1)/adz(i-1)*(f_im1-f_im2))
+        # Note: outer coefficient uses adzw(i-1) NOT inverted (Fortran line 173)
+        c_asym_coeff = ((-1.0/12.0)
+                        * (cn*cn * _b(az_i*az_i) * _b(aw_im1) / _b(aw_ip1) - 1.0)
+                        * cn * _b(az_i) * iaw_i)
+        c_asym = c_asym_coeff * (
+              _b(aw_im1) * iaz_i * (f_ip1 - f_i)
+            - _b(aw_ip1 * aw_im1) * _b(az_im1 + az_i) * iaw_i * iaz_i * iaz_im1 * (f_i - f_im1)
+            + _b(aw_ip1) * iaz_im1 * (f_im1 - f_im2)
         )
-        fz_t_in = fz_t_in.at[-1].set(0.0)  # rigid-lid BC
+
+        # (c) positive_5th (Fortran line 150-157):
+        # 1/120*(cn^2*adz^2/adzw(i)/adzw(i-1)-1)*(cn^2*adz^2/adzw(i+1)/adzw(i-2)-4)
+        # * (  adzw(i-1)*adzw(i-2)/adz(i)/adz(i-1)*(f_ip1-f_i)
+        #    - adzw(i+1)*adzw(i-2)*(adzw(i-1)*adz(i-1)+adzw(i-1)*adz(i)+adzw(i)*adz(i))
+        #       /adzw(i)/adz(i)/adz(i-1)^2*(f_i-f_im1)
+        #    + adzw(i+1)*adzw(i-2)*(adzw(i-1)*adz(i-2)+adzw(i)*adz(i-2)+adzw(i)*adz(i-1))
+        #       /adzw(i-1)/adz(i-1)^2/adz(i-2)*(f_im1-f_im2)
+        #    - adzw(i+1)*adzw(i)/adz(i-1)/adz(i-2)*(f_im2-f_im3) )
+        p5_a = ((1.0/120.0)
+                * (cn*cn * _b(az_i*az_i) / (_b(aw_i) * _b(aw_im1)) - 1.0)
+                * (cn*cn * _b(az_i*az_i) / (_b(aw_ip1) * _b(aw_im2)) - 4.0))
+        p5 = p5_a * (
+              _b(aw_im1 * aw_im2) * iaz_i * iaz_im1 * (f_ip1 - f_i)
+            - _b(aw_ip1 * aw_im2) * _b(aw_im1*az_im1 + aw_im1*az_i + aw_i*az_i)
+              * iaw_i * iaz_i * iaz_im1 * iaz_im1 * (f_i - f_im1)
+            + _b(aw_ip1 * aw_im2) * _b(aw_im1*az_im2 + aw_i*az_im2 + aw_i*az_im1)
+              / _b(aw_im1) * iaz_im1 * iaz_im1 * iaz_im2 * (f_im1 - f_im2)
+            - _b(aw_ip1 * aw_i) * iaz_im1 * iaz_im2 * (f_im2 - f_im3)
+        )
+
+        # (d) negative_5th (Fortran line 159-166):
+        # 1/120*(cn^2*adz^2/adzw(i+1)/adzw(i)-1)*(cn^2*adz^2/adzw(i+2)/adzw(i-1)-4)
+        # * (  adzw(i)*adzw(i-1)/adz(i+1)/adz(i)*(f_ip2-f_ip1)
+        #    - adzw(i+2)*adzw(i-1)*(adzw(i)*adz(i)+adzw(i)*adz(i+1)+adzw(i+1)*adz(i+1))
+        #       /adzw(i+1)/adz(i+1)/adz(i)^2*(f_ip1-f_i)
+        #    + adzw(i+2)*adzw(i-1)*(adzw(i)*adz(i-1)+adzw(i+1)*adz(i-1)+adzw(i+1)*adz(i))
+        #       /adzw(i)/adz(i)^2/adz(i-1)*(f_i-f_im1)
+        #    - adzw(i+2)*adzw(i+1)/adz(i)/adz(i-1)*(f_im1-f_im2) )
+        n5_a = ((1.0/120.0)
+                * (cn*cn * _b(az_i*az_i) / (_b(aw_ip1) * _b(aw_i)) - 1.0)
+                * (cn*cn * _b(az_i*az_i) / (_b(aw_ip2) * _b(aw_im1)) - 4.0))
+        n5 = n5_a * (
+              _b(aw_i * aw_im1) * iaz_ip1 * iaz_i * (f_ip2 - f_ip1)
+            - _b(aw_ip2 * aw_im1) * _b(aw_i*az_i + aw_i*az_ip1 + aw_ip1*az_ip1)
+              / _b(aw_ip1) * iaz_ip1 * iaz_i * iaz_i * (f_ip1 - f_i)
+            + _b(aw_ip2 * aw_im1) * _b(aw_i*az_im1 + aw_ip1*az_im1 + aw_ip1*az_i)
+              * iaw_i * iaz_i * iaz_i * iaz_im1 * (f_i - f_im1)
+            - _b(aw_ip2 * aw_ip1) * iaz_i * iaz_im1 * (f_im1 - f_im2)
+        )
+
+        fz5 = 0.5 * (lin + c3 + c_asym + p5 + n5 + jnp.sign(cn) * (p5 - n5))
+
+        # Select order by level:
+        # k=0: bottom BC=0 (Fortran fz(1)=0)
+        # k=1: face_2nd_z  (Fortran fz(2))
+        # k=2: face_3rd_z  (Fortran fz(3))
+        # k=3..nz-3: face_5th_z (Fortran fz(4..nzm-2))
+        # k=nz-2: face_3rd_z (Fortran fz(nzm-1))
+        # k=nz-1: rigid-lid BC=0 (Fortran fz(nzm)=0 and fz(nz)=0)
+        fz2 = 0.5 * lin   # face_2nd_z = 0.5 * lin_inner
+        k_arr = jnp.arange(nz)[:, None, None]
+        fz_t_in = jnp.where(k_arr == 0,      0.0,
+                   jnp.where(k_arr == 1,      fz2,   # face_2nd_z
+                   jnp.where(k_arr == 2,      fz3,   # face_3rd_z
+                   jnp.where(k_arr == nz - 2, fz3,   # face_3rd_z
+                              fz5))))                  # face_5th_z (interior) or nz-1 (overridden)
+        fz_t_in = fz_t_in.at[-1].set(0.0)    # rigid-lid BC
         return fz_t_in
 
     def _adv_update_z(fadv_in, fz_t_in):
         fz_b_in = jnp.concatenate([jnp.zeros_like(fz_t_in[:1]), fz_t_in[:-1]], axis=0)
-        return fadv_in + _adv_cn(cw_b, cw_t) * (fz_b_in - fz_t_in), fz_b_in
+        update = _adv_cn(cw_b, cw_t) * (fz_b_in - fz_t_in)
+        # Fix 1.7: gSAM adv_form_update_z loops k=2..nzm-1 (Fortran 1-based),
+        # skipping k=1 (bottom) and k=nzm (top).  In 0-based terms: skip index 0
+        # and index nz-1.
+        mask = jnp.ones(nz).at[0].set(0.0).at[-1].set(0.0)
+        return fadv_in + update * mask[:, None, None], fz_b_in
 
     fadv = phi
 
@@ -226,15 +376,19 @@ def _advect_scalar_jit(
 
     eps = 1e-10
 
+    # Fix 1.6: gSAM fct3D (advect_um_lib.f90:478-488) computes both scale
+    # factors as (f - mn) / (out_flux * irho(k) + eps) where irho(k) = 1/rho(k).
+    # The entire sum (horizontal + vertical/iadz terms) is multiplied by irho
+    # before adding eps.  Match this density weighting in the denominator.
     out_flux = (jnp.maximum(0.0, afx_e) - jnp.minimum(0.0, afx_w)
               + jnp.maximum(0.0, afy_n) - jnp.minimum(0.0, afy_s)
               + (jnp.maximum(0.0, afz_t) - jnp.minimum(0.0, afz_b)) * iadz)
-    scale_out = (f_up - mn) / (out_flux + eps)
+    scale_out = (f_up - mn) / (out_flux * irho + eps)
 
     in_flux = (jnp.maximum(0.0, afx_w) - jnp.minimum(0.0, afx_e)
              + jnp.maximum(0.0, afy_s) - jnp.minimum(0.0, afy_n)
              + (jnp.maximum(0.0, afz_b) - jnp.minimum(0.0, afz_t)) * iadz)
-    scale_in = (mx - f_up) / (in_flux + eps)
+    scale_in = (mx - f_up) / (in_flux * irho + eps)
     scale_out_xm = jnp.roll(scale_out, 1, axis=2)
     scale_in_xm  = jnp.roll(scale_in,  1, axis=2)
     afx_w = (jnp.maximum(0.0, afx_w) * jnp.minimum(1.0, jnp.minimum(scale_out_xm, scale_in))
@@ -299,7 +453,14 @@ def _flux3(
 def _mom_adv_tend(
     U: jax.Array, V: jax.Array, W: jax.Array, metric: dict, dt: float
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Spherical mass-weighted momentum advective tendencies."""
+    """Spherical mass-weighted momentum advective tendencies.
+
+    Uses 2nd-order centered differences (gSAM nadv_mom=2, advect2_mom_xy +
+    advect2_mom_z).  The centered flux formula at face i+1/2 is:
+        F = 0.25 * (u1_L + u1_R) * (phi_L + phi_R)
+    where u1 are mass-flux-weighted advective velocities and phi is the
+    transported momentum component.
+    """
     mu     = metric["cos_lat"]
     muv    = metric["cos_v"]
     ady    = metric["ady"]
@@ -324,6 +485,8 @@ def _mom_adv_tend(
     dtdy = dt / dy_ref
     dtdz = dt / dz_ref
 
+    # Mass-flux-weighted advective velocities (same as before — verified
+    # against gSAM advect_mom.f90: gu = mu*rho*ady*adz, etc.)
     u1 = U * (rho[:, None, None] * dtdx
               * adz[:, None, None] * ady[None, :, None])
     v1 = V * (rho[:, None, None] * dtdy
@@ -331,6 +494,7 @@ def _mom_adv_tend(
     w1 = W * (rhow[:, None, None] * dtdz
               * ady[None, :, None] * mu[None, :, None])
 
+    # Grid Jacobians (1/g) for tendency normalisation
     gu3 = (mu[None, :, None] * rho[:, None, None]
            * ady[None, :, None] * adz[:, None, None])
     gv3_int = (muv[None, 1:ny, None] * rho[:, None, None]
@@ -338,98 +502,157 @@ def _mom_adv_tend(
     gw3_int = (mu[None, :, None] * rhow[1:nz, None, None]
                * ady[None, :, None] * adzw[1:nz, None, None])
 
+    # ------------------------------------------------------------------
+    # U tendency
+    # advect2_mom_xy (x-direction, 2D branch j=1):
+    #   fu(i,j) = 0.25*(u1(ic,j,k)+u1(i,j,k))*(u(i,j,k)+u(ic,j,k))
+    #   dudt -= igu*(fu(i,j)-fu(ib,j))
+    # Here u1 lives on cell centres (same staggering as U on a C-grid with
+    # a redundant east column).  u1_c = u1[:,:,:nx], u1_cp = u1[:,:,1:nx+1]
+    # is u1 at the cell to the east (ic face = i+1 in Fortran 1-based).
+    # ------------------------------------------------------------------
     U_c   = U[:, :, :nx]
     u1_c  = u1[:, :, :nx]
-    u1_cp = jnp.roll(u1_c, -1, axis=2)
+    u1_cp = u1[:, :, 1:nx+1]          # u1 at eastern neighbour (ic = i+1)
 
-    U_m1 = jnp.roll(U_c, +1, axis=2)
-    U_p1 = jnp.roll(U_c, -1, axis=2)
-    U_p2 = jnp.roll(U_c, -2, axis=2)
-    flux_x_U = _flux3(U_m1, U_c, U_p1, U_p2, 0.5 * (u1_c + u1_cp))
-    dU_x = -(flux_x_U - jnp.roll(flux_x_U, +1, axis=2)) / gu3
+    # x-flux of U: F_{i+1/2} = 0.25*(u1_i + u1_{i+1})*(U_i + U_{i+1})
+    fu_x = 0.25 * (u1_c + u1_cp) * (U_c + jnp.roll(U_c, -1, axis=2))
+    dU_x = -(fu_x - jnp.roll(fu_x, +1, axis=2)) / gu3
 
-    v1_face_all = 0.5 * (v1 + jnp.roll(v1, +1, axis=-1))
-    v_adv_U_n   = v1_face_all[:, 1:ny+1, :]
-    U_py = jnp.concatenate(
-        [U_c[:, :1, :], U_c, U_c[:, -1:, :], U_c[:, -2:-1, :]], axis=1,
-    )
-    fy_n_U = _flux3(U_py[:, 0:ny, :],   U_py[:, 1:ny+1, :],
-                    U_py[:, 2:ny+2, :], U_py[:, 3:ny+3, :], v_adv_U_n)
-    fy_s_U = jnp.concatenate([jnp.zeros_like(fy_n_U[:, :1, :]),
-                              fy_n_U[:, :-1, :]], axis=1)
-    dU_y = -(fy_n_U - fy_s_U) / gu3
+    # y-flux of U (3D gSAM): fu(i,j)=0.25*(v1(i,jc,k)+v1(ib,jc,k))*(u(i,j,k)+u(i,jc,k))
+    # v1 has shape (nz, ny+1, nx+1); ib = i-1 → roll(v1, +1, axis=2)
+    # The face j+1/2 uses v1 at (i, jc=j+1) and (ib=i-1, jc).
+    # v1_jc_i  = v1[:, 1:ny+1, :nx]   (at j+1, column i)
+    # v1_jc_im1= v1[:, 1:ny+1, :nx] rolled +1 in x → v1[:, 1:ny+1, :] roll +1 sliced
+    v1_jc    = v1[:, 1:ny+1, :nx]                        # shape (nz, ny, nx)
+    v1_jc_xm = jnp.roll(v1[:, 1:ny+1, :nx], +1, axis=2) # v1 at (ib, jc)
+    # U at (i,j) and (i,jc): U_c and U_c shifted +1 in y
+    U_c_yn   = jnp.concatenate([U_c[:, 1:, :], U_c[:, -1:, :]], axis=1)  # U at j+1 (periodic/edge)
+    fu_y_n   = 0.25 * (v1_jc + v1_jc_xm) * (U_c + U_c_yn)               # flux at j+1/2
+    fu_y_s   = jnp.concatenate([jnp.zeros_like(fu_y_n[:, :1, :]),
+                                 fu_y_n[:, :-1, :]], axis=1)               # flux at j-1/2
+    dU_y = -(fu_y_n - fu_y_s) / gu3
 
-    w1_face_all = 0.5 * (w1 + jnp.roll(w1, +1, axis=-1))
-    w_adv_U_int = w1_face_all[1:nz, :, :]
-    U_pz = jnp.pad(U_c, ((2, 2), (0, 0), (0, 0)), mode='edge')
-    fuz_int = _flux3(U_pz[1:nz],   U_pz[2:nz+1],
-                     U_pz[3:nz+2], U_pz[4:nz+3], w_adv_U_int)
-    fuz_full = jnp.concatenate([jnp.zeros_like(fuz_int[:1]),
-                                fuz_int,
-                                jnp.zeros_like(fuz_int[:1])], axis=0)
+    # z-flux of U: fuz(k) = 0.25*(w1(i,j,k)+w1(i-1,j,k))*(u(i,j,k)+u(i,j,kb))
+    # w1 shape (nz+1, ny, nx+1); w1(i-1,j,k) → roll w1 +1 in x
+    # Face at k (between k-1 and k), for k=2..nzm (interior).
+    # w1_k_i   = w1[1:nz, :, :nx]   (level k, column i)
+    # w1_k_im1 = roll(w1[1:nz, :, :nx], +1, axis=2)
+    w1_int    = w1[1:nz, :, :nx]                       # shape (nz-1, ny, nx)
+    w1_int_xm = jnp.roll(w1[1:nz, :, :nx], +1, axis=2)
+    U_kb      = U_c[0:nz-1, :, :]                      # U at k-1
+    U_k       = U_c[1:nz,   :, :]                      # U at k
+    fuz_int   = 0.25 * (w1_int + w1_int_xm) * (U_k + U_kb)  # shape (nz-1, ny, nx)
+    fuz_full  = jnp.concatenate([jnp.zeros_like(fuz_int[:1]),
+                                  fuz_int,
+                                  jnp.zeros_like(fuz_int[:1])], axis=0)   # (nz+1, ny, nx)
+    # tendency: dudt -= igu*(fuz(kc)-fuz(k))  where kc=k+1
     dU_z = -(fuz_full[1:nz+1] - fuz_full[0:nz]) / gu3
 
     dU = dU_x + dU_y + dU_z
 
-    V_prog = V[:, 1:ny, :]
+    # ------------------------------------------------------------------
+    # V tendency — V_prog lives at interior y-faces j=1..ny-1 (0-based)
+    # advect2_mom_xy x-direction (3D):
+    #   fv(i,j)=0.25*(u1(ic,j,k)+u1(ic,jb,k))*(v(i,j,k)+v(ic,j,k))
+    # ic=i+1 (east face), jb=j-1.
+    # v1 is on (nz, ny+1, nx+1); V_prog is V[:, 1:ny, :].
+    # u1 at (ic, j, k): u1[:, 1:ny, 1:nx+1]   (east column of interior rows)
+    # u1 at (ic, jb, k): u1[:, 0:ny-1, 1:nx+1]
+    # ------------------------------------------------------------------
+    V_prog = V[:, 1:ny, :]                               # (nz, ny-1, nx+1)
+    V_c    = V_prog[:, :, :nx]                           # (nz, ny-1, nx)
+    V_cp   = jnp.roll(V_c, -1, axis=2)                   # V at i+1
 
-    u1_east = u1[:, :, 1:nx+1]
-    u1_V_e  = 0.5 * (u1_east[:, 1:ny, :] + u1_east[:, 0:ny-1, :])
-    V_m1 = jnp.roll(V_prog, +1, axis=2)
-    V_p1 = jnp.roll(V_prog, -1, axis=2)
-    V_p2 = jnp.roll(V_prog, -2, axis=2)
-    flux_x_V = _flux3(V_m1, V_prog, V_p1, V_p2, u1_V_e)
-    dV_x = -(flux_x_V - jnp.roll(flux_x_V, +1, axis=2)) / gv3_int
+    u1_e_j  = u1[:, 1:ny,   1:nx+1]   # u1 at (ic=i+1, j,  k): (nz, ny-1, nx)
+    u1_e_jb = u1[:, 0:ny-1, 1:nx+1]   # u1 at (ic=i+1, jb, k): (nz, ny-1, nx)
+    fv_x    = 0.25 * (u1_e_j + u1_e_jb) * (V_c + V_cp)
+    dV_x    = -(fv_x - jnp.roll(fv_x, +1, axis=2)) / gv3_int
 
-    V_ext = jnp.concatenate([V, -V[:, -2:-1, :]], axis=1)
-    v1_V_n_a = v1[:, 1:ny,   :]
-    v1_V_n_b = v1[:, 2:ny+1, :]
-    v_adv_V_n = 0.5 * (v1_V_n_a + v1_V_n_b)
-    fy_n_V = _flux3(V_ext[:, 0:ny-1, :],  V_ext[:, 1:ny,   :],
-                    V_ext[:, 2:ny+1, :],  V_ext[:, 3:ny+2, :], v_adv_V_n)
-    fy_s_V = jnp.concatenate([jnp.zeros_like(fy_n_V[:, :1, :]),
-                              fy_n_V[:, :-1, :]], axis=1)
-    dV_y = -(fy_n_V - fy_s_V) / gv3_int
+    # y-flux of V: fv(i,j)=0.25*(v1(i,jc,k)+v1(i,j,k))*(v(i,j,k)+v(i,jc,k))
+    # jc=j+1; v1 at j → v1[:, 1:ny, :nx], v1 at jc → v1[:, 2:ny+1, :nx]
+    v1_j  = v1[:, 1:ny,   :nx]   # v1 at j   (nz, ny-1, nx)
+    v1_jc2 = v1[:, 2:ny+1, :nx]  # v1 at j+1 (nz, ny-1, nx)
+    V_jc  = V[:, 2:ny+1, :nx]    # V at jc=j+1 (nz, ny-1, nx)
+    fv_y_n = 0.25 * (v1_jc2 + v1_j) * (V_c + V_jc)
+    fv_y_s = jnp.concatenate([jnp.zeros_like(fv_y_n[:, :1, :]),
+                               fv_y_n[:, :-1, :]], axis=1)
+    dV_y = -(fv_y_n - fv_y_s) / gv3_int
 
-    w1_V_all = 0.5 * (w1[:, 1:ny, :] + w1[:, 0:ny-1, :])
-    w_adv_V_int = w1_V_all[1:nz, :, :]
-    V_pz = jnp.pad(V_prog, ((2, 2), (0, 0), (0, 0)), mode='edge')
-    fvz_int = _flux3(V_pz[1:nz],   V_pz[2:nz+1],
-                     V_pz[3:nz+2], V_pz[4:nz+3], w_adv_V_int)
-    fvz_full = jnp.concatenate([jnp.zeros_like(fvz_int[:1]),
-                                fvz_int,
-                                jnp.zeros_like(fvz_int[:1])], axis=0)
+    # z-flux of V: fvz(k)=0.25*(w1(i,j,k)+w1(i,jb,k))*(v(i,j,k)+v(i,j,kb))
+    # w1 at (i,j,k) = w1[1:nz, 1:ny, :nx]; w1 at (i,jb=j-1,k) = w1[1:nz, 0:ny-1, :nx]
+    w1_j_int  = w1[1:nz, 1:ny,   :nx]   # (nz-1, ny-1, nx)
+    w1_jb_int = w1[1:nz, 0:ny-1, :nx]
+    V_k       = V_c[1:nz,   :, :]        # V_prog at k
+    V_kb      = V_c[0:nz-1, :, :]        # V_prog at k-1
+    fvz_int   = 0.25 * (w1_j_int + w1_jb_int) * (V_k + V_kb)
+    fvz_full  = jnp.concatenate([jnp.zeros_like(fvz_int[:1]),
+                                  fvz_int,
+                                  jnp.zeros_like(fvz_int[:1])], axis=0)
     dV_z = -(fvz_full[1:nz+1] - fvz_full[0:nz]) / gv3_int
 
     dV = dV_x + dV_y + dV_z
 
-    W_core = W[1:nz, :, :]
+    # ------------------------------------------------------------------
+    # W tendency — W_core lives at interior z-faces k=1..nzm-1 (0-based)
+    # advect2_mom_xy x-direction:
+    #   fw(i,j)=0.25*(u1(ic,j,k)+u1(ic,j,kcu))*(w(i,j,kc)+w(ic,j,kc))
+    # kc=k+1, kcu=min(kc,nzm); W_core = W[1:nz, :, :]; its level index maps
+    # to kc=1..nzm-1 in Fortran 1-based → kc in 0-based = 1..nz-1.
+    # u1(ic,j,k)   = u1[k-1, :, 1:nx+1]  (k-1 because k goes 1..nzm in Fortran
+    #                                       and W_core[0] = W[1])
+    # u1(ic,j,kcu) = u1[min(k,nzm-1), :, 1:nx+1]  → u1[k, :, 1:nx+1] clamped
+    # For W_core level l (0-based, l=0..nz-2): k_f = l+1, kc_f = l+2, kcu_f=min(l+2,nzm)
+    #   u1 index for k  : l   (0-based)
+    #   u1 index for kcu: min(l+1, nz-1)
+    # ------------------------------------------------------------------
+    W_core = W[1:nz, :, :]                  # (nz-1, ny, nx+1)
+    W_c    = W_core[:, :, :nx]              # (nz-1, ny, nx)
+    W_cp   = jnp.roll(W_c, -1, axis=2)     # W at i+1
 
-    u1_W_e = 0.5 * (u1_east[0:nz-1, :, :] + u1_east[1:nz, :, :])
-    W_m1 = jnp.roll(W_core, +1, axis=2)
-    W_p1 = jnp.roll(W_core, -1, axis=2)
-    W_p2 = jnp.roll(W_core, -2, axis=2)
-    flux_x_W = _flux3(W_m1, W_core, W_p1, W_p2, u1_W_e)
-    dW_x = -(flux_x_W - jnp.roll(flux_x_W, +1, axis=2)) / gw3_int
+    # u1 at (ic=i+1, j, k) and (ic, j, kcu):
+    # l = 0..nz-2; k-index in u1 = l, kcu-index = min(l+1, nz-1)
+    u1_e_k    = u1[0:nz-1, :, 1:nx+1]      # (nz-1, ny, nx)
+    u1_e_kcu  = u1[1:nz,   :, 1:nx+1]      # (nz-1, ny, nx); clamp handled by pad below
+    # clamp: at top level (l=nz-2), kcu should saturate at nzm=nz-1 (0-based nz-2 in u1)
+    # u1 has shape (nz, ...) so u1[1:nz] goes up to u1[nz-1] which is fine (nz-1 = nzm in 0-based)
+    fw_x   = 0.25 * (u1_e_k + u1_e_kcu) * (W_c + W_cp)
+    dW_x   = -(fw_x - jnp.roll(fw_x, +1, axis=2)) / gw3_int
 
-    v1_Wy_a = v1[0:nz-1, :, :]
-    v1_Wy_b = v1[1:nz,   :, :]
-    v1_W    = 0.5 * (v1_Wy_a + v1_Wy_b)
-    v_adv_W_n = v1_W[:, 1:ny+1, :]
-    W_py = jnp.concatenate(
-        [W_core[:, :1, :], W_core, W_core[:, -1:, :], W_core[:, -2:-1, :]], axis=1,
-    )
-    fy_n_W = _flux3(W_py[:, 0:ny, :],   W_py[:, 1:ny+1, :],
-                    W_py[:, 2:ny+2, :], W_py[:, 3:ny+3, :], v_adv_W_n)
-    fy_s_W = jnp.concatenate([jnp.zeros_like(fy_n_W[:, :1, :]),
-                              fy_n_W[:, :-1, :]], axis=1)
-    dW_y = -(fy_n_W - fy_s_W) / gw3_int
+    # y-flux of W: fw(i,j)=0.25*(v1(i,jc,k)+v1(i,jc,kcu))*(w(i,j,kc)+w(i,jc,kc))
+    # v1 at (i,jc=j+1,k) = v1[l, j+1, :nx]; v1 at (i,jc,kcu) = v1[l+1, j+1, :nx] clamped
+    v1_jc_k   = v1[0:nz-1, 1:ny+1, :nx]   # (nz-1, ny, nx)
+    v1_jc_kcu = v1[1:nz,   1:ny+1, :nx]   # (nz-1, ny, nx)
+    # W is (nz+1, ny, nx+1) — no ghost cell in y; Neumann-pad north before j+1 access
+    W_pad_y   = jnp.pad(W, ((0,0), (0,1), (0,0)), mode='edge')
+    W_jc      = W_pad_y[1:nz, 1:ny+1, :nx]  # W at jc=j+1 (nz-1, ny, nx)
+    fw_y_n    = 0.25 * (v1_jc_k + v1_jc_kcu) * (W_c + W_jc)
+    fw_y_s    = jnp.concatenate([jnp.zeros_like(fw_y_n[:, :1, :]),
+                                  fw_y_n[:, :-1, :]], axis=1)
+    dW_y = -(fw_y_n - fw_y_s) / gw3_int
 
-    w_adv_W = 0.5 * (w1[0:nz, :, :] + w1[1:nz+1, :, :])
-    W_pz = jnp.pad(W, ((1, 2), (0, 0), (0, 0)), mode='edge')
-    fwz = _flux3(W_pz[0:nz],   W_pz[1:nz+1],
-                 W_pz[2:nz+2], W_pz[3:nz+3], w_adv_W)
-    dW_z = -(fwz[1:nz, :, :] - fwz[0:nz-1, :, :]) / gw3_int
+    # z-flux of W: fwz(k)=0.25*(w1(i,j,kc)+w1(i,j,k))*(w(i,j,kc)+w(i,j,k))
+    # kc=k+1; for interior W faces at level m (0-based, m=1..nzm-1):
+    # W at kc=m+1 = W[m+1], W at k=m = W[m]
+    # w1 at kc = w1[m+1], w1 at k = w1[m]
+    # fwz lives at half-levels between W levels; we need fwz at k and kb=k-1
+    # for dwdt(k) = -(fwz(k)-fwz(kb))/igw
+    # W_core[l] = W[l+1]; l=0..nz-2 (interior W levels)
+    # fwz at level l (between W[l] and W[l+1]):
+    #   fwz[l] = 0.25*(w1[l+1]+w1[l])*(W[l+1]+W[l])
+    # tendency for W_core[l]: -(fwz[l] - fwz[l-1])/gw3_int[l]
+    # Boundary: fwz at l=-1 (bottom) = 0, fwz at l=nz-1 (top) = 0
+    w1_kc = w1[1:nz,   :, :nx]    # w1 at kc (nz-1, ny, nx)
+    w1_k  = w1[0:nz-1, :, :nx]    # w1 at k  (nz-1, ny, nx)
+    W_kc  = W[1:nz,    :, :nx]    # W  at kc (nz-1, ny, nx)
+    W_k   = W[0:nz-1,  :, :nx]    # W  at k  (nz-1, ny, nx)
+    fwz   = 0.25 * (w1_kc + w1_k) * (W_kc + W_k)   # (nz-1, ny, nx)
+    fwz_full = jnp.concatenate([jnp.zeros_like(fwz[:1]),
+                                 fwz,
+                                 jnp.zeros_like(fwz[:1])], axis=0)   # (nz+1, ny, nx)
+    # dwdt(k) -= igw*(fwz(k)-fwz(kb)); W_core[l] = W[l+1]:
+    # fwz at l=W_core level → fwz_full[l+1] (upper face), fwz_full[l] (lower face)
+    dW_z = -(fwz_full[1:nz] - fwz_full[0:nz-1]) / gw3_int
 
     dW = dW_x + dW_y + dW_z
 
@@ -444,7 +667,7 @@ def advect_momentum(
     metric: dict,
     dt:     float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """One timestep of 3rd-order upwind momentum advection on a lat-lon C-grid."""
+    """One timestep of 2nd-order centered momentum advection on a lat-lon C-grid."""
     nz, ny, nx_p1 = U.shape
     nx = nx_p1 - 1
     nz_w = W.shape[0]    # nz+1
