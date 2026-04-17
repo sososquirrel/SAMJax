@@ -484,8 +484,8 @@ def precip_proc(
         # Fix 4.4: Scale-dependence factor using full 2D cell area.
         # gSAM precip_proc.f90:105: autor *= min(1, 10000/(dx*mu(j)*dy*ady(j)))
         # cell_area = dx * mu[j] * dy * ady[j]  (m²)
-        dx    = float(metric["dx_lon"])              # scalar, m
-        dy    = float(metric["dy_lat_ref"])          # scalar reference dy, m
+        dx    = metric["dx_lon"]              # scalar, m
+        dy    = metric["dy_lat_ref"]          # scalar reference dy, m
         mu_j  = metric["cos_lat"][None, :, None]     # (1, ny, 1)
         ady_j = metric["ady"][None, :, None]         # (1, ny, 1)
         cell_area = dx * mu_j * dy * ady_j + 1e-30  # (1, ny, 1) m²
