@@ -1201,13 +1201,16 @@ def micro_proc(
         )
 
     # 4. Precipitation processes (precip_proc() in gSAM micro_proc)
-    # Recompute evaporation coefficients every call for JAX JIT compatibility
-    # (gSAM recomputes every 10 steps via mod(nstep,10).eq.0, but traced arrays
-    # cannot be used in Python control flow within JIT)
-    evap_coefs = _compute_evap_coefs(TABS, metric, params)
+    # Evaporation coefficients are recomputed every 10 steps, matching gSAM's
+    # precip_init call frequency: mod(nstep,10).eq.0.and.icycle.eq.1
+    # micro_proc is not JIT-compiled, so int(state.nstep) works fine.
+    nstep = int(state.nstep)
+    if _evap_coef_cache["nstep"] < 0 or nstep % 10 == 0:
+        _evap_coef_cache["coefs"] = _compute_evap_coefs(TABS, metric, params)
+        _evap_coef_cache["nstep"] = nstep
     TABS, QV, QC, QI, QR, QS, QG = precip_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
-        evap_coefs=evap_coefs,
+        evap_coefs=_evap_coef_cache["coefs"],
         landmask=landmask,
         p_pert_pa=_p_pert,
     )
@@ -1300,11 +1303,14 @@ def micro_proc_with_precip(
             TABS, QV, QC, QI, QR, QS, QG, metric, params,
             p_pert_pa=_p_pert,
         )
-    # 4. Precip processes: recompute evaporation coefficients every call for JAX JIT
-    evap_coefs = _compute_evap_coefs(TABS, metric, params)
+    # 4. Precip processes (same cache logic as micro_proc)
+    nstep = int(state.nstep)
+    if _evap_coef_cache["nstep"] < 0 or nstep % 10 == 0:
+        _evap_coef_cache["coefs"] = _compute_evap_coefs(TABS, metric, params)
+        _evap_coef_cache["nstep"] = nstep
     TABS, QV, QC, QI, QR, QS, QG = precip_proc(
         TABS, QC, QI, QR, QS, QG, QV, metric, params, dt,
-        evap_coefs=evap_coefs,
+        evap_coefs=_evap_coef_cache["coefs"],
         landmask=landmask,
         p_pert_pa=_p_pert,
     )
