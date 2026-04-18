@@ -60,13 +60,27 @@ def _dzw(dz: jax.Array) -> jax.Array:
 
 @jax.jit
 def shear_prod(U: jax.Array, V: jax.Array, W: jax.Array, metric: dict) -> jax.Array:
-    """Compute 2·S_ij·S_ij at cell centres; Cartesian approx for y."""
-    dx  = metric["dx_lon"]
-    dy  = metric["dy_lat"]
-    dz  = metric["dz"]
-    rdx = 1.0 / dx
+    """Compute 2·S_ij·S_ij at cell centres. Matches gSAM shear_prod3D: rdx=imu(j)/dx."""
+    dx    = metric["dx_lon"]
+    dy    = metric["dy_lat"]
+    dz    = metric["dz"]
+    imu   = metric["imu"]
+    cos_v = metric["cos_v"]   # (ny+1,)
+    rdx  = imu[None, :, None] / dx   # (1, ny, 1)  spherical: 1/(dx·cos_lat_j)
     rdy  = (1.0 / dy)[None, :, None]
     dzw_ = _dzw(dz)
+
+    # Spherical metrics for UV and VW cross-terms — matches gSAM shear_prod3D.f90:
+    #   rdx1 = imuv(jc)/dx  (north v-face of cell j),  rdx2 = imuv(j)/dx  (south v-face)
+    #   rdy1 = 1/(dy*adyv(jc))  center-to-center j↔j+1,  rdy2 = 1/(dy*adyv(j)) j-1↔j
+    imuv    = 1.0 / jnp.clip(cos_v, 1e-6, None)    # (ny+1,)
+    imuv_jc = imuv[1:]    # (ny,) north v-face (between j and j+1)
+    imuv_j  = imuv[:-1]   # (ny,) south v-face (between j-1 and j)
+    dy_v_int = 0.5 * (dy[:-1] + dy[1:])             # (ny-1,) center-to-center spacing
+    rdy1 = 1.0 / jnp.concatenate([dy_v_int, dy[-1:]])   # (ny,) north; last row = polar
+    rdy2 = 1.0 / jnp.concatenate([dy[:1],   dy_v_int])  # (ny,) south; first row = polar
+    rdx1 = imuv_jc[None, :, None] / dx   # (1, ny, 1) north v-face
+    rdx2 = imuv_j[None, :, None]  / dx   # (1, ny, 1) south v-face
 
     S11 = (U[:, :, 1:] - U[:, :, :-1]) * rdx
     S22 = (V[:, 1:, :] - V[:, :-1, :]) * rdy
@@ -79,14 +93,16 @@ def shear_prod(U: jax.Array, V: jax.Array, W: jax.Array, metric: dict) -> jax.Ar
     Up = jnp.pad(U, ((0, 0), (1, 1), (0, 0)), mode='edge')
     Vx = jnp.concatenate([V[:, :, -1:], V, V[:, :, :1]], axis=2)
 
-    dudy_NE = (Up[:, 2:,  1:] - Up[:, 1:-1,  1:]) * rdy
-    dvdx_NE = (Vx[:, 1:, 2:] - Vx[:, 1:, 1:-1]) * rdx
-    dudy_NW = (Up[:, 2:, :-1] - Up[:, 1:-1, :-1]) * rdy
-    dvdx_NW = (Vx[:, 1:, 1:-1] - Vx[:, 1:, :-2]) * rdx
-    dudy_SE = (Up[:, 1:-1,  1:] - Up[:, :-2,  1:]) * rdy
-    dvdx_SE = (Vx[:, :-1, 2:] - Vx[:, :-1, 1:-1]) * rdx
-    dudy_SW = (Up[:, 1:-1, :-1] - Up[:, :-2, :-1]) * rdy
-    dvdx_SW = (Vx[:, :-1, 1:-1] - Vx[:, :-1, :-2]) * rdx
+    # NE/NW: north v-face of cell j → imuv(jc)/dx and 1/adyv(jc)
+    dudy_NE = (Up[:, 2:,  1:] - Up[:, 1:-1,  1:]) * rdy1[None, :, None]
+    dvdx_NE = (Vx[:, 1:, 2:] - Vx[:, 1:, 1:-1]) * rdx1
+    dudy_NW = (Up[:, 2:, :-1] - Up[:, 1:-1, :-1]) * rdy1[None, :, None]
+    dvdx_NW = (Vx[:, 1:, 1:-1] - Vx[:, 1:, :-2]) * rdx1
+    # SE/SW: south v-face of cell j → imuv(j)/dx and 1/adyv(j)
+    dudy_SE = (Up[:, 1:-1,  1:] - Up[:, :-2,  1:]) * rdy2[None, :, None]
+    dvdx_SE = (Vx[:, :-1, 2:] - Vx[:, :-1, 1:-1]) * rdx2
+    dudy_SW = (Up[:, 1:-1, :-1] - Up[:, :-2, :-1]) * rdy2[None, :, None]
+    dvdx_SW = (Vx[:, :-1, 1:-1] - Vx[:, :-1, :-2]) * rdx2
 
     cross_uv = 0.25 * (
         (dudy_NE + dvdx_NE)**2 + (dudy_NW + dvdx_NW)**2 +
@@ -118,12 +134,20 @@ def shear_prod(U: jax.Array, V: jax.Array, W: jax.Array, metric: dict) -> jax.Ar
     dvdz_ab_j   = (Vz[2:, :-1, :] - Vz[1:-1, :-1, :]) / dzw_above
     dvdz_bel_jp1 = (Vz[1:-1, 1:, :] - Vz[:-2, 1:, :]) / dzw_below
     dvdz_bel_j   = (Vz[1:-1, :-1, :] - Vz[:-2, :-1, :]) / dzw_below
-    dwdy_above = (Wy[1:, 2:, :] - Wy[1:, 1:-1, :]) * rdy
-    dwdy_below = (Wy[:-1, 2:, :] - Wy[:-1, 1:-1, :]) * rdy
+    # dw/dy uses adyv(jc) for north v-face corners and adyv(j) for south v-face corners
+    # (matches gSAM shear_prod3D.f90 — same spacing as UV cross-terms)
+    dwdy_north = Wy[:, 2:, :] - Wy[:, 1:-1, :]   # (nz+1, ny, nx) northward diff j→j+1
+    dwdy_south = Wy[:, 1:-1, :] - Wy[:, :-2, :]   # (nz+1, ny, nx) northward diff j-1→j
+    dwdy_north_above = dwdy_north[1:]  * rdy1[None, :, None]
+    dwdy_north_below = dwdy_north[:-1] * rdy1[None, :, None]
+    dwdy_south_above = dwdy_south[1:]  * rdy2[None, :, None]
+    dwdy_south_below = dwdy_south[:-1] * rdy2[None, :, None]
 
     cross_vw = 0.25 * (
-        (dvdz_ab_jp1  + dwdy_above)**2 + (dvdz_ab_j   + dwdy_above)**2 +
-        (dvdz_bel_jp1 + dwdy_below)**2 + (dvdz_bel_j  + dwdy_below)**2
+        (dvdz_ab_jp1  + dwdy_north_above)**2 +
+        (dvdz_bel_jp1 + dwdy_north_below)**2 +
+        (dvdz_ab_j    + dwdy_south_above)**2 +
+        (dvdz_bel_j   + dwdy_south_below)**2
     )
 
     # Fix 2.8: surface boundary correction for uw/vw cross-terms.
@@ -135,7 +159,8 @@ def shear_prod(U: jax.Array, V: jax.Array, W: jax.Array, metric: dict) -> jax.Ar
         (dudz_ab_ip1[0]  + dwdx_above[0])**2 + (dudz_ab_i[0]   + dwdx_above[0])**2
     )
     cross_vw_sfc = 0.5 * (
-        (dvdz_ab_jp1[0]  + dwdy_above[0])**2 + (dvdz_ab_j[0]   + dwdy_above[0])**2
+        (dvdz_ab_jp1[0] + dwdy_north_above[0])**2 +
+        (dvdz_ab_j[0]   + dwdy_south_above[0])**2
     )
     cross_uw = cross_uw.at[0].set(cross_uw_sfc)
     cross_vw = cross_vw.at[0].set(cross_vw_sfc)
@@ -1098,6 +1123,7 @@ def diffuse_damping_mom_z(
     damping_w_cu: float = 0.3,
     fluxbu: jax.Array | None = None,   # (ny, nx+1) surface U flux (m/s * m/s)
     fluxbv: jax.Array | None = None,   # (ny+1, nx) surface V flux
+    dtn: float | None = None,          # AB effective timestep (at*dt); None → use dt
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Implicit vertical SGS diffusion + all damping for U, V, W.
@@ -1127,7 +1153,9 @@ def diffuse_damping_mom_z(
     dx   = metric["dx_lon"]      # scalar
     pres = metric["pres"]        # (nz,) Pa
 
-    tau_max = 1.0 / dt
+    # gSAM damping.f90: tau_max = dtn/dt = at (AB coefficient, dimensionless)
+    _dtn = dtn if dtn is not None else dt
+    tau_max = _dtn / dt
 
     # Interior w-face arrays (faces 1..nz-1 in 0-indexed = gSAM faces 2..nzm).
     # adzw_int[f] = adzw[f+1] = (z[f+1]-z[f])/dz_ref  (center-to-center spacing ratio)
@@ -1151,7 +1179,7 @@ def diffuse_damping_mom_z(
     # Polar + upper-level damping coefficients for U
     mu = cos_lat                                            # (ny,)
     tauy = tau_max * (1.0 - mu ** 2) ** 200                # (ny,)
-    umax_polar = damping_u_cu * dx * mu / dt               # (ny,)
+    umax_polar = damping_u_cu * dx * mu / _dtn             # (ny,) gSAM: cu*dx*mu/dtn
     umax_3d = umax_polar[None, :, None]                    # (1, ny, 1)
 
     # pres < 70 hPa → use tau_max; else tauy
@@ -1213,7 +1241,7 @@ def diffuse_damping_mom_z(
     )  # (ny+1,)
     # Use mass-cell-averaged tau and umax (not v-face cos)
     tauy_mass = tau_max * (1.0 - cos_lat ** 2) ** 200    # (ny,)
-    umax_mass = damping_u_cu * dx * cos_lat / dt         # (ny,)
+    umax_mass = damping_u_cu * dx * cos_lat / _dtn       # (ny,) gSAM: cu*dx*mu/dtn
     tauy_v = jnp.pad(
         0.5 * (tauy_mass[:-1] + tauy_mass[1:]),
         (1, 1), constant_values=tau_max,
@@ -1267,8 +1295,8 @@ def diffuse_damping_mom_z(
     tauz_w = 0.5 * (tauz_c[:-1] + tauz_c[1:])  # (nz-1,)
 
     # W CFL limiter (dodamping_w): only below sponge (tauz_w == 0)
-    # gSAM: wmax = damping_w_cu * dz * adzw(k) / dtn = damping_w_cu * dz_ref * adzw_int / dt
-    wmax_w = damping_w_cu * dz_ref * adzw_int / dt  # (nz-1,)
+    # gSAM: wmax = damping_w_cu * dz * adzw(k) / dtn
+    wmax_w = damping_w_cu * dz_ref * adzw_int / _dtn  # (nz-1,)
     W_int = W[1:-1]  # (nz-1, ny, nx) interior w-faces
 
     below_sponge = (tauz_w == 0.0)[:, None, None]

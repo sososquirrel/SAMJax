@@ -42,7 +42,6 @@ from jsam.core import debug_dump as _dd
 # Batched SGS scalar diffusion — JIT + vmap over all 7 prognostic scalars
 # ---------------------------------------------------------------------------
 
-@jax.jit
 def _diffuse_scalars_horiz_seq(
     fields:  list,         # list of N (nz, ny, nx) arrays
     tkh:     jax.Array,   # (nz, ny, nx)
@@ -79,6 +78,15 @@ def _diffuse_scalars_z_seq(
 def _stage_dump(state, stage_id: int, dt, force_nstep=None):
     """Emit oracle-format dump if DebugDumper is active."""
     if _dd.DUMPER is not None:
+        try:
+            d = jax.local_devices()[0]
+            ms = d.memory_stats()
+            used_gb = ms.get("bytes_in_use", 0) / 1e9
+            peak_gb = ms.get("peak_bytes_in_use", 0) / 1e9
+            print(f"  [mem] stage={stage_id}  in_use={used_gb:.2f}GB  peak={peak_gb:.2f}GB",
+                  flush=True)
+        except Exception:
+            pass
         _dd.DUMPER.dump(state, stage_id, dt, force_nstep=force_nstep)
 
 @dataclass(frozen=True)
@@ -96,7 +104,8 @@ class StepConfig:
     epsv:          float = 0.61
     damping_u_cu:  float = 0.3    # U/V polar velocity limiter (gSAM damping_u_cu)
     damping_w_cu:  float = 0.3    # W Courant-number damping threshold (gSAM damping_w_cu)
-    dodamping_w:   bool  = False  # gSAM dodamping_w: CFL-based W soft-clip below sponge
+    dodamping_w:      bool  = False  # gSAM dodamping_w: CFL-based W soft-clip below sponge
+    dodamping_poles:  bool  = True   # gSAM dodamping_poles: implicit polar U/V damping
     sponge_z_frac: float = 0.6    # fraction of domain height where top sponge begins
     sponge_tau:    float = 10.0   # sponge damping time scale at model top (s); 0 = off
     w_sponge_nub:  float = 0.6    # gSAM nub — W sponge starts at (z-z0)/(ztop-z0) > nub
@@ -619,6 +628,7 @@ def step(
         V_adv=V_adv_for_advection,
         W_adv=W_adv_for_advection,
     )
+    del mom_tends_nm1, mom_tends_nm2
 
     # gSAM sgs_mom() → adamsA: apply horizontal SGS as forward Euler step using the
     # pre-advance tendency (dudtd coefficient 1).  Must happen before terrain masking
@@ -669,28 +679,8 @@ def step(
             damping_u_cu=config.damping_u_cu,
             damping_w_cu=config.damping_w_cu,
             fluxbu=_fluxbu, fluxbv=_fluxbv,
+            dtn=_at_ab * dt,   # gSAM: tau_max = dtn/dt = at
         )
-        # gSAM dodamping branch: W-only Rayleigh sponge at model top.
-        if config.w_sponge_max > 0.0:
-            _W_imp = gsam_w_sponge(
-                _W_imp, metric["zi"],
-                nub=config.w_sponge_nub,
-                taudamp_max=config.w_sponge_max,
-                dtn=_at_ab * dt,
-                dt=dt,
-            )
-        # gSAM dodamping_w branch: CFL-based W soft-clip below the sponge.
-        # Independent of dodamping — in gSAM these are separate if-blocks sharing taudamp.
-        # gsam_w_courant_damping recomputes the sponge mask (nu > nub) internally to
-        # identify levels where taudamp==0 (below sponge), matching gSAM exactly.
-        if config.dodamping_w:
-            _W_imp = gsam_w_courant_damping(
-                _W_imp, metric,
-                dtn=_at_ab * dt,
-                damping_w_cu=config.damping_w_cu,
-                tau_max=_at_ab,         # gSAM: tau_max = dtn/dt = at_ab
-                nub=config.w_sponge_nub,
-            )
         state = ModelState(
             U=_U_imp, V=_V_imp, W=_W_imp,
             TABS=state.TABS, QV=state.QV, QC=state.QC,
@@ -698,6 +688,7 @@ def step(
             TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
             nstep=state.nstep, time=state.time,
         )
+        del _U_imp, _V_imp, _W_imp
 
     _stage_dump(state, 11, dt, force_nstep=_dump_nstep)
 
@@ -710,6 +701,50 @@ def step(
         )
 
     _stage_dump(state, 12, dt, force_nstep=_dump_nstep)
+
+    # gSAM damping.f90 — called after adamsB, before pressure, matching gSAM main.f90.
+    # Three independent branches in gSAM order: dodamping (W sponge), dodamping_w (W CFL),
+    # dodamping_poles (polar U/V).  All share tau_max = dtn/dt = _at_ab.
+    _dtn = _at_ab * dt
+    _W_dam = state.W
+    _U_dam = state.U
+    _V_dam = state.V
+    if config.w_sponge_max > 0.0:
+        _W_dam = gsam_w_sponge(
+            _W_dam, metric["zi"],
+            nub=config.w_sponge_nub,
+            taudamp_max=config.w_sponge_max,
+            dtn=_dtn,
+            dt=dt,
+        )
+    if config.dodamping_w:
+        _W_dam = gsam_w_courant_damping(
+            _W_dam, metric,
+            dtn=_dtn,
+            damping_w_cu=config.damping_w_cu,
+            tau_max=_at_ab,
+            nub=config.w_sponge_nub,
+        )
+    if config.dodamping_poles:
+        _U_dam, _V_dam = pole_damping(
+            _U_dam, _V_dam,
+            metric["lat_rad"],
+            metric["dx_lon"],
+            metric["dy_lat"],
+            dt,
+            cu=config.damping_u_cu,
+            pres=metric["pres"],
+            p_upper=7000.0,
+            dtn=_dtn,
+        )
+    state = ModelState(
+        U=_U_dam, V=_V_dam, W=_W_dam,
+        TABS=state.TABS, QV=state.QV, QC=state.QC,
+        QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
+        TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
+        nstep=state.nstep, time=state.time,
+    )
+    del _W_dam, _U_dam, _V_dam
 
     if polar_filter_masks is not None:
         mask_u, mask_v = polar_filter_masks
@@ -724,11 +759,10 @@ def step(
 
     state, p_new = pressure_step(state, grid, metric, dt, at=_at_ab)
 
-    # Normalize pressure for adamsB: scale by 1/at so that the AB coefficients
-    # (bt*dt, ct*dt) in adamsB combine correctly across steps with different at values.
-    # This matches gSAM's convention where press_rhs divides by at and press_grad
-    # multiplies by at, making the stored pressure independent of at scaling.
-    p_for_storage = p_new / _at_ab if _at_ab != 0.0 else p_new
+    # gSAM stores the raw solver output p(na) with no normalization.
+    # adamsB.f90: u -= dt * bt * grad(p(nb))  — uses raw p, coefficient is dt (not at*dt).
+    # press_grad applies at*dt*grad(p(na)) for the current step.
+    p_for_storage = p_new
 
     _stage_dump(state, 13, dt, force_nstep=_dump_nstep)
 
@@ -771,6 +805,7 @@ def step(
         U_adv=U_adv_scalar, V_adv=V_adv_scalar, W_adv=W_adv_scalar,
         macho_order=_macho_order,
     )
+    del tends_nm1, tends_nm2
 
     # F11 mode: convert advected static energy back to absolute temperature
     if config.micro_params is not None and _omp_f11 is not None:
@@ -788,6 +823,20 @@ def step(
 
 
     _stage_dump(state, 14, dt, force_nstep=_dump_nstep)
+
+    # Release large intermediates that are no longer needed.  Python keeps
+    # local variables alive for the entire function, so without explicit
+    # cleanup the GPU accumulates ~7 GB of dead arrays by this point.
+    del dU_extra, dV_extra, dW_extra
+    del u1_curr, v1_curr, w1_curr
+    del u1_adv, v1_adv, w1_adv
+    del U_adv_for_advection, V_adv_for_advection, W_adv_for_advection
+    del _dU_cor_mass, _dV_cor, _dW_cor
+    del U_adv_scalar, V_adv_scalar, W_adv_scalar
+    del _U_old, _V_old, _W_old
+    del p_new
+    del _dUh_sgs, _dVh_sgs, _dWh_sgs  # may be None; del of None is fine
+    _t_static = _omp_f11 = _qp_f11 = None  # conditionally set; clear regardless
 
     if config.polar_cool_tau > 0.0 and forcing.tabs0 is not None:
         _lat     = metric["lat_rad"]

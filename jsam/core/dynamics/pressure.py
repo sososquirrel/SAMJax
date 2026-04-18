@@ -358,80 +358,90 @@ def _pcg_solve(
 
 def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     """
-    Build H_m as a scipy CSC sparse matrix of size (ny*nz, ny*nz).
+    Build H_m matching gSAM gmg_discr.f90 (mu_discr='B', rho_discr='B').
 
-    H_m is the discrete spherical Helmholtz operator for zonal wavenumber m:
-      H_m[P](j,k) = alpha_m(j)*P(j,k) + L_y[P](j,k) + L_z[P](j,k)
+    System: [alpha_scalar*I + L_y_B + cos²(lat)*L_z_B_base] * P = cos²(lat)*RHS
+
+    L_y 'B' off-diagonal (j→j-1):
+      c_lo_B[j] = 2*(mu[j-1]*dy[j] + mu[j]*dy[j-1]) * mu[j] / ((dy[j-1]+dy[j])² * dy[j])
+    L_z 'B' base off-diagonal (k→k-1), scaled by cos²(lat_j) per row:
+      d_lo_base[k] = 2*(rho[k-1]*dz[k] + rho[k]*dz[k-1]) / ((dz[k-1]+dz[k])² * dz[k]*rho[k])
+    alpha = Cartesian x-eigenvalue, scalar (no lat dependence) — gSAM pressure_gmg.f90.
 
     Row/column index: row = j*nz + k  (j outer, k inner).
-
-    Non-zeros per row: up to 5 (self, ±j neighbour, ±k neighbour).
-    Fully vectorised — no Python loops over (j, k).
     """
     import scipy.sparse as sp
 
-    cos_lat_c = np.maximum(np.asarray(metric_np["cos_lat"], np.float64), 1e-6)
-    cos_v     = np.asarray(metric_np["cos_v"],   np.float64)
-    dy_row    = np.asarray(metric_np["dy_lat"],  np.float64)
-    rho       = np.asarray(metric_np["rho"],     np.float64)
-    rhow      = np.asarray(metric_np["rhow"],    np.float64)
-    dz        = np.asarray(metric_np["dz"],      np.float64)
-    adzw      = np.asarray(metric_np.get("adzw", np.ones(nz + 1)), np.float64)
-    dz_ref_val = float(metric_np.get("dz_ref", dz[0]))
-    dlon_rad  = float(metric_np["dlon_rad"])
-    nx_grid   = int(metric_np["nx"])
+    mu       = np.maximum(np.asarray(metric_np["cos_lat"], np.float64), 1e-6)  # (ny,)
+    dy       = np.asarray(metric_np["dy_lat"],  np.float64)   # (ny,) physical cell widths
+    rho      = np.asarray(metric_np["rho"],     np.float64)   # (nz,) cell-centre density
+    dz       = np.asarray(metric_np["dz"],      np.float64)   # (nz,) physical cell heights
+    dlon_rad = float(metric_np["dlon_rad"])
+    nx_grid  = int(metric_np["nx"])
 
-    sin2            = np.sin(np.pi * m / nx_grid) ** 2
-    # Cartesian x-eigenvalue × cos²(lat) per row — matches gSAM pressure_gmg.f90:
-    #   alpha = (2 - 2*cos(2πm/nx)) / dx²   (Cartesian, then scaled by cos²(lat_j))
-    alpha_cartesian = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS) ** 2       # (scalar)
-    alpha_m         = alpha_cartesian * cos_lat_c ** 2                     # (ny,)
+    # Scalar alpha — same for all j (gSAM pressure_gmg.f90: alpha = (2-2cos)*ddx)
+    sin2         = np.sin(np.pi * m / nx_grid) ** 2
+    alpha_scalar = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS) ** 2  # (float)
 
-    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])   # (ny-1,)
-    inv_row  = 1.0 / (dy_row * cos_lat_c)           # (ny,)
+    # ── L_y 'B' stencil ─────────────────────────────────────────────────────
+    # Interface between j-1 and j: 'B' average of mu, times mu[j] (center)
+    # c_lo_B[j] = 2*(mu[j-1]*dy[j] + mu[j]*dy[j-1]) * mu[j] / ((dy[j-1]+dy[j])² * dy[j])
+    # c_hi_B[j] = 2*(mu[j]*dy[j+1] + mu[j+1]*dy[j]) * mu[j] / ((dy[j]+dy[j+1])² * dy[j])
+    dy_sum  = dy[:-1] + dy[1:]                           # (ny-1,) lo-hi sums
+    num_ly  = mu[:-1] * dy[1:] + mu[1:] * dy[:-1]       # (ny-1,) 'B' numerator (shared)
+    c_lo_B  = np.zeros(ny)
+    c_hi_B  = np.zeros(ny)
+    c_lo_B[1:]  = 2.0 * num_ly * mu[1:]  / (dy_sum ** 2 * dy[1:])
+    c_hi_B[:-1] = 2.0 * num_ly * mu[:-1] / (dy_sum ** 2 * dy[:-1])
 
-    c_lo        = np.zeros(ny)
-    c_hi        = np.zeros(ny)
-    c_lo[1:]    = cos_v[1:-1]  / dy_v_int * inv_row[1:]
-    c_hi[:-1]   = cos_v[1:-1] / dy_v_int * inv_row[:-1]
+    # ── L_z 'B' base stencil (before cos² scaling) ──────────────────────────
+    # d_lo_base[k] = 2*(rho[k-1]*dz[k]+rho[k]*dz[k-1]) / ((dz[k-1]+dz[k])²*dz[k]*rho[k])
+    # d_hi_base[k] = 2*(rho[k]*dz[k+1]+rho[k+1]*dz[k]) / ((dz[k]+dz[k+1])²*dz[k]*rho[k])
+    dz_sum      = dz[:-1] + dz[1:]                       # (nz-1,)
+    num_lz      = rho[:-1] * dz[1:] + rho[1:] * dz[:-1] # (nz-1,)
+    d_lo_base   = np.zeros(nz)
+    d_hi_base   = np.zeros(nz)
+    d_lo_base[1:]  = 2.0 * num_lz / (dz_sum ** 2 * dz[1:]  * rho[1:])
+    d_hi_base[:-1] = 2.0 * num_lz / (dz_sum ** 2 * dz[:-1] * rho[:-1])
 
-    inv_rho_dz  = 1.0 / (rho * dz)                  # (nz,)
-    d_lo        = np.zeros(nz)
-    d_hi        = np.zeros(nz)
-    d_lo[1:]    = rhow[1:-1]  / (adzw[1:-1]  * dz_ref_val) * inv_rho_dz[1:]
-    d_hi[:-1]   = rhow[1:-1]  / (adzw[1:-1]  * dz_ref_val) * inv_rho_dz[:-1]
+    # cos²(lat) scales L_z per row (gSAM: mu_cent(j)² factor in L_z 'B')
+    cos2 = mu ** 2   # (ny,)
 
-    # Build COO arrays fully vectorised over (j, k)
-    j_idx = np.arange(ny)   # (ny,)
-    k_idx = np.arange(nz)   # (nz,)
-    jj, kk = np.meshgrid(j_idx, k_idx, indexing='ij')   # (ny, nz) each
-    row_all = (jj * nz + kk).ravel()                     # (ny*nz,)
+    # ── COO assembly ─────────────────────────────────────────────────────────
+    j_idx = np.arange(ny)
+    k_idx = np.arange(nz)
+    jj, kk = np.meshgrid(j_idx, k_idx, indexing='ij')  # (ny, nz)
+    row_all = (jj * nz + kk).ravel()                   # (ny*nz,)
 
-    diag_j = alpha_m - (c_lo + c_hi)   # (ny,)
-    diag_k = -(d_lo + d_hi)            # (nz,)
-    diag_vals = (diag_j[:, None] + diag_k[None, :]).ravel()  # (ny*nz,)
+    # Diagonal: alpha + L_y_diag[j] + cos²[j]*L_z_diag_base[k]
+    diag_L_y      = alpha_scalar - (c_lo_B + c_hi_B)   # (ny,)
+    diag_Lz_base  = -(d_lo_base + d_hi_base)            # (nz,)
+    diag_vals = (diag_L_y[:, None] + cos2[:, None] * diag_Lz_base[None, :]).ravel()
 
     r_list = [row_all]
     c_list = [row_all]
     v_list = [diag_vals]
 
-    # ±k neighbours (vertical)
+    # ±k (vertical), off-diagonals scaled by cos²[j]
+    d_lo_2d = (cos2[:, None] * d_lo_base[None, :]).ravel()  # (ny*nz,)
+    d_hi_2d = (cos2[:, None] * d_hi_base[None, :]).ravel()
+
     mask_lo = kk.ravel() > 0
     r_list.append(row_all[mask_lo]);  c_list.append(row_all[mask_lo] - 1)
-    v_list.append(d_lo[kk.ravel()[mask_lo]])
+    v_list.append(d_lo_2d[mask_lo])
 
     mask_hi = kk.ravel() < nz - 1
     r_list.append(row_all[mask_hi]);  c_list.append(row_all[mask_hi] + 1)
-    v_list.append(d_hi[kk.ravel()[mask_hi]])
+    v_list.append(d_hi_2d[mask_hi])
 
-    # ±j neighbours (meridional)
+    # ±j (meridional), L_y 'B'
     mask_jlo = jj.ravel() > 0
     r_list.append(row_all[mask_jlo]);  c_list.append(row_all[mask_jlo] - nz)
-    v_list.append(c_lo[jj.ravel()[mask_jlo]])
+    v_list.append(c_lo_B[jj.ravel()[mask_jlo]])
 
     mask_jhi = jj.ravel() < ny - 1
     r_list.append(row_all[mask_jhi]);  c_list.append(row_all[mask_jhi] + nz)
-    v_list.append(c_hi[jj.ravel()[mask_jhi]])
+    v_list.append(c_hi_B[jj.ravel()[mask_jhi]])
 
     rows_arr = np.concatenate(r_list).astype(np.int32)
     cols_arr = np.concatenate(c_list).astype(np.int32)
@@ -472,8 +482,7 @@ def _get_sparse_solvers(metric_np: dict, ny: int, nz: int, nm: int):
     import scipy.sparse.linalg as spla
     import scipy.sparse as sp
     from concurrent.futures import ThreadPoolExecutor
-    import hashlib, pickle, os, time
-    from pathlib import Path
+    import os
 
     key = (ny, nz, nm)
     if key in _SOLVER_CACHE:
@@ -481,27 +490,6 @@ def _get_sparse_solvers(metric_np: dict, ny: int, nz: int, nm: int):
 
     n_workers = min(nm, int(os.environ.get("JSAM_LU_WORKERS", os.cpu_count() or 4)))
 
-    # ── Disk cache: keyed on (ny, nz, nm) + a hash of the grid metric arrays ──
-    cache_dir  = os.environ.get("JSAM_LU_CACHE_DIR", "/glade/work/sabramian/jsam_lu_cache")
-    _hash_data = b"".join(
-        np.asarray(metric_np[k], dtype=np.float64).tobytes()
-        for k in ("dy_lat", "cos_lat", "cos_v", "rho", "rhow", "dz")
-        if k in metric_np
-    )
-    _hash_data += f"{ny}_{nz}_{nm}_v2_cartesian_alpha".encode()  # v2: Cartesian×cos² alpha
-    cache_key  = hashlib.md5(_hash_data).hexdigest()
-    cache_file = Path(cache_dir) / f"lu_{cache_key}.pkl"
-
-    if False and cache_file.exists():  # cache load disabled
-        print(f"  [pressure] Loading LU cache ({nm} modes)...", flush=True)
-        t0 = time.time()
-        with open(cache_file, 'rb') as f:
-            solvers = pickle.load(f)
-        print(f"  [pressure] LU cache loaded in {time.time()-t0:.1f}s", flush=True)
-        _SOLVER_CACHE[key] = solvers
-        return solvers
-
-    print(f"  [pressure] Building H_m matrices ({nm} modes × {ny}×{nz})...", flush=True)
     def _build_mode(m):
         Hm = _build_Hm_sparse(m, metric_np, ny, nz)
         if m == 0:
@@ -510,7 +498,6 @@ def _get_sparse_solvers(metric_np: dict, ny: int, nz: int, nm: int):
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         hm_list = list(pool.map(_build_mode, range(nm)))
 
-    print(f"  [pressure] Factorising {nm} H_m matrices in parallel...", flush=True)
     def _factorize(Hm):
         return _LUSolver(spla.splu(Hm))
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -518,14 +505,6 @@ def _get_sparse_solvers(metric_np: dict, ny: int, nz: int, nm: int):
     del hm_list
 
     print("  [pressure] Factorisations ready.", flush=True)
-
-    try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_file, 'wb') as f:
-            pickle.dump(solvers, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"  [pressure] LU factors cached → {cache_file}", flush=True)
-    except Exception as e:
-        print(f"  [pressure] LU cache write failed: {e}", flush=True)
 
     _SOLVER_CACHE[key] = solvers
     return solvers
@@ -901,21 +880,14 @@ def pressure_step(
     for _iter in range(n_iter):
         rhs = press_rhs(U_cur, V_cur, W_cur, metric, dt_eff)
         p_inc = solve_pressure(rhs, metric)
-        print(f"  [pressure diag] iter={_iter}"
-              f" W_in=[{float(jnp.min(W_cur)):.3e},{float(jnp.max(W_cur)):.3e}]"
-              f" rhs_max={float(jnp.max(jnp.abs(rhs))):.3e}"
-              f" p_max={float(jnp.max(jnp.abs(p_inc))):.3e}", flush=True)
         p_total = p_total + p_inc
         U_cur, V_cur, W_cur = apply_pressure_gradient(
             U_cur, V_cur, W_cur, p_inc, metric, dt_eff,
         )
         U_cur = U_cur.at[:, :, -1].set(U_cur[:, :, 0])
-        print(f"  [pressure diag] iter={_iter}"
-              f" W_out=[{float(jnp.min(W_cur)):.3e},{float(jnp.max(W_cur)):.3e}]", flush=True)
 
-    # gSAM pressure.f90:83-84: clamp pressure perturbation to ±15% of reference
-    pres_ref = metric["pres"][:, None, None]   # (nz, 1, 1)
-    p_total = jnp.clip(p_total, -0.15 * pres_ref, 0.15 * pres_ref)
+    # gSAM pressure.f90 clips pp (physical pressure for output) but NOT p (the
+    # velocity-correction pressure stored here).  No clip applied — matches gSAM.
 
     new_state = ModelState(
         U=U_cur, V=V_cur, W=W_cur,

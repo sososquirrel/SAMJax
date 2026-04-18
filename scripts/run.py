@@ -255,10 +255,6 @@ def main():
 
     print(f"  Binary init done in {time.perf_counter()-t0_io:.1f}s")
     print(f"  Grid: {len(lat)} lat × {len(lon)} lon × {nzm} z")
-    print(f"  U: {np.array(state.U).shape}  "
-          f"min={float(jnp.min(state.U)):.3f} max={float(jnp.max(state.U)):.3f}")
-    print(f"  TABS: min={float(jnp.min(state.TABS)):.1f} max={float(jnp.max(state.TABS)):.1f}")
-    print(f"  SST slice idx={_sst_idx}: min={float(jnp.min(sst)):.1f} max={float(jnp.max(sst)):.1f}")
 
     if args.float32:
         _f32 = jnp.float32
