@@ -56,6 +56,10 @@ def ratio(jsam_val: float, gsam_val: float) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--jsam-csv", type=str, default=JSAM_CSV,
+                    help="Path to jsam globals.csv (default: hardcoded path).")
+    ap.add_argument("--gsam-csv", type=str, default=GSAM_CSV,
+                    help="Path to gSAM oracle globals.csv (default: hardcoded path).")
     ap.add_argument("--steps",  type=str, default=None,
                     help="Comma-separated step numbers, or 'all'. Default: first 10.")
     ap.add_argument("--stages", type=str, default=None,
@@ -68,10 +72,10 @@ def main():
                     help="Only show rows with |reldiff| > this threshold (%).")
     args = ap.parse_args()
 
-    print(f"Loading jsam CSV …  {JSAM_CSV}")
-    jsam = load_csv(JSAM_CSV)
-    print(f"Loading gSAM CSV …  {GSAM_CSV}")
-    gsam = load_csv(GSAM_CSV)
+    print(f"Loading jsam CSV …  {args.jsam_csv}")
+    jsam = load_csv(args.jsam_csv)
+    print(f"Loading gSAM CSV …  {args.gsam_csv}")
+    gsam = load_csv(args.gsam_csv)
 
     jsam_steps = sorted(jsam.index.get_level_values("nstep").unique())
     gsam_steps = sorted(gsam.index.get_level_values("nstep").unique())

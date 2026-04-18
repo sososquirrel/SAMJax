@@ -177,6 +177,14 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
     q  = QV + QC + QI   # total non-precip water
     qp = QR + QS + QG   # total precip water
 
+    # rh_homo computed ONCE from original TABS (cloud.f90 lines 48-52).
+    # It is a fixed constant during the Newton loop — not updated as tabs1 evolves.
+    rh_homo = jnp.where(
+        (TABS < 235.0) & (QI < 1.0e-8),
+        2.583 - TABS / 207.8,
+        1.0,
+    )
+
     def _newton_step(carry):
         """One Newton iteration with convergence masking (gSAM: exit when |dtabs|<0.001)."""
         tabs1, converged = carry
@@ -196,34 +204,22 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
             a_pr * FAC_FUS, 0.0,
         )
 
-        rh_homo = jnp.where(
-            (tabs1 < 235.0) & (QI < 1.0e-8),
-            2.583 - tabs1 / 207.8,
-            1.0,
-        )
-
-        # Fix 4.5: rh_homo only applied in pure-ice branch; NOT in mixed-phase
-        # (cloud.f90 Newton loop lines 115-116 use plain qsati in mixed-phase)
+        # rh_homo is the fixed value from original TABS (not tabs1)
+        # In mixed-phase Newton loop gSAM does NOT apply rh_homo (cloud.f90 line 115-116)
         qsati_val = qsati(tabs1, pres_mb)
-        qsati_homo = qsati_val * rh_homo
         qsat = jnp.where(
             tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
             jnp.where(
-                tabs1 <= params.tbgmin, qsati_homo,
+                tabs1 <= params.tbgmin, qsati_val * rh_homo,
                 om * qsatw(tabs1, pres_mb) + (1.0 - om) * qsati_val,
             ),
         )
-        drh_homo = jnp.where(
-            (tabs1 < 235.0) & (QI < 1.0e-8),
-            -1.0 / 207.8,
-            0.0,
-        )
+        # Jacobian: rh_homo treated as constant (no drh_homo term), matching cloud.f90
         dtqsati_val = _dtqsati(tabs1, pres_mb)
-        dtqsati_homo = dtqsati_val * rh_homo + qsati_val * drh_homo
         dqsat = jnp.where(
             tabs1 >= params.tbgmax, _dtqsatw(tabs1, pres_mb),
             jnp.where(
-                tabs1 <= params.tbgmin, dtqsati_homo,
+                tabs1 <= params.tbgmin, dtqsati_val * rh_homo,
                 om * _dtqsatw(tabs1, pres_mb) + (1.0 - om) * dtqsati_val,
             ),
         )
@@ -233,9 +229,10 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
         dfff = dlstarn * sat_excess + dlstarp * qp - lstarn * dqsat - 1.0
         dtabs = -fff / dfff
 
-        # Fix 4.6: once |dtabs| < 0.001 K, stop updating that cell (convergence mask)
+        # gSAM's do-while ALWAYS applies dtabs then checks convergence at top of next iter.
+        # Apply step for all non-converged cells, then mark newly converged.
+        tabs1_new = jnp.where(converged, tabs1, tabs1 + dtabs)
         newly_converged = jnp.abs(dtabs) < 0.001
-        tabs1_new = jnp.where(converged | newly_converged, tabs1, tabs1 + dtabs)
         converged_new = converged | newly_converged
         return tabs1_new, converged_new
 
@@ -263,23 +260,19 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
 
     # Final condensate and phase partitioning
     om_f = jnp.clip(a_bg * tabs1 - b_bg, 0.0, 1.0)
-    # Fix 4.5: rh_homo applies only in pure-ice branch, not mixed-phase
-    # (cloud.f90 line 107: qsati*rh_homo only when tabs1 <= tbgmin)
-    rh_homo_f = jnp.where(
-        (tabs1 < 235.0) & (QI < 1.0e-8),
-        2.583 - tabs1 / 207.8,
-        1.0,
-    )
+    # rh_homo is the fixed value from original TABS computed before the Newton loop
     qsati_val_f = qsati(tabs1, pres_mb)
-    qsati_homo_f = qsati_val_f * rh_homo_f
     qsat_f = jnp.where(
         tabs1 >= params.tbgmax, qsatw(tabs1, pres_mb),
         jnp.where(
-            tabs1 <= params.tbgmin, qsati_homo_f,
+            tabs1 <= params.tbgmin, qsati_val_f * rh_homo,
             om_f * qsatw(tabs1, pres_mb) + (1.0 - om_f) * qsati_val_f,
         ),
     )
     qn_new = jnp.maximum(0.0, q - qsat_f)
+
+    # micro_diagnose: zero out qn where qn <= 0.001 * qsatt (microphysics.f90 lines 360-369)
+    qn_new = jnp.where(qn_new > 0.001 * qsat_f, qn_new, 0.0)
 
     # For undersaturated air (qn_new==0) the Newton result is wrong because the
     # iteration found a spurious root.  Override tabs1 to the no-condensation
@@ -1047,21 +1040,54 @@ def ice_fall(
     """
     Gravitational sedimentation of cloud ice with MC flux limiter.
 
-    Port of gSAM MICRO_SAM1MOM/ice_fall.f90 (scalar icefall_fudge branch;
-    Heymsfield 2003 terminal velocity).  Latent heat of sublimation is
-    released into TABS following the same static-energy convention as
-    precip_fall: ΔTABS = -fac_sub · ΔQI.
+    Port of gSAM MICRO_SAM1MOM/ice_fall.f90.  When metric contains the grid
+    spacing arrays (dx_lon, cos_lat, dy_lat_ref, ady) the per-row fudge factor
+    follows gSAM ice_fall.f90:51-61 (doglobalpresets branch); otherwise the
+    scalar params.icefall_fudge is used uniformly.
+
+    Latent heat of sublimation is released into TABS following the same
+    static-energy convention as precip_fall: ΔTABS = -fac_sub · ΔQI.
     """
     rho_1d = np.array(metric["rho"])
     dz_1d  = np.array(metric["dz"])
 
-    def _col(qi_col):
-        return _ice_fall_col(qi_col, rho_1d, dz_1d,
-                             params.icefall_fudge, params.gamma_rave, dt)
+    # gSAM ice_fall.f90:51-61: per-row fudge based on effective grid spacing.
+    # Uses doglobalpresets formula with fudge1km=0.8, fudge4km=0.3.
+    #   delta(j) = min(8, 0.001*sqrt(dx*mu(j)*dy*ady(j)))   [km]
+    #   fudge(j) = max(0.2, min(1, 0.3333*((fudge4km-fudge1km)*delta
+    #                                        + 4*fudge1km - fudge4km)))
+    if (
+        "dx_lon" in metric
+        and "cos_lat" in metric
+        and "dy_lat_ref" in metric
+        and "ady" in metric
+    ):
+        dx     = float(metric["dx_lon"])           # scalar, m
+        dy     = float(metric["dy_lat_ref"])        # scalar reference dy, m
+        mu_j   = jnp.asarray(metric["cos_lat"])    # (ny,)
+        ady_j  = jnp.asarray(metric["ady"])        # (ny,)
+        _delta = jnp.minimum(8.0, 0.001 * jnp.sqrt(dx * mu_j * dy * ady_j))  # (ny,) km
+        _fudge1km = 0.8
+        _fudge4km = 0.3
+        _fudge = jnp.maximum(
+            0.2,
+            jnp.minimum(
+                1.0,
+                0.3333 * ((_fudge4km - _fudge1km) * _delta + 4.0 * _fudge1km - _fudge4km),
+            ),
+        )  # (ny,)
+    else:
+        ny = QI.shape[1]
+        _fudge = jnp.full((ny,), params.icefall_fudge)  # (ny,) uniform fallback
 
-    _vmap_i  = jax.vmap(_col, in_axes=1, out_axes=1)   # over nx
-    _vmap_ji = jax.vmap(_vmap_i, in_axes=1, out_axes=1)  # over ny
-    QI_new, dQI = _vmap_ji(QI)
+    def _col(qi_col, fudge_j):
+        return _ice_fall_col(qi_col, rho_1d, dz_1d,
+                             fudge_j, params.gamma_rave, dt)
+
+    # vmap over i (nx) for fixed j-row fudge, then vmap over j (ny)
+    _vmap_i  = jax.vmap(_col, in_axes=(1, None), out_axes=1)   # over nx
+    _vmap_ji = jax.vmap(_vmap_i, in_axes=(1, 0), out_axes=1)   # over ny
+    QI_new, dQI = _vmap_ji(QI, _fudge)
 
     TABS_new = TABS - FAC_SUB * dQI
     return QI_new, TABS_new

@@ -41,13 +41,13 @@ def qsatw(t, p):
     p in millibar (hPa); output in kg/kg.
     """
     es = esatw(t)
-    return 0.622 * es / jnp.maximum(es, p - es)
+    return 0.622 * es / jnp.maximum(jnp.maximum(es, p - es), 1.0e-30)
 
 
 def qsati(t, p):
     """Saturation specific humidity over ice. p in hPa."""
     es = esati(t)
-    return 0.622 * es / jnp.maximum(es, p - es)
+    return 0.622 * es / jnp.maximum(jnp.maximum(es, p - es), 1.0e-30)
 
 
 def dtesatw(t):

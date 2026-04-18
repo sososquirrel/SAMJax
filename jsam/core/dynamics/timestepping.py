@@ -103,15 +103,16 @@ def advance_scalars(
     tends_nm2: Tendencies,
     metric: dict,
     dt: float,
-    dt_prev:  float | None = None,
-    dt_pprev: float | None = None,
-    U_old:    "jax.Array | None" = None,
-    V_old:    "jax.Array | None" = None,
-    W_old:    "jax.Array | None" = None,
-    is_f11:   bool = False,
-    U_adv:    "jax.Array | None" = None,
-    V_adv:    "jax.Array | None" = None,
-    W_adv:    "jax.Array | None" = None,
+    dt_prev:     float | None = None,
+    dt_pprev:    float | None = None,
+    U_old:       "jax.Array | None" = None,
+    V_old:       "jax.Array | None" = None,
+    W_old:       "jax.Array | None" = None,
+    is_f11:      bool = False,
+    U_adv:       "jax.Array | None" = None,
+    V_adv:       "jax.Array | None" = None,
+    W_adv:       "jax.Array | None" = None,
+    macho_order: "int | None" = None,
 ) -> tuple:
     """Advance scalars (TABS, QV, QC, QI, QR, QS, QG) by one step.
 
@@ -146,9 +147,13 @@ def advance_scalars(
         s_n = (state.TABS + gamaz
                - FAC_COND * (state.QC + state.QR)
                - FAC_SUB * (state.QI + state.QS + state.QG))
-    def _adv(phi: jax.Array) -> jax.Array:
-        return advect_scalar(phi, U, V, W, metric, dt, nstep=nstep)
-
+    if macho_order is not None:
+        from jsam.core.dynamics.advection import _advect_scalar_jit
+        def _adv(phi: jax.Array) -> jax.Array:
+            return _advect_scalar_jit(phi, U, V, W, metric, dt, macho_order)
+    else:
+        def _adv(phi: jax.Array) -> jax.Array:
+            return advect_scalar(phi, U, V, W, metric, dt, nstep=nstep)
     s_new  = _adv(s_n)
     qv_new = _adv(state.QV)
     qc_new = _adv(state.QC)

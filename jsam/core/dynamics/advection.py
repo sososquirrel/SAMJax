@@ -4,6 +4,8 @@ Port of gSAM ADV_UM5 with MACHO direction cycling and Zalesak FCT.
 """
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -129,20 +131,36 @@ def _advect_scalar_jit(
 
     def _face_z(fadv_in):
         # Non-uniform vertical grid stencil matching gSAM face_5th_z / face_3rd_z / face_2nd_z.
-        # Pad 3 levels on each side (edge-replicate).  fp[k+3] = fadv_in[k].
-        fp = jnp.pad(fadv_in, ((3, 3), (0, 0), (0, 0)), mode='edge')
+        #
+        # Index mapping (corrected):
+        #   jsam fz_t[k] = Fortran fz(k+2)   [derived from adv_form_update_z equivalence]
+        #   Fortran face index i = k_idx + 2  (k_idx is 0-based Python index into fz_t)
+        #
+        # Field stencil for face i = k_idx+2:
+        #   fadv(i-3..i+2) = fadv[k_idx-1..k_idx+3]  (0-based)
+        # Pad 2 cells at bottom and 4 at top so fp[2+k] = fadv_in[k], giving:
+        #   f_im3 = fp[0:nz]    = fadv[k_idx-2]  (Fortran fadv(i-3))
+        #   f_im2 = fp[1:nz+1]  = fadv[k_idx-1]  (Fortran fadv(i-2))
+        #   f_im1 = fp[2:nz+2]  = fadv[k_idx]    (Fortran fadv(i-1))
+        #   f_i   = fp[3:nz+3]  = fadv[k_idx+1]  (Fortran fadv(i))
+        #   f_ip1 = fp[4:nz+4]  = fadv[k_idx+2]  (Fortran fadv(i+1))
+        #   f_ip2 = fp[5:nz+5]  = fadv[k_idx+3]  (Fortran fadv(i+2))
+        #
+        # Metric arrays for face i = k_idx+2:
+        #   adz(i)   = adz1d[k_idx+1];  adz(i-1) = adz1d[k_idx];  adz(i-2) = adz1d[k_idx-1]
+        #   adz(i+1) = adz1d[k_idx+2]
+        #   adzw(i)   = adzw1d[k_idx+1];  adzw(i-1) = adzw1d[k_idx];  etc.
+        # (adzw1d has nz+1 entries 0..nz; clip indices to [0, nz].)
+        #
+        # Courant number: cw_t[k_idx] = W[k_idx+1] = Fortran cw(k_idx+2) = cw(i)  ✓
+        fp = jnp.pad(fadv_in, ((2, 4), (0, 0), (0, 0)), mode='edge')
 
-        # Index mapping: Fortran face index i = Python k+1.
-        # Fortran adz(i)   -> adz1d[k];   adz(i-1) -> adz1d[k-1]; adz(i-2) -> adz1d[k-2]
-        #         adz(i+1) -> adz1d[k+1]
-        # Fortran adzw(i-2)-> adzw1d[k-1]; adzw(i-1)->adzw1d[k]; adzw(i)->adzw1d[k+1];
-        #         adzw(i+1)->adzw1d[k+2];  adzw(i+2)->adzw1d[k+3]  (adzw1d has nz+1 entries)
         k_idx = jnp.arange(nz)
 
-        az_i   = adz1d[jnp.clip(k_idx,     0, nz - 1)]   # adz(i)
-        az_im1 = adz1d[jnp.clip(k_idx - 1, 0, nz - 1)]   # adz(i-1)
-        az_im2 = adz1d[jnp.clip(k_idx - 2, 0, nz - 1)]   # adz(i-2)
-        az_ip1 = adz1d[jnp.clip(k_idx + 1, 0, nz - 1)]   # adz(i+1)
+        az_i   = adz1d[jnp.clip(k_idx + 1, 0, nz - 1)]   # adz(i)
+        az_im1 = adz1d[jnp.clip(k_idx,     0, nz - 1)]   # adz(i-1)
+        az_im2 = adz1d[jnp.clip(k_idx - 1, 0, nz - 1)]   # adz(i-2)
+        az_ip1 = adz1d[jnp.clip(k_idx + 2, 0, nz - 1)]   # adz(i+1)
 
         aw_im2 = adzw1d[jnp.clip(k_idx - 1, 0, nz)]      # adzw(i-2)
         aw_im1 = adzw1d[jnp.clip(k_idx,     0, nz)]       # adzw(i-1)
@@ -248,21 +266,22 @@ def _advect_scalar_jit(
 
         fz5 = 0.5 * (lin + c3 + c_asym + p5 + n5 + jnp.sign(cn) * (p5 - n5))
 
-        # Select order by level:
-        # k=0: bottom BC=0 (Fortran fz(1)=0)
-        # k=1: face_2nd_z  (Fortran fz(2))
-        # k=2: face_3rd_z  (Fortran fz(3))
-        # k=3..nz-3: face_5th_z (Fortran fz(4..nzm-2))
-        # k=nz-2: face_3rd_z (Fortran fz(nzm-1))
-        # k=nz-1: rigid-lid BC=0 (Fortran fz(nzm)=0 and fz(nz)=0)
+        # Select order by level — matches gSAM face_z_5th (advect_um_lib.f90:250-279).
+        # jsam fz_t[k] = Fortran fz(k+2), so the mapping is:
+        # k=0  (fz(2)):      face_2nd_z with i=2
+        # k=1  (fz(3)):      face_3rd_z with i=3
+        # k=2..nz-4 (fz(4..nzm-2)): face_5th_z
+        # k=nz-3 (fz(nzm-1)): face_3rd_z with i=nzm-1
+        # k=nz-2 (fz(nzm)):  face_2nd_z with i=nzm
+        # k=nz-1 (fz(nzm+1)=fz(nz)): top rigid-lid BC = 0
         fz2 = 0.5 * lin   # face_2nd_z = 0.5 * lin_inner
         k_arr = jnp.arange(nz)[:, None, None]
-        fz_t_in = jnp.where(k_arr == 0,      0.0,
-                   jnp.where(k_arr == 1,      fz2,   # face_2nd_z
-                   jnp.where(k_arr == 2,      fz3,   # face_3rd_z
-                   jnp.where(k_arr == nz - 2, fz3,   # face_3rd_z
-                              fz5))))                  # face_5th_z (interior) or nz-1 (overridden)
-        fz_t_in = fz_t_in.at[-1].set(0.0)    # rigid-lid BC
+        fz_t_in = jnp.where(k_arr == 0,          fz2,   # face_2nd_z  (Fortran fz(2))
+                   jnp.where(k_arr == 1,          fz3,   # face_3rd_z  (Fortran fz(3))
+                   jnp.where(k_arr == nz - 3,     fz3,   # face_3rd_z  (Fortran fz(nzm-1))
+                   jnp.where(k_arr == nz - 2,     fz2,   # face_2nd_z  (Fortran fz(nzm))
+                   jnp.where(k_arr == nz - 1,     0.0,   # top rigid-lid BC (Fortran fz(nz))
+                              fz5)))))                     # face_5th_z  (interior)
         return fz_t_in
 
     def _adv_update_z(fadv_in, fz_t_in):
@@ -437,6 +456,22 @@ def advect_scalar(
     return _advect_scalar_jit(phi, U, V, W, metric, dt, macho_order)
 
 
+@functools.partial(jax.jit, static_argnums=(6,))
+def _advect_scalars_batch_jit(
+    fields:      jax.Array,   # (N, nz, ny, nx) — N scalars stacked
+    U:           jax.Array,
+    V:           jax.Array,
+    W:           jax.Array,
+    metric:      dict,
+    dt:          float,
+    macho_order: int,         # static — same for all N scalars this step
+) -> jax.Array:               # (N, nz, ny, nx)
+    """Batch-advect N scalar fields in one vmapped JIT call."""
+    return jax.vmap(
+        lambda phi: _advect_scalar_jit(phi, U, V, W, metric, dt, macho_order),
+    )(fields)
+
+
 def _flux3(
     phi_m1: jax.Array,
     phi_0:  jax.Array,
@@ -494,12 +529,15 @@ def _mom_adv_tend(
     w1 = W * (rhow[:, None, None] * dtdz
               * ady[None, :, None] * mu[None, :, None])
 
-    # Grid Jacobians (1/g) for tendency normalisation
-    gu3 = (mu[None, :, None] * rho[:, None, None]
+    # Grid Jacobians (1/g) for tendency normalisation.
+    # Clamp mu/muv to 1e-5 (matches gSAM advect_mom.f90: gv=max(1.e-5,muv)*...).
+    mu_safe  = jnp.maximum(mu,  1e-5)
+    muv_safe = jnp.maximum(muv, 1e-5)
+    gu3 = (mu_safe[None, :, None] * rho[:, None, None]
            * ady[None, :, None] * adz[:, None, None])
-    gv3_int = (muv[None, 1:ny, None] * rho[:, None, None]
+    gv3_int = (muv_safe[None, 1:ny, None] * rho[:, None, None]
                * adyv[None, 1:ny, None] * adz[:, None, None])
-    gw3_int = (mu[None, :, None] * rhow[1:nz, None, None]
+    gw3_int = (mu_safe[None, :, None] * rhow[1:nz, None, None]
                * ady[None, :, None] * adzw[1:nz, None, None])
 
     # ------------------------------------------------------------------

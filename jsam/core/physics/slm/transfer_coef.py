@@ -128,14 +128,19 @@ def _psih1(x: jax.Array, x0: jax.Array) -> jax.Array:
 
 def _psim2(xsi: jax.Array, xsim0: jax.Array, xm0: jax.Array) -> jax.Array:
     # Uses module-level XSIM / _XM parameters (Fortran parameters).
-    return (jnp.log(XSIM / xsim0)
+    # Guard: active branch always has xsim0 < 0; cap at -1e-30 so inactive
+    # (xsim0 >= 0) cells don't produce log(negative) under JAX_DEBUG_NANS.
+    safe_xsim0 = jnp.minimum(xsim0, -1e-30)
+    return (jnp.log(XSIM / safe_xsim0)
             - _psim1(jnp.asarray(_XM, xsi.dtype), xm0)
             + 1.14 * (jnp.power(jnp.maximum(-xsi, 0.0), 1.0 / 3.0)
                       - (-XSIM) ** (1.0 / 3.0)))
 
 
 def _psih2(xsi: jax.Array, xsih0: jax.Array, xh0: jax.Array) -> jax.Array:
-    return (jnp.log(XSIH / xsih0)
+    # Guard: same inactive-branch protection as _psim2.
+    safe_xsih0 = jnp.minimum(xsih0, -1e-30)
+    return (jnp.log(XSIH / safe_xsih0)
             - _psih1(jnp.asarray(_XH, xsi.dtype), xh0)
             + 0.8 * (jnp.power(jnp.maximum(-xsi, 0.0), 1.0 / 3.0)
                      - (-XSIH) ** (1.0 / 3.0)))
@@ -150,13 +155,18 @@ def _psih3(xsi: jax.Array, xsih0: jax.Array) -> jax.Array:
 
 
 def _psim4(xsi: jax.Array, xsim0: jax.Array) -> jax.Array:
-    return (jnp.log(jnp.power(jnp.maximum(xsi, 1e-30), 5) / xsim0)
-            + 5.0 * (1.0 - xsim0) + xsi - 1.0)
+    # Active branch has xsim0 > 0; guard so inactive (xsim0 < 0) cells
+    # don't produce log(negative).
+    safe_xsim0 = jnp.maximum(xsim0, 1e-30)
+    return (jnp.log(jnp.power(jnp.maximum(xsi, 1e-30), 5) / safe_xsim0)
+            + 5.0 * (1.0 - safe_xsim0) + xsi - 1.0)
 
 
 def _psih4(xsi: jax.Array, xsih0: jax.Array) -> jax.Array:
-    return (jnp.log(jnp.power(jnp.maximum(xsi, 1e-30), 5) / xsih0)
-            + 5.0 * (1.0 - xsih0) + xsi - 1.0)
+    # Active branch has xsih0 > 0; same inactive-branch guard as _psim4.
+    safe_xsih0 = jnp.maximum(xsih0, 1e-30)
+    return (jnp.log(jnp.power(jnp.maximum(xsi, 1e-30), 5) / safe_xsih0)
+            + 5.0 * (1.0 - safe_xsih0) + xsi - 1.0)
 
 
 def _fm_fh(xsi: jax.Array,

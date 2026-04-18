@@ -18,7 +18,7 @@ class BulkParams:
     umin:        float = 1.0
     karman:      float = 0.4
     epsv:        float = 0.61
-    salt_factor: float = 0.98
+    salt_factor: float = 0.981  # gSAM surface.f90:55
     ug:          float = 0.0
     vg:          float = 0.0
     p00:         float = 1.0e5
@@ -26,6 +26,7 @@ class BulkParams:
     Rv:          float = 461.5
     cp:          float = 1004.64
     g:           float = 9.79764
+    g_mo:        float = 9.81    # gSAM surface.f90:360 — local g used inside MO stability loop
 
 
 # ---------------------------------------------------------------------------
@@ -85,16 +86,19 @@ def _one_iteration(vmag: jax.Array, delt: jax.Array, delq: jax.Array,
     tstar = rhn * delt
     qstar = ren * delq
 
-    hol = (karman * params.g * zbot
+    hol = (karman * params.g_mo * zbot   # gSAM oceflx.f90:147
            * (tstar / thbot + qstar / (1.0 / epsv + qbot))
-           / (ustar ** 2 + 1.0e-20))
+           / ustar ** 2)
     hol    = jnp.clip(hol, -10.0, 10.0)
     stable = 0.5 + jnp.sign(hol) * 0.5
 
-    xsq    = jnp.maximum(jnp.sqrt(jnp.abs(1.0 - 16.0 * hol)), 1.0)
-    xqq    = jnp.sqrt(xsq)
-    psimh  = -5.0 * hol * stable + (1.0 - stable) * _psimhu(xqq)
-    psixh  = -5.0 * hol * stable + (1.0 - stable) * _psixhu(xqq)
+    # Monin-Obukhov stability functions (matches gSAM oceflx.f90 lines 151-154)
+    # am=5.0, bm=16.0 are the gSAM oceflx.f90 constants (NOT Businger 1973 values)
+    am, bm = 5.0, 16.0
+    xsq    = jnp.maximum(jnp.sqrt(jnp.abs(1.0 - bm * hol)), 1.0)
+    xqq    = jnp.sqrt(xsq)   # net: max((abs(1-16*hol))^0.25, 1.0)
+    psimh  = -am * hol * stable + (1.0 - stable) * _psimhu(xqq)
+    psixh  = -am * hol * stable + (1.0 - stable) * _psixhu(xqq)
 
     # --- shift rd to measurement height ---
     rd   = rdn / (1.0 + rdn / karman * (alz - psimh))
@@ -164,7 +168,7 @@ def bulk_surface_fluxes(state: ModelState, metric: dict, sst: jax.Array,
 
     rdn, rhn, ren = _neutral_coeffs(vmag, delt)
 
-    for _ in range(2):
+    for _ in range(2):  # gSAM oceflx.f90: exactly 2 passes (first estimate + one iteration)
         rdn, rhn, ren, ustar, tstar, qstar = _one_iteration(
             vmag, delt, delq, thbot, QV0, z0, rdn, rhn, ren, params,
         )

@@ -1,0 +1,90 @@
+#!/bin/bash
+#PBS -N jsam_irma_debug500
+#PBS -A UCLB0066
+#PBS -q casper@casper-pbs
+#PBS -l select=1:ncpus=8:mem=120GB:ngpus=1:gpu_type=a100 
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -o /dev/null
+
+set -euo pipefail
+
+RUN_ID=$(date +%Y%m%d_%H%M%S)
+LOGFILE=/glade/u/home/sabramian/SAMJax/outputs/run_${RUN_ID}.log
+exec > "$LOGFILE" 2>&1
+
+unset XLA_FLAGS
+
+PYTHON=/glade/u/home/sabramian/.conda/envs/jsam/bin/python
+SAMJAX=/glade/u/home/sabramian/SAMJax
+GSAM_ROOT=/glade/u/home/sabramian/gSAM1.8.7
+
+OUTDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500_${RUN_ID}/snapshots
+DEBUGDIR=/glade/derecho/scratch/sabramian/jsam_IRMA_debug500_${RUN_ID}/debug
+O3FILE=${GSAM_ROOT}/GLOBAL_DATA/BIN_D/ozone_era5_monthly_201709-201709_GLOBAL.bin
+SLM_DATA_ROOT=${GSAM_ROOT}/GLOBAL_DATA/BIN_D
+
+mkdir -p "$OUTDIR" "$DEBUGDIR"
+cd "$SAMJAX"
+
+export JAX_PLATFORMS=cuda
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export JSAM_LU_WORKERS=7
+export JAX_COMPILATION_CACHE_DIR=/glade/work/sabramian/jsam_jax_cache
+export JSAM_LU_CACHE_DIR=/glade/work/sabramian/jsam_lu_cache
+export JSAM_INIT_CACHE_DIR=/glade/work/sabramian/jsam_init_cache
+mkdir -p "$JAX_COMPILATION_CACHE_DIR" "$JSAM_LU_CACHE_DIR" "$JSAM_INIT_CACHE_DIR"
+
+echo "=== jsam IRMA debug500 (Casper A100): $(date) ==="
+echo "Host: $(hostname)"
+echo "GPUs: $(nvidia-smi -L 2>/dev/null || echo 'none')"
+
+$PYTHON -u scripts/run.py \
+    \
+    `# ── Run identity ────────────────────────────────────────────────` \
+    --gsam-root           "$GSAM_ROOT" \
+    --start-time          "2017-09-05T00:00:00" \
+    --dt                  10.0 \
+    --cfl-max             0.7 \
+    --ncycle-max          4 \
+    \
+    `# ── SST indexing ─────────────────────────────────────────────────` \
+    --sst-file-start      "2017-09-04T00:00:00" \
+    --sst-interval-hours  6 \
+    \
+    `# ── Time integration ─────────────────────────────────────────────` \
+    --nsteps              3 \
+    --output-interval     1 \
+    \
+    `# ── Output ───────────────────────────────────────────────────────` \
+    --out-dir             "$OUTDIR" \
+    --casename            jsam_IRMA_debug500 \
+    \
+    `# ── Numerics ─────────────────────────────────────────────────────` \
+    --no-polar-filter \
+    --sponge-tau          0 \
+    \
+    `# ── Radiation ────────────────────────────────────────────────────` \
+    --rad                 rrtmg \
+    --nrad                90 \
+    --co2                 367.0 \
+    --o3file              "$O3FILE" \
+    --rad-day0            248.0 \
+    --rad-iyear           1999 \
+    \
+    `# ── Microphysics ─────────────────────────────────────────────────` \
+    --qci0                1e-5 \
+    \
+    `# ── Stratospheric nudging (disabled) ─────────────────────────────` \
+    --nudge-z1            15000.0 \
+    --nudge-z2            60000.0 \
+    --nudge-tau           3600.0 \
+    \
+    `# ── Simple Land Model ────────────────────────────────────────────` \
+    --slm \
+    --slm-data-root       "$SLM_DATA_ROOT" \
+    \
+    `# ── Debug ────────────────────────────────────────────────────────` \
+    --debug-dump-dir      "$DEBUGDIR"
+
+echo "=== done: $(date) ==="

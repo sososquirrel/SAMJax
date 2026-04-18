@@ -263,14 +263,18 @@ def resistances(
     r_c_veg = jnp.minimum(Rc_max, Rc_min / LAI_safe / tmp2)
 
     # ------------------------------------------------------------------
-    # Non-vegetated branch : Fortran sets all four to 0
+    # Non-vegetated branch : Fortran sets all four to 0, but JAX evaluates
+    # the vegetated expressions for all cells before masking via jnp.where.
+    # Use sentinel=1.0 so dead-branch divisions produce finite (discarded)
+    # values — matching the Fortran if(vegetated) guard semantics.
     # ------------------------------------------------------------------
     veg = vegetated.astype(bool)
     zero = jnp.zeros_like(r_c_veg)
+    one  = jnp.ones_like(r_c_veg)
 
-    r_b = jnp.where(veg, r_b_veg, zero)
-    r_c = jnp.where(veg, r_c_veg, zero)
-    r_d = jnp.where(veg, r_d_veg, zero)
+    r_b = jnp.where(veg, r_b_veg, one)
+    r_c = jnp.where(veg, r_c_veg, one)
+    r_d = jnp.where(veg, r_d_veg, one)
     r_litter = zero    # gSAM hard-codes r_litter = 0
 
     # ------------------------------------------------------------------

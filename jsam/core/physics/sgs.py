@@ -277,7 +277,9 @@ def _compute_buoy_sgs(
         # Fix 2.6: use local SST if available; falls back to tabs0[0]
         _sst = metric.get("sst", None)
         _sst_val = _sst if _sst is not None else tabs0[0]
-        _a_prod_bu = _bet0 * (fluxbt + EPSV * _sst_val * _fbq)   # (ny,nx)
+        # gSAM tke_full.f90:101: bbb = 1 + epsv*qv(k=1) multiplies sensible heat term
+        _bbb = 1.0 + EPSV * QV[0]   # (ny, nx) — density correction at lowest level
+        _a_prod_bu = _bet0 * (_bbb * fluxbt + EPSV * _sst_val * _fbq)   # (ny,nx)
         # grd at surface level k=0: coef(j) = min(delta_max, dx*mu) * min(delta_max, dy*ady)
         # dz_ref*adz(k=0) ≈ dz[0] (adz[0] = 1 in flat terrain with uniform vertical grid)
         _dz_sfc = dz_ref   # dz_ref = metric["dz_ref"] already in scope (JAX array)
@@ -527,6 +529,73 @@ def diffuse_scalar(
 
     rho_dz = (rho * dz)[:, None, None]   # (nz,1,1)
     dfdt   = dfdt - (flx_z[1:, :, :] - flx_z[:-1, :, :]) / rho_dz
+
+    return dfdt
+
+
+# ---------------------------------------------------------------------------
+# Horizontal-only SGS diffusion of a scalar field
+# (gSAM diffuse_scalar3D.f90 with doimplicitdiff=.true. — skips vertical)
+# ---------------------------------------------------------------------------
+
+@jax.jit
+def diffuse_scalar_horiz(
+    field:  jax.Array,   # (nz, ny, nx)
+    tkh:    jax.Array,   # (nz, ny, nx)  eddy diffusivity
+    metric: dict,
+    tk_max: jax.Array | None = None,   # (nz,ny,1) per-face stability cap
+) -> jax.Array:
+    """
+    Horizontal-only explicit SGS diffusion tendency d(field)/dt.
+    Matches gSAM diffuse_scalar3D.f90 with doimplicitdiff=.true.: applies
+    horizontal (x and y) diffusion only and returns early; the vertical is
+    handled separately by diffuse_scalar_z_implicit (the implicit solver).
+
+    No fluxb/fluxt arguments — boundary fluxes are applied only by the
+    implicit vertical solver.
+    """
+    dx  = metric["dx_lon"]
+    dy  = metric["dy_lat"]   # (ny,) per-row
+
+    # ---- Horizontal x-direction — with imu(j) = 1/cos(lat) metric (C8 fix) ----
+    field_xp = jnp.concatenate([field[:, :, -1:], field, field[:, :, :1]], axis=2)
+    tkh_xp   = jnp.concatenate([tkh[:, :, -1:],  tkh,  tkh[:, :, :1]],  axis=2)
+    rdx2     = (1.0 / dx) ** 2
+    cos_lat  = metric.get("cos_lat", None)
+    if cos_lat is not None:
+        imu2 = (1.0 / cos_lat[None, :, None]) ** 2
+    else:
+        imu2 = 1.0
+    rdx2_j   = rdx2 * imu2
+    tkh_fx   = 0.5 * (tkh_xp[:, :, :-1] + tkh_xp[:, :, 1:])
+    if tk_max is not None:
+        tkh_fx = jnp.minimum(tkh_fx, tk_max)
+    flx_x    = -rdx2_j * tkh_fx * (field_xp[:, :, 1:] - field_xp[:, :, :-1])
+    dfdt     = -(flx_x[:, :, 1:] - flx_x[:, :, :-1])
+
+    # ---- Horizontal y-direction (non-uniform, with spherical metrics) ----
+    field_yp = jnp.pad(field, ((0, 0), (1, 1), (0, 0)), mode='edge')
+    tkh_yp   = jnp.pad(tkh,   ((0, 0), (1, 1), (0, 0)), mode='edge')
+    dy_v_int = 0.5 * (dy[:-1] + dy[1:])
+    dy_v_full = jnp.concatenate([dy_v_int[:1], dy_v_int, dy_v_int[-1:]])
+    cos_v_s   = metric.get("cos_v", None)
+    if cos_v_s is not None:
+        muv_face = cos_v_s[None, :, None]
+    else:
+        muv_face = 1.0
+    if cos_lat is not None:
+        mu_cell = cos_lat[None, :, None]
+    else:
+        mu_cell = 1.0
+    tkh_fy   = 0.5 * (tkh_yp[:, :-1, :] + tkh_yp[:, 1:, :])
+    if tk_max is not None:
+        tk_max_interior = 0.5 * (tk_max[:, :-1, :] + tk_max[:, 1:, :])
+        tk_max_yface = jnp.concatenate([tk_max[:, :1, :], tk_max_interior, tk_max[:, -1:, :]], axis=1)
+        tkh_fy = jnp.minimum(tkh_fy, tk_max_yface)
+    dy_ref_s  = metric["dy_lat_ref"]
+    flx_y    = (-muv_face / (dy_v_full[None, :, None] * dy_ref_s)
+                * tkh_fy * (field_yp[:, 1:, :] - field_yp[:, :-1, :]))
+    dfdt     = dfdt - (flx_y[:, 1:, :] - flx_y[:, :-1, :]) / (dy[None, :, None] * mu_cell)
 
     return dfdt
 
@@ -1047,20 +1116,27 @@ def diffuse_damping_mom_z(
     nz = tk.shape[0]
     ny = tk.shape[1]
     nx = tk.shape[2]
-    dz   = metric["dz"]        # (nz,)
-    rho  = metric["rho"]       # (nz,)
-    rhow = metric["rhow"]      # (nz+1,)
-    z    = metric["z"]          # (nz,) cell centres
-    cos_lat = metric["cos_lat"] # (ny,)
-    dx   = metric["dx_lon"]     # scalar
-    pres = metric["pres"]       # (nz,) Pa
+    dz     = metric["dz"]        # (nz,)  adz * dz_ref — actual cell thickness (used for sponge zi)
+    rho    = metric["rho"]       # (nz,)
+    rhow   = metric["rhow"]      # (nz+1,)
+    adz    = metric["adz"]       # (nz,)  (zi[k+1]-zi[k]) / dz_ref
+    adzw   = metric["adzw"]      # (nz+1,) (z[k]-z[k-1]) / dz_ref; adzw[0]=1
+    dz_ref = metric["dz_ref"]    # scalar, reference dz = zi[1]-zi[0]
+    z      = metric["z"]         # (nz,)  cell-centre heights (used for sponge nu)
+    cos_lat = metric["cos_lat"]  # (ny,)
+    dx   = metric["dx_lon"]      # scalar
+    pres = metric["pres"]        # (nz,) Pa
 
     tau_max = 1.0 / dt
 
-    # dzw[f] = z[f] - z[f-1] for interior w-faces f=0..nz-2
-    # (distance between cell centres f and f+1)
-    dzw = z[1:] - z[:-1]     # (nz-1,)
-    rhow_int = rhow[1:-1]    # (nz-1,) at interior w-faces
+    # Interior w-face arrays (faces 1..nz-1 in 0-indexed = gSAM faces 2..nzm).
+    # adzw_int[f] = adzw[f+1] = (z[f+1]-z[f])/dz_ref  (center-to-center spacing ratio)
+    # adz_lo[f]   = adz[f]   = thickness ratio of cell below face f+1
+    # adz_hi[f]   = adz[f+1] = thickness ratio of cell above face f+1
+    adzw_int = adzw[1:-1]    # (nz-1,) face-spacing ratios at interior w-faces
+    adz_lo   = adz[:-1]      # (nz-1,) adz of cell below each interior face
+    adz_hi   = adz[1:]       # (nz-1,) adz of cell above each interior face
+    rhow_int = rhow[1:-1]    # (nz-1,) density at interior w-faces
 
     # ================================================================
     # U implicit solve  (nz, ny, nx+1)
@@ -1089,30 +1165,32 @@ def diffuse_damping_mom_z(
     vel0_u = jnp.where(U > umax_3d, umax_3d,
                         jnp.where(U < -umax_3d, -umax_3d, 0.0))
 
-    # Tridiagonal coefficients
-    # c[k]: coefficient for U[k+1], at face between k and k+1
-    #   = -dt * rhow[k+1] * tkz_u[k] / (dzw[k] * dz[k] * rho[k])
-    c_vals = (-dt * rhow_int[:, None, None] * tkz_u
-              / (dzw[:, None, None] * dz[:-1, None, None] * rho[:-1, None, None]))
+    # Tridiagonal coefficients — exact gSAM diffuse_damping_mom_z.f90 notation.
+    # rdz2 = dt/dz_ref^2; for row k (0-indexed), c coefficient uses face above (adzw[k+1]):
+    #   c[k] = -tkz * rdz2 * rhow[k+1] / (adzw[k+1] * adz[k] * rho[k])
+    # and a coefficient at row k uses face below (adzw[k]):
+    #   a[k] = -tkz * rdz2 * rhow[k]   / (adzw[k]   * adz[k] * rho[k])
+    # Here adzw_int[f] = adzw[f+1], adz_lo[f] = adz[f] (cell below face f+1).
+    rdz2 = dt / dz_ref ** 2
+    c_vals = (-rdz2 * rhow_int[:, None, None] * tkz_u
+              / (adzw_int[:, None, None] * adz_lo[:, None, None] * rho[:-1, None, None]))
     c_u = jnp.concatenate([c_vals, jnp.zeros((1, ny, nx + 1))], axis=0)
 
-    # a[k]: coefficient for U[k-1], at face between k-1 and k
-    #   = -dt * rhow[k] * tkz_u[k-1] / (dzw[k-1] * dz[k] * rho[k])
-    a_vals = (-dt * rhow_int[:, None, None] * tkz_u
-              / (dzw[:, None, None] * dz[1:, None, None] * rho[1:, None, None]))
+    # a[k+1] uses face adzw[k+1] (= adzw_int[k]) and adz[k+1] = adz_hi[k].
+    a_vals = (-rdz2 * rhow_int[:, None, None] * tkz_u
+              / (adzw_int[:, None, None] * adz_hi[:, None, None] * rho[1:, None, None]))
     a_u = jnp.concatenate([jnp.zeros((1, ny, nx + 1)), a_vals], axis=0)
 
     b_u = 1.0 + dt * tau_vel_u - a_u - c_u
     d_u = U + dt * tau_vel_u * vel0_u
 
     # Surface flux BC at k = k_terrau(i,j).  jsam is flat-only so
-    # k_terrau ≡ 0 everywhere, matching gSAM diffuse_damping_mom_z.f90:121-138
-    # for the flat-terrain limit:
-    #     d(i,j,k_terrau) += dtn*rhow(k)/(dz*adz(k)*rho(k))*fluxbu(i,j)
-    # In jsam the metric dz[0] already equals dz_ref*adz(0), so the flux
-    # coefficient is rhow[0] / (rho[0] * dz[0]).
+    # k_terrau ≡ 0 everywhere, matching gSAM diffuse_damping_mom_z.f90:121-138:
+    #     d(i,j,k) += dtn*rhow(k)/(dz_ref*adz(k)*rho(k))*fluxbu(i,j)
+    # (gSAM uses dz=dz_ref and adz(k_terrau)=1 for flat terrain, but we use
+    # adz[0] for generality to match the Fortran coefficient exactly.)
     if fluxbu is not None:
-        d_u = d_u.at[0].add(dt * rhow[0] / (rho[0] * dz[0]) * fluxbu)
+        d_u = d_u.at[0].add(dt * rhow[0] / (dz_ref * adz[0] * rho[0]) * fluxbu)
 
     U_new = _thomas_solve(a_u, b_u, c_u, d_u)
 
@@ -1154,21 +1232,21 @@ def diffuse_damping_mom_z(
     vel0_v = jnp.where(V > umax_v3d, umax_v3d,
                         jnp.where(V < -umax_v3d, -umax_v3d, 0.0))
 
-    c_vals_v = (-dt * rhow_int[:, None, None] * tkz_v
-                / (dzw[:, None, None] * dz[:-1, None, None] * rho[:-1, None, None]))
+    c_vals_v = (-rdz2 * rhow_int[:, None, None] * tkz_v
+                / (adzw_int[:, None, None] * adz_lo[:, None, None] * rho[:-1, None, None]))
     c_v = jnp.concatenate([c_vals_v, jnp.zeros((1, ny + 1, nx))], axis=0)
 
-    a_vals_v = (-dt * rhow_int[:, None, None] * tkz_v
-                / (dzw[:, None, None] * dz[1:, None, None] * rho[1:, None, None]))
+    a_vals_v = (-rdz2 * rhow_int[:, None, None] * tkz_v
+                / (adzw_int[:, None, None] * adz_hi[:, None, None] * rho[1:, None, None]))
     a_v = jnp.concatenate([jnp.zeros((1, ny + 1, nx)), a_vals_v], axis=0)
 
     b_v = 1.0 + dt * tau_vel_v - a_v - c_v
     d_v = V + dt * tau_vel_v * vel0_v
 
     # Surface flux BC at k = k_terrav(i,j) ≡ 0 for flat-only jsam.
-    # Matches gSAM diffuse_damping_mom_z.f90:243-260 in the flat limit.
+    # Matches gSAM diffuse_damping_mom_z.f90:243-260: dtn*rhow(k)/(dz*adz(k)*rho(k)).
     if fluxbv is not None:
-        d_v = d_v.at[0].add(dt * rhow[0] / (rho[0] * dz[0]) * fluxbv)
+        d_v = d_v.at[0].add(dt * rhow[0] / (dz_ref * adz[0] * rho[0]) * fluxbv)
 
     V_new = _thomas_solve(a_v, b_v, c_v, d_v)
     # Enforce polar wall BC: V=0 at j=0 and j=ny
@@ -1189,8 +1267,8 @@ def diffuse_damping_mom_z(
     tauz_w = 0.5 * (tauz_c[:-1] + tauz_c[1:])  # (nz-1,)
 
     # W CFL limiter (dodamping_w): only below sponge (tauz_w == 0)
-    # wmax = damping_w_cu * dzw / dt at each interior w-face
-    wmax_w = damping_w_cu * dzw / dt  # (nz-1,)
+    # gSAM: wmax = damping_w_cu * dz * adzw(k) / dtn = damping_w_cu * dz_ref * adzw_int / dt
+    wmax_w = damping_w_cu * dz_ref * adzw_int / dt  # (nz-1,)
     W_int = W[1:-1]  # (nz-1, ny, nx) interior w-faces
 
     below_sponge = (tauz_w == 0.0)[:, None, None]
@@ -1201,26 +1279,24 @@ def diffuse_damping_mom_z(
         jnp.where(W_int < -wmax_w[:, None, None], -wmax_w[:, None, None], 0.0),
     )
 
-    # For W at interior face f (0-indexed in the nz-1 system, = w-face f+1):
-    # cell below = f, cell above = f+1
-    # tkz_below = tk[f], tkz_above = tk[f+1]
-    # dzw_f = z[f+1] - z[f]
-    #
-    # a[f] = -dt * tk[f]   * rho[f]   / (dzw_f * dz[f]   * rhow[f+1])
-    # c[f] = -dt * tk[f+1] * rho[f+1] / (dzw_f * dz[f+1] * rhow[f+1])
-    #
-    # But f goes from 0..nz-2 in this system.
-    # Cell below of system-f = cell f (0-indexed)
-    # Cell above of system-f = cell f+1
+    # For W at interior face f (0-indexed in the nz-1 system, = gSAM w-face k=f+2):
+    # cell below = f (gSAM kb=f+1), cell above = f+1 (gSAM k=f+2)
+    # gSAM diffuse_damping_mom_z.f90 lines 368-369 (1-indexed k, kc=k+1, kb=k-1):
+    #   iadz  = rdz2*rho(kb)/(adzw(k)*adz(kb)*rhow(k))  -> a = -tkz_below * iadz
+    #   iadzw = rdz2*rho(k) /(adzw(k)*adz(k) *rhow(k))  -> c = -tkz_above * iadzw
+    # Both use adzw(k) (the same face), but adz(kb) vs adz(k) for a vs c.
+    # 0-indexed: adzw(k=f+2) = adzw[f+1] = adzw_int[f]
+    #            adz(kb=f+1) = adz[f]    = adz_lo[f]
+    #            adz(k=f+2)  = adz[f+1]  = adz_hi[f]
 
-    tk_below = tk[:-1]   # (nz-1, ny, nx) = tk at cells 0..nz-2
-    tk_above = tk[1:]    # (nz-1, ny, nx) = tk at cells 1..nz-1
-    rhow_w   = rhow[1:-1]  # (nz-1,) density at interior w-faces
+    tk_below = tk[:-1]   # (nz-1, ny, nx) = tk at cells 0..nz-2  (gSAM tk(kb))
+    tk_above = tk[1:]    # (nz-1, ny, nx) = tk at cells 1..nz-1  (gSAM tk(k))
+    rhow_w   = rhow[1:-1]  # (nz-1,) = density at interior w-faces (gSAM rhow(k))
 
-    a_w_vals = (-dt * tk_below * rho[:-1, None, None]
-                / (dzw[:, None, None] * dz[:-1, None, None] * rhow_w[:, None, None]))
-    c_w_vals = (-dt * tk_above * rho[1:, None, None]
-                / (dzw[:, None, None] * dz[1:, None, None] * rhow_w[:, None, None]))
+    a_w_vals = (-rdz2 * tk_below * rho[:-1, None, None]
+                / (adzw_int[:, None, None] * adz_lo[:, None, None] * rhow_w[:, None, None]))
+    c_w_vals = (-rdz2 * tk_above * rho[1:, None, None]
+                / (adzw_int[:, None, None] * adz_hi[:, None, None] * rhow_w[:, None, None]))
 
     # First face (f=0): a connects to W[0]=0, so a is effectively unused
     # but we set alpha[0]=0, beta[0] properly by keeping a[0] in the system.
@@ -1266,37 +1342,61 @@ def diffuse_scalar_z_implicit(
     Returns the updated field (not a tendency).
 
     Port of gSAM SGS_TKE/diffuse_scalar_z.f90.
+
+    Tridiagonal coefficients match gSAM diffuse_scalar_z.f90 exactly:
+      rdz2   = dt / dz_ref^2
+      c[k]   = -tkz * rdz2 * rhow[k+1] / (adzw[k+1] * adz[k] * rho[k])   (super-diagonal)
+      a[k]   = -tkz * rdz2 * rhow[k]   / (adzw[k]   * adz[k] * rho[k])   (sub-diagonal)
+    where tkz is the face-average of tkh at the relevant w-face.
     """
     nz, ny, nx = field.shape
-    dz   = metric["dz"]
-    rho  = metric["rho"]
-    rhow = metric["rhow"]
-    z    = metric["z"]
+    rho    = metric["rho"]      # (nz,)
+    rhow   = metric["rhow"]     # (nz+1,)
+    adz    = metric["adz"]      # (nz,)   (zi[k+1]-zi[k]) / dz_ref
+    adzw   = metric["adzw"]     # (nz+1,) (z[k]-z[k-1]) / dz_ref; adzw[0]=1
+    dz_ref = metric["dz_ref"]   # scalar
 
-    dzw = z[1:] - z[:-1]      # (nz-1,)
-    rhow_int = rhow[1:-1]     # (nz-1,)
+    # Interior face arrays (gSAM faces 2..nzm → Python indices 1..nz-1).
+    # adzw_int[f] = adzw[f+1]  (face-spacing ratio at interior face f+1)
+    # adz_lo[f]   = adz[f]     (cell-thickness ratio of cell below face f+1)
+    # adz_hi[f]   = adz[f+1]   (cell-thickness ratio of cell above face f+1)
+    adzw_int = adzw[1:-1]   # (nz-1,)
+    adz_lo   = adz[:-1]     # (nz-1,)
+    adz_hi   = adz[1:]      # (nz-1,)
+    rhow_int = rhow[1:-1]   # (nz-1,) at interior w-faces
 
-    # tkh at interior w-faces: average of adjacent cell-centre values
+    # tkh at interior w-faces: average of adjacent cell-centre values.
+    # Matches gSAM: tkz = 0.5*(tkh(k-1)+tkh(k)) for sub, 0.5*(tkh(k)+tkh(k+1)) for super.
     tkh_fz = 0.5 * (tkh[:-1] + tkh[1:])  # (nz-1, ny, nx)
 
-    # Tridiagonal coefficients (same structure as momentum but no damping)
-    c_vals = (-dt * rhow_int[:, None, None] * tkh_fz
-              / (dzw[:, None, None] * dz[:-1, None, None] * rho[:-1, None, None]))
+    # Tridiagonal coefficients — exact gSAM diffuse_scalar_z.f90 notation.
+    # rdz2 = dt/dz_ref^2 (= gSAM's dtn/dz^2 where dz=dz_ref).
+    rdz2 = dt / dz_ref ** 2
+    # c[k] (super-diagonal, row k → row k+1):
+    #   iadzw = rdz2 * rhow(kc) / (adzw(kc) * adz(k) * rho(k))  [gSAM line 70]
+    c_vals = (-rdz2 * rhow_int[:, None, None] * tkh_fz
+              / (adzw_int[:, None, None] * adz_lo[:, None, None] * rho[:-1, None, None]))
     c_f = jnp.concatenate([c_vals, jnp.zeros((1, ny, nx))], axis=0)
 
-    a_vals = (-dt * rhow_int[:, None, None] * tkh_fz
-              / (dzw[:, None, None] * dz[1:, None, None] * rho[1:, None, None]))
+    # a[k] (sub-diagonal, row k → row k-1):
+    #   iadz = rdz2 * rhow(k) / (adzw(k) * adz(k) * rho(k))  [gSAM line 69]
+    # Applied at row k+1 (= f+1) using face f+1 spacing (adzw_int[f]=adzw[f+1])
+    # and cell f+1 thickness (adz_hi[f]=adz[f+1]).
+    a_vals = (-rdz2 * rhow_int[:, None, None] * tkh_fz
+              / (adzw_int[:, None, None] * adz_hi[:, None, None] * rho[1:, None, None]))
     a_f = jnp.concatenate([jnp.zeros((1, ny, nx)), a_vals], axis=0)
 
     b_f = 1.0 - a_f - c_f
     d_f = field.copy()
 
-    # Surface flux BC at k=0
+    # Surface flux BC at k=0 (gSAM diffuse_scalar_z.f90 line 61):
+    #   d += dtn * rhow(k_terra) / (rho(k) * dz * adz(k)) * fluxb
     if fluxb is not None:
-        d_f = d_f.at[0].add(dt * rhow[0] / (rho[0] * dz[0]) * fluxb)
-    # Top flux BC at k=nz-1
+        d_f = d_f.at[0].add(dt * rhow[0] / (dz_ref * adz[0] * rho[0]) * fluxb)
+    # Top flux BC at k=nz-1 (gSAM line 97, kc=nzm+1=nz → rhow[nz]):
+    #   d -= dtn * rhow(kc) / (rho(k) * dz * adz(k)) * fluxt
     if fluxt is not None:
-        d_f = d_f.at[-1].add(-dt * rhow[-1] / (rho[-1] * dz[-1]) * fluxt)
+        d_f = d_f.at[-1].add(-dt * rhow[-1] / (dz_ref * adz[-1] * rho[-1]) * fluxt)
 
     return _thomas_solve(a_f, b_f, c_f, d_f)
 

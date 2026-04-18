@@ -3,18 +3,40 @@
     "allow": [
       "Bash(git commit -m ' *)",
       "Bash(qstat)",
-      "Bash(git commit -m 'Fix FCT scale factor: apply iadz weighting to vertical flux term *)",
       "Bash(tee /tmp/test_era5_init.log)",
       "Bash(xargs cat *)",
       "Bash(awk '{print $5}')",
       "Bash(awk -F',' 'NR>1 && $1==1 {print $1,$2,$3}' /glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug/globals.csv)",
       "Bash(awk -F',' 'NR>1 && $1==1 {print $1,$2,$3}' /glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/debug/globals.csv)",
       "Bash(python3 -m py_compile jsam/core/physics/sgs.py)",
-      "Bash(sacct -j 3191590 -o jobid,state,exitcode)"
+      "Bash(sacct -j 3191590 -o jobid,state,exitcode)",
+      "Bash(tee /tmp/qsub_result.txt)",
+      "Bash(cat /glade/derecho/scratch/sabramian/tmp/*.o*)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(awk -F/ '{depth=NF-10; for\\(i=0;i<depth;i++\\) printf \"  \"; print $NF \" \\(\" substr\\($0, index\\($0, $NF-3\\)\\) \"\\)\"}')",
+      "Bash(awk '{printf \"%-8s %s\\\\n\", $5, $9}')",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(crontab -l)",
+      "Bash(awk -F *)",
+      "Bash(awk '{print $NF, $\\(NF-2\\)}')",
+      "Bash(qdel 3213227.casper-pbs)",
+      "Bash(xargs -I{} basename {})",
+      "Bash(JAX_PLATFORMS=cpu bash run_all_new.sh)",
+      "Bash(tee /tmp/matching_tests_run.log)",
+      "Bash(awk -F',' '{printf \"%s %s %-18s W=[%s,%s] U=[%s,%s]\\\\n\", $1,$2,$3,$8,$9,$5,$6}')",
+      "Bash([ -f \"$log\" ])",
+      "Bash(conda run *)",
+      "Bash(sort -t/ -k7)",
+      "Bash(awk -F',' '{print $1}' /glade/derecho/scratch/sabramian/jsam_IRMA_debug500_20260418_093804/debug/globals.csv)"
     ],
     "additionalDirectories": [
       "/glade/derecho/scratch/sabramian",
-      "/tmp"
+      "/tmp",
+      "/glade/work/sabramian/jsam_lu_cache",
+      "/glade/work/sabramian/jsam_init_cache",
+      "/glade/u/home/sabramian/.claude/commands"
     ]
   }
 }

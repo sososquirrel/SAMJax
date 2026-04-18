@@ -336,7 +336,7 @@ def soil_temperature(
     ice = icemask == 1
 
     poro = static.poro_soil
-    s_d = static.s_depth          # metres (temperature equation uses m)
+    s_d = jnp.maximum(static.s_depth, 1.0e-20)  # guard ocean/non-land cells
     sst_cond = static.sst_cond
     sst_capa = static.sst_capa
 
@@ -378,7 +378,7 @@ def soil_temperature(
         cond_k = jnp.where(ice, cond_ice, cond_soil)
         capa_k = jnp.where(ice, rho_ice * capa_ice, capa_soil)
         st_cond_layers.append(cond_k)
-        st_capa_layers.append(capa_k)
+        st_capa_layers.append(jnp.maximum(capa_k, 1.0e-20))
 
     # -----------------------------------------------------------------
     # Effective conductivity at interior interfaces — depth-weighted

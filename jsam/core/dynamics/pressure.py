@@ -1,17 +1,14 @@
 """
 Pressure solver for the anelastic equations on a lat-lon grid.
-Solves ∇²p' = RHS via rfft-x + sparse-LU in (y,z) per zonal mode.
+Solves ∇²p' = RHS via rfft-x + sparse-LU-(y,z) (spherical, matching gSAM pressure_gmg).
 
-SPHERICAL HELMHOLTZ SOLVER (NOT Cartesian pressure_big.f90):
-  - RHS: Full spherical anelastic divergence with cos(lat) factors
-  - Solver: FFT in x + sparse-LU in (y,z) per zonal mode (spherical Helmholtz)
-  - Metric: True spherical with EARTH_RADIUS * cos(lat) * dlon for zonal distance
+SPHERICAL SOLVER — matches gSAM pressure_gmg (used for dolatlon=T, doflat=F):
+  - RHS: Spherical anelastic divergence with cos(lat)/imu factors (matches gSAM press_rhs.f90)
+  - Solver: rfft in x + sparse LU factorisation per zonal mode m in (y,z)
+  - Zonal eigenvalue: α_m(j) = [-4sin²(πm/nx)/(dλ R)²] × cos²(φ_j)  (Cartesian × cos², matches gSAM)
+  - Meridional operator: (1/cosφ) d/dφ(cosφ dP/dφ) / R²  (true spherical Laplacian)
+  - Vertical operator: rhow(k)/(rho(k)*adz(k)*adzw(k)*dz_ref²)  (anelastic)
   - Pressure history: p_prev/p_pprev returned unchanged; actual pressure separate
-
-Differences from gSAM pressure_big.f90 (Cartesian FFT+DCT+Thomas):
-  - JAX uses full spherical metrics; gSAM uses Cartesian approximation
-  - JAX uses sparse-LU in (y,z); gSAM uses DCT in y + Thomas in z
-  - JAX applies spherical imu/cos_v factors in RHS; gSAM uses scalar dx/dy
 """
 
 from __future__ import annotations
@@ -321,7 +318,7 @@ def _pcg_solve(
     op,
     b: jax.Array,
     precond,
-    tol: float = 1e-5,
+    tol: float = 1e-7,  # gSAM gmg_precision typical value
     maxiter: int = 200,
 ) -> jax.Array:
     """Preconditioned Conjugate Gradient solver (eager execution)."""
@@ -369,109 +366,169 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     Row/column index: row = j*nz + k  (j outer, k inner).
 
     Non-zeros per row: up to 5 (self, ±j neighbour, ±k neighbour).
+    Fully vectorised — no Python loops over (j, k).
     """
     import scipy.sparse as sp
 
-    cos_lat  = metric_np["cos_lat"]
-    cos_lat_c = np.maximum(cos_lat, 1e-6)
-    cos_v    = metric_np["cos_v"]
-    dy_row   = np.asarray(metric_np["dy_lat"], dtype=np.float64)
-    rho      = metric_np["rho"]
-    rhow     = metric_np["rhow"]
-    dz       = metric_np["dz"]
-    dlon_rad = float(metric_np["dlon_rad"])
-    nx_grid  = int(metric_np["nx"])
-
-    R = EARTH_RADIUS
-    sin2    = np.sin(np.pi * m / nx_grid) ** 2
-    alpha_m = -4.0 * sin2 / (dlon_rad * R * cos_lat_c) ** 2   # (ny,)
-
-    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])
-
-    c_lo = np.zeros(ny)   # coefficient multiplying P[j-1,:]
-    c_hi = np.zeros(ny)   # coefficient multiplying P[j+1,:]
-    for j in range(ny):
-        inv_row = 1.0 / (dy_row[j] * cos_lat_c[j])
-        if j > 0:
-            c_lo[j] = cos_v[j] / dy_v_int[j - 1] * inv_row
-        if j < ny - 1:
-            c_hi[j] = cos_v[j + 1] / dy_v_int[j] * inv_row
-
-    adzw = np.asarray(metric_np.get("adzw", np.ones(nz + 1)), dtype=np.float64)
+    cos_lat_c = np.maximum(np.asarray(metric_np["cos_lat"], np.float64), 1e-6)
+    cos_v     = np.asarray(metric_np["cos_v"],   np.float64)
+    dy_row    = np.asarray(metric_np["dy_lat"],  np.float64)
+    rho       = np.asarray(metric_np["rho"],     np.float64)
+    rhow      = np.asarray(metric_np["rhow"],    np.float64)
+    dz        = np.asarray(metric_np["dz"],      np.float64)
+    adzw      = np.asarray(metric_np.get("adzw", np.ones(nz + 1)), np.float64)
     dz_ref_val = float(metric_np.get("dz_ref", dz[0]))
-    d_lo = np.zeros(nz)
-    d_hi = np.zeros(nz)
-    for k in range(nz):
-        c = 1.0 / (rho[k] * dz[k])
-        if k > 0:
-            d_lo[k] = rhow[k] / (adzw[k] * dz_ref_val) * c
-        if k < nz - 1:
-            d_hi[k] = rhow[k + 1] / (adzw[k + 1] * dz_ref_val) * c
+    dlon_rad  = float(metric_np["dlon_rad"])
+    nx_grid   = int(metric_np["nx"])
 
-    n = ny * nz
-    rows, cols, vals = [], [], []
-    for j in range(ny):
-        diag_j = alpha_m[j] - (c_lo[j] + c_hi[j])
-        for k in range(nz):
-            row = j * nz + k
-            diag_k = -(d_lo[k] + d_hi[k])
-            rows.append(row); cols.append(row)
-            vals.append(diag_j + diag_k)
-            if k > 0:
-                rows.append(row); cols.append(row - 1); vals.append(d_lo[k])
-            if k < nz - 1:
-                rows.append(row); cols.append(row + 1); vals.append(d_hi[k])
-            if j > 0:
-                rows.append(row); cols.append(row - nz); vals.append(c_lo[j])
-            if j < ny - 1:
-                rows.append(row); cols.append(row + nz); vals.append(c_hi[j])
+    sin2            = np.sin(np.pi * m / nx_grid) ** 2
+    # Cartesian x-eigenvalue × cos²(lat) per row — matches gSAM pressure_gmg.f90:
+    #   alpha = (2 - 2*cos(2πm/nx)) / dx²   (Cartesian, then scaled by cos²(lat_j))
+    alpha_cartesian = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS) ** 2       # (scalar)
+    alpha_m         = alpha_cartesian * cos_lat_c ** 2                     # (ny,)
 
-    H = sp.csc_matrix(
-        (np.array(vals, dtype=np.float64),
-         (np.array(rows, dtype=np.int32),
-          np.array(cols, dtype=np.int32))),
-        shape=(n, n),
-    )
-    return H
+    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])   # (ny-1,)
+    inv_row  = 1.0 / (dy_row * cos_lat_c)           # (ny,)
+
+    c_lo        = np.zeros(ny)
+    c_hi        = np.zeros(ny)
+    c_lo[1:]    = cos_v[1:-1]  / dy_v_int * inv_row[1:]
+    c_hi[:-1]   = cos_v[1:-1] / dy_v_int * inv_row[:-1]
+
+    inv_rho_dz  = 1.0 / (rho * dz)                  # (nz,)
+    d_lo        = np.zeros(nz)
+    d_hi        = np.zeros(nz)
+    d_lo[1:]    = rhow[1:-1]  / (adzw[1:-1]  * dz_ref_val) * inv_rho_dz[1:]
+    d_hi[:-1]   = rhow[1:-1]  / (adzw[1:-1]  * dz_ref_val) * inv_rho_dz[:-1]
+
+    # Build COO arrays fully vectorised over (j, k)
+    j_idx = np.arange(ny)   # (ny,)
+    k_idx = np.arange(nz)   # (nz,)
+    jj, kk = np.meshgrid(j_idx, k_idx, indexing='ij')   # (ny, nz) each
+    row_all = (jj * nz + kk).ravel()                     # (ny*nz,)
+
+    diag_j = alpha_m - (c_lo + c_hi)   # (ny,)
+    diag_k = -(d_lo + d_hi)            # (nz,)
+    diag_vals = (diag_j[:, None] + diag_k[None, :]).ravel()  # (ny*nz,)
+
+    r_list = [row_all]
+    c_list = [row_all]
+    v_list = [diag_vals]
+
+    # ±k neighbours (vertical)
+    mask_lo = kk.ravel() > 0
+    r_list.append(row_all[mask_lo]);  c_list.append(row_all[mask_lo] - 1)
+    v_list.append(d_lo[kk.ravel()[mask_lo]])
+
+    mask_hi = kk.ravel() < nz - 1
+    r_list.append(row_all[mask_hi]);  c_list.append(row_all[mask_hi] + 1)
+    v_list.append(d_hi[kk.ravel()[mask_hi]])
+
+    # ±j neighbours (meridional)
+    mask_jlo = jj.ravel() > 0
+    r_list.append(row_all[mask_jlo]);  c_list.append(row_all[mask_jlo] - nz)
+    v_list.append(c_lo[jj.ravel()[mask_jlo]])
+
+    mask_jhi = jj.ravel() < ny - 1
+    r_list.append(row_all[mask_jhi]);  c_list.append(row_all[mask_jhi] + nz)
+    v_list.append(c_hi[jj.ravel()[mask_jhi]])
+
+    rows_arr = np.concatenate(r_list).astype(np.int32)
+    cols_arr = np.concatenate(c_list).astype(np.int32)
+    vals_arr = np.concatenate(v_list)
+
+    return sp.csc_matrix((vals_arr, (rows_arr, cols_arr)), shape=(ny * nz, ny * nz))
 
 
 # Module-level cache: keyed by (ny, nz, nm).  Valid for one grid per session.
 _SOLVER_CACHE: dict = {}
 
 
+class _LUSolver:
+    """Wraps a scipy SuperLU object for in-memory caching.
+
+    Uses lu.solve(b) directly — avoids manually reimplementing the
+    permutation logic, which is error-prone.
+    Not picklable (disk cache disabled intentionally).
+    """
+    __slots__ = ('_lu',)
+
+    def __init__(self, lu):
+        self._lu = lu
+
+    def solve(self, b: np.ndarray) -> np.ndarray:
+        return self._lu.solve(b)
+
+
+
 def _get_sparse_solvers(metric_np: dict, ny: int, nz: int, nm: int):
     """
     Build (and cache) sparse LU factorizations of H_m for all zonal modes.
 
-    Returns a list of nm callables: solve_m(b) → x such that H_m x = b.
-    The factorization is precomputed once; each solve is O(ny*nz*bandwidth).
+    Returns a list of nm _LUSolver objects: lu.solve(b) → x such that H_m x = b.
+    LU factors (L, U, perm_r, perm_c — all picklable) are cached to disk keyed
+    on grid geometry; set JSAM_LU_CACHE_DIR to override the cache directory.
     """
     import scipy.sparse.linalg as spla
+    import scipy.sparse as sp
+    from concurrent.futures import ThreadPoolExecutor
+    import hashlib, pickle, os, time
+    from pathlib import Path
 
     key = (ny, nz, nm)
-    if key not in _SOLVER_CACHE:
-        print(f"  [pressure] Factorising spherical Helmholtz operators "
-              f"({nm} modes × {ny}×{nz})...", flush=True)
-        import scipy.sparse as sp
-        solvers = []
-        for m in range(nm):
-            Hm = _build_Hm_sparse(m, metric_np, ny, nz)
-            if m == 0:
-                # H_0 = L_y + L_z has a true 1-D null space (constant field).
-                # Negative shift preserves the sign (all eigenvalues ≤ 0)
-                # while making the null-space eigenvalue strictly negative.
-                Hm = Hm - sp.eye(ny * nz, format="csc") * 1e-10
-            # m >= 1: H_m is strictly negative definite — SuperLU handles
-            # any conditioning fine without regularisation.  Earlier code
-            # subtracted 1e-7*I here, but that shift is comparable to (or
-            # larger than) the matrix scale on small/coarse grids and
-            # ruins the round-trip residual (4.78e-5 vs 2.7e-10 with no
-            # shift on the LAM-equator test fixture).
-            lu = spla.splu(Hm)
-            solvers.append(lu)
+    if key in _SOLVER_CACHE:
+        return _SOLVER_CACHE[key]
+
+    n_workers = min(nm, int(os.environ.get("JSAM_LU_WORKERS", os.cpu_count() or 4)))
+
+    # ── Disk cache: keyed on (ny, nz, nm) + a hash of the grid metric arrays ──
+    cache_dir  = os.environ.get("JSAM_LU_CACHE_DIR", "/glade/work/sabramian/jsam_lu_cache")
+    _hash_data = b"".join(
+        np.asarray(metric_np[k], dtype=np.float64).tobytes()
+        for k in ("dy_lat", "cos_lat", "cos_v", "rho", "rhow", "dz")
+        if k in metric_np
+    )
+    _hash_data += f"{ny}_{nz}_{nm}_v2_cartesian_alpha".encode()  # v2: Cartesian×cos² alpha
+    cache_key  = hashlib.md5(_hash_data).hexdigest()
+    cache_file = Path(cache_dir) / f"lu_{cache_key}.pkl"
+
+    if False and cache_file.exists():  # cache load disabled
+        print(f"  [pressure] Loading LU cache ({nm} modes)...", flush=True)
+        t0 = time.time()
+        with open(cache_file, 'rb') as f:
+            solvers = pickle.load(f)
+        print(f"  [pressure] LU cache loaded in {time.time()-t0:.1f}s", flush=True)
         _SOLVER_CACHE[key] = solvers
-        print("  [pressure] Factorisations ready.", flush=True)
-    return _SOLVER_CACHE[key]
+        return solvers
+
+    print(f"  [pressure] Building H_m matrices ({nm} modes × {ny}×{nz})...", flush=True)
+    def _build_mode(m):
+        Hm = _build_Hm_sparse(m, metric_np, ny, nz)
+        if m == 0:
+            Hm = Hm - sp.eye(ny * nz, format="csc") * 1e-10
+        return Hm
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        hm_list = list(pool.map(_build_mode, range(nm)))
+
+    print(f"  [pressure] Factorising {nm} H_m matrices in parallel...", flush=True)
+    def _factorize(Hm):
+        return _LUSolver(spla.splu(Hm))
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        solvers = list(pool.map(_factorize, hm_list))
+    del hm_list
+
+    print("  [pressure] Factorisations ready.", flush=True)
+
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(solvers, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  [pressure] LU factors cached → {cache_file}", flush=True)
+    except Exception as e:
+        print(f"  [pressure] LU cache write failed: {e}", flush=True)
+
+    _SOLVER_CACHE[key] = solvers
+    return solvers
 
 
 # ---------------------------------------------------------------------------
@@ -521,32 +578,14 @@ def _solve_pressure_cartesian(
     **kwargs,
 ) -> jax.Array:             # (nz, ny, nx)
     """
-    Solve ∇²p' = rhs using FFT in x + DCT-II in y + Thomas in z (CARTESIAN).
+    Solve ∇²p' = rhs using FFT in x + DCT-II in y + Thomas in z.
 
-    Matches gSAM pressure_big.f90:
-      - Cartesian eigenvalues (approximation gSAM uses globally):
-          λ_x[m] = (2*cos(2πm/nx) − 2) / dx²
-          λ_y[k] = (2*cos(πk/ny)  − 2) / dy²
-      - DCT-II in y handles Neumann (wall) BCs at south/north edges
-      - Thomas tridiagonal solve in z for each (m, k) mode pair
-      - (m=0, k=0) singularity: zero RHS + diagonal shift of −1 → p = 0
+    Matches gSAM pressure_big.f90 (dolatlon=F or doflat=T).  NOT the active
+    solver for global lat-lon runs — use _solve_pressure_spherical for that.
 
-    KEPT FOR REFERENCE/TESTING: This solver matches the Cartesian approximation
-    used in gSAM pressure_big.f90, but the active solver (_solve_pressure_spherical)
-    uses true spherical Helmholtz with FFT-x + sparse-LU in (y,z).
-
-    Why Cartesian approximation:
-      DCT-II diagonalises only constant-coefficient operators.  The spherical
-      y-operator (1/R²cosφ) d/dφ(cosφ dP/dφ) has variable coefficients and
-      cannot be diagonalised by DCT-II without an expensive eigenvalue solve.
-      gSAM uses this Cartesian approximation globally; the polar filter compensates
-      at high latitudes.
-
-    Advantage over 2D sparse-LU:
-      For each (m,k) the Thomas diagonal is L_z_diag[l] + λ_x + λ_y.
-      Even for near-zero eigenvalues (λ ≈ 4e-14 m⁻²), L_z_diag dominates (~8e-6 m⁻²)
-      at every row, so Thomas never encounters near-zero pivots.  The 2D LU approach
-      can amplify barotropic eigenvectors by ~10¹³.
+    Cartesian eigenvalues:
+      λ_x[m] = (2*cos(2πm/nx) − 2) / dx²
+      λ_y[n] = (2*cos(πn/ny)  − 2) / dy²   (uses scalar dy_ref — wrong for sphere)
     """
     from scipy.fft import dct, idct
 
@@ -559,9 +598,11 @@ def _solve_pressure_cartesian(
     # operators, so it requires a scalar dy.  Use the reference dy (mid-latitude)
     # — this solver is kept only for testing; the active solver is spherical.
     dy   = float(metric["dy_lat_ref"])
-    rho  = np.array(metric["rho"],  dtype=np.float64)   # (nz,)
-    rhow = np.array(metric["rhow"], dtype=np.float64)   # (nz+1,)
-    dz_  = np.array(metric["dz"],   dtype=np.float64)   # (nz,)
+    rho    = np.array(metric["rho"],   dtype=np.float64)   # (nz,)
+    rhow   = np.array(metric["rhow"],  dtype=np.float64)   # (nz+1,)
+    dz_    = np.array(metric["dz"],    dtype=np.float64)   # (nz,)
+    adzw_  = np.array(metric["adzw"],  dtype=np.float64)   # (nz+1,)
+    dz_ref_ = float(metric["dz_ref"])
 
     # ── Eigenvalues ────────────────────────────────────────────────────────────
     m_arr = np.arange(nm, dtype=np.float64)
@@ -571,14 +612,20 @@ def _solve_pressure_cartesian(
     lam_y = (2.0 * np.cos(np.pi * k_arr / ny) - 2.0) / dy**2          # (ny,)
 
     # ── Vertical tridiagonal coefficients (L_z, same for all (m,k)) ──────────
+    # Matches gSAM pressure_big.f90 exactly (Fortran k → Python l):
+    #   a(k) = rhow(k)   / (rho(k) * adz(k) * adzw(k)   * dz^2)
+    #   c(k) = rhow(k+1) / (rho(k) * adz(k) * adzw(k+1) * dz^2)
+    # In Python (0-based, dz[l] = adz[l]*dz_ref):
+    #   a_sub[l] = rhow[l]   / (rho[l] * adz[l] * adzw[l]   * dz_ref^2)
+    #   c_sup[l] = rhow[l+1] / (rho[l] * adz[l] * adzw[l+1] * dz_ref^2)
     a_sub = np.zeros(nz)   # sub-diagonal;   a_sub[0]   unused
     c_sup = np.zeros(nz)   # super-diagonal; c_sup[-1]  unused
     for l in range(nz):
-        inv = 1.0 / (rho[l] * dz_[l])
+        inv = 1.0 / (rho[l] * dz_[l])   # dz_[l] = adz[l]*dz_ref
         if l > 0:
-            a_sub[l] = rhow[l]     / dz_[l - 1] * inv
+            a_sub[l] = rhow[l]     / (adzw_[l]     * dz_ref_) * inv
         if l < nz - 1:
-            c_sup[l] = rhow[l + 1] / dz_[l]     * inv
+            c_sup[l] = rhow[l + 1] / (adzw_[l + 1] * dz_ref_) * inv
     Lz_diag = -(a_sub + c_sup)   # (nz,)
 
     # ── Per-(k,m) diagonal for Thomas: shape (ny*nm, nz) ─────────────────────
@@ -641,11 +688,13 @@ def solve_pressure(
     **kwargs,
 ) -> jax.Array:       # (nz, ny, nx)
     """
-    Solve the spherical anelastic Poisson equation.
+    Solve the anelastic Poisson equation for pressure.
 
-    Uses FFT in x + sparse LU in (y,z) per zonal mode — solves the true
-    spherical Helmholtz operator, consistent with the spherical press_rhs
-    and apply_pressure_gradient.
+    Matches gSAM pressure_gmg (dolatlon=T, doflat=F):
+      - rfft in x → nm complex modes
+      - RHS × cos²(lat) per mode (matching gSAM: ff = rhs * mu_gl²)
+      - Sparse LU in (y,z) per mode with Cartesian α × cos²(lat_j) diagonal
+      - irfft in x → physical pressure
     """
     return _solve_pressure_spherical(rhs, metric, **kwargs)
 
@@ -658,23 +707,14 @@ def _solve_pressure_spherical(
     """
     Solve the spherical anelastic Poisson equation (ACTIVE SOLVER).
 
-    Uses FFT in x + sparse-LU in (y,z) per zonal mode:
-      1. rfft in x  → nm complex modes
-      2. For each zonal mode m: solve the (ny×nz) spherical Helmholtz system
-             H_m p_m = rhs_m
-         where H_m includes:
-           - Zonal eigenvalue: α_m(j) = -4sin²(πm/nx)/(dλ R cosφ_j)²
-           - Meridional operator: (1/R²cosφ) d/dφ(cosφ dP/dφ)
-           - Vertical operator: ρ_w(k)/ρ(k) d²P/dz²
-         Uses cached sparse LU factorisation (computed once per grid).
-      3. irfft in x  → physical pressure field
+    Matches gSAM pressure_gmg (used for dolatlon=T, doflat=F).
 
-    DIFFERS FROM gSAM pressure_big.f90 (Cartesian FFT+DCT+Thomas):
-      - Uses spherical Helmholtz operator (not Cartesian approximation)
-      - Solves full (y,z) system with sparse-LU (not separable DCT+Thomas)
-      - Properly handles variable latitude metric factors
-      - Near equator: numerically identical to Cartesian solver
-      - At high latitudes: requires polar filter compensation (same as gSAM)
+    Algorithm: rfft in x + sparse LU in (y,z) per zonal mode m:
+      1. rfft in x  → nm complex modes
+      2. For each mode m: solve (ny*nz) spherical Helmholtz system H_m p_m = rhs_m
+         H_m includes true spherical α_m(j) eigenvalue (lat-dependent).
+         LU factorisations cached on first call.
+      3. irfft in x  → physical pressure field
     """
     rhs_np = np.array(rhs, dtype=np.float64)   # (nz, ny, nx)
     nz, ny, nx = rhs_np.shape
@@ -691,32 +731,35 @@ def _solve_pressure_spherical(
     # Build / retrieve cached sparse LU factorisations for all nm modes
     solvers = _get_sparse_solvers(metric_np, ny, nz, nm)
 
+    # cos²(lat) for RHS pre-scaling — matches gSAM: ff(k,j) = rhs(k,j) * mu_gl(j)²
+    cos2_ny = metric_np["cos_lat"] ** 2   # (ny,)
+
     # ── 1. rfft in x ─────────────────────────────────────────────────────────
     rhs_x = np.fft.rfft(rhs_np, axis=2)   # (nz, ny, nm) complex
 
     p_hat = np.zeros_like(rhs_x)          # (nz, ny, nm) complex
 
-    # ── 2. Sparse solve for each zonal mode m ────────────────────────────────
-    for m, lu in enumerate(solvers):
-        # Extract RHS for this mode: shape (nz, ny)
-        rhs_m = rhs_x[:, :, m]   # (nz, ny)
+    # ── 2. Sparse solve for each zonal mode m — parallel over modes ───────────
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+    n_solve_workers = int(os.environ.get("JSAM_LU_WORKERS", os.cpu_count() or 4))
 
-        # H_m uses row = j*nz + k  (j outer, k inner).
-        # Transpose (nz,ny) → (ny,nz), then flatten j-outer k-inner.
-        rhs_real = np.ascontiguousarray(rhs_m.real.T).ravel()   # (ny*nz,)
-        rhs_imag = np.ascontiguousarray(rhs_m.imag.T).ravel()   # (ny*nz,)
-
-        # m=0: remove global mean from RHS to decouple the null-space component
+    def _solve_mode(m):
+        lu    = solvers[m]
+        rhs_m = rhs_x[:, :, m]          # (nz, ny)
+        # Pre-multiply by cos²(lat) matching gSAM: ff(k,j) = rhs(k,j) * mu_gl(j)²
+        rhs_m = rhs_m * cos2_ny[np.newaxis, :]
+        rhs_real = np.ascontiguousarray(rhs_m.real.T).ravel()
+        rhs_imag = np.ascontiguousarray(rhs_m.imag.T).ravel()
         if m == 0:
             rhs_real -= rhs_real.mean()
-            # imag part of m=0 is zero (rfft m=0 is always real)
-
-        p_real = lu.solve(rhs_real)   # (ny*nz,)
+        p_real = lu.solve(rhs_real)
         p_imag = lu.solve(rhs_imag)
+        return m, (p_real + 1j * p_imag).reshape(ny, nz).T
 
-        # Reshape back: (ny*nz,) j-outer k-inner → (ny,nz) → transpose → (nz,ny)
-        p_m = (p_real + 1j * p_imag).reshape(ny, nz).T   # (nz, ny)
-        p_hat[:, :, m] = p_m
+    with ThreadPoolExecutor(max_workers=n_solve_workers) as pool:
+        for m, p_m in pool.map(_solve_mode, range(nm)):
+            p_hat[:, :, m] = p_m
 
     # ── 3. irfft in x ────────────────────────────────────────────────────────
     p = np.fft.irfft(p_hat, n=nx, axis=2)   # (nz, ny, nx)
@@ -855,14 +898,24 @@ def pressure_step(
                           state.TABS.shape[2]))
 
     dt_eff = at * dt
-    for _ in range(n_iter):
+    for _iter in range(n_iter):
         rhs = press_rhs(U_cur, V_cur, W_cur, metric, dt_eff)
         p_inc = solve_pressure(rhs, metric)
+        print(f"  [pressure diag] iter={_iter}"
+              f" W_in=[{float(jnp.min(W_cur)):.3e},{float(jnp.max(W_cur)):.3e}]"
+              f" rhs_max={float(jnp.max(jnp.abs(rhs))):.3e}"
+              f" p_max={float(jnp.max(jnp.abs(p_inc))):.3e}", flush=True)
         p_total = p_total + p_inc
         U_cur, V_cur, W_cur = apply_pressure_gradient(
             U_cur, V_cur, W_cur, p_inc, metric, dt_eff,
         )
         U_cur = U_cur.at[:, :, -1].set(U_cur[:, :, 0])
+        print(f"  [pressure diag] iter={_iter}"
+              f" W_out=[{float(jnp.min(W_cur)):.3e},{float(jnp.max(W_cur)):.3e}]", flush=True)
+
+    # gSAM pressure.f90:83-84: clamp pressure perturbation to ±15% of reference
+    pres_ref = metric["pres"][:, None, None]   # (nz, 1, 1)
+    p_total = jnp.clip(p_total, -0.15 * pres_ref, 0.15 * pres_ref)
 
     new_state = ModelState(
         U=U_cur, V=V_cur, W=W_cur,

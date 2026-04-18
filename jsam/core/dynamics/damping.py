@@ -153,6 +153,71 @@ def build_polar_filter_masks(
 
 
 @jax.jit
+def gsam_w_courant_damping(
+    W: jax.Array,        # (nz+1, ny, nx)
+    metric: dict,        # must contain "zi", "dz_ref", "adzw"
+    dtn: float,          # AB-weighted sub-timestep (s) — CFL denominator
+    damping_w_cu: float, # Courant-number cap for W (gSAM damping_w_cu)
+    tau_max: float,      # sponge damping coefficient = dtn/dt
+    nub: float = 0.6,    # normalized height above which top sponge is active
+) -> jax.Array:
+    """gSAM damping.f90 dodamping_w: clip W to a CFL-based maximum at levels
+    below the top sponge (where taudamp == 0).
+
+    Matches Fortran exactly (damping.f90 lines 54-69):
+      taudamp(k) is zero only for k where nu <= nub (below the sponge).
+      For those levels: wmax = damping_w_cu * dz * adzw(k) / dtn
+      Soft-clip: W_new = (W + clip(W,-wmax,wmax)*tau_max) / (1+tau_max)
+
+    Index mapping (Fortran 1-indexed k=1..nzm):
+      Fortran w(i,j,k) -> Python W[k] for k=1..nz  (W-face k)
+      Fortran dz scalar base spacing -> metric["dz_ref"]
+      Fortran adzw(k)  -> Python metric["adzw"][k-1]  (zi declared as zi(nz), 1-indexed)
+      Fortran zi(k)    -> Python zi[k-1]              (zi declared as zi(nz), 1-indexed)
+      taudamp(k)==0    <=>  nu[k] = (zi[k-1]-zi[0])/(zi[-1]-zi[0]) <= nub
+    """
+    zi     = metric["zi"]      # (nz+1,)
+    dz_ref = metric["dz_ref"]  # scalar base grid spacing (m)
+    adzw   = metric["adzw"]    # (nz+1,) — stretch factor at W-faces
+
+    # Fortran zi is declared as zi(nz), 1-indexed (no zi(0)).
+    # Python metric["zi"] has shape (nz+1,); Fortran zi(nz) has nz elements.
+    # Fortran nzm = nz - 1.  Fortran zi(k) for k=1..nzm -> Python zi[k-1] = zi[0..nzm-1] = zi[:-2].
+    # Fortran zi(1) = Python zi[0].
+    # Fortran zi(nzm) = Python zi[nzm-1] = Python zi[-2]  (NOT zi[-1]).
+    # nu for Fortran k=1..nzm: nu = (zi(k)-zi(1))/(zi(nzm)-zi(1))
+    zi_lo = zi[0]    # Fortran zi(1): ground interface
+    zi_hi = zi[-2]   # Fortran zi(nzm): top mass-level interface (Python nz+1 array -> index nz-1 = -2)
+    nu = (zi[:-1] - zi_lo) / (zi_hi - zi_lo)   # shape (nz,), indices 0..nz-1
+
+    # sponge_active: taudamp(k) > 0 <=> nu > nub  (shape nz,)
+    sponge_active = nu > nub   # (nz,)
+
+    # wmax at each W-face k=1..nzm (Python index 0..nzm-1):
+    #   Fortran: wmax1 = damping_w_cu * dz * adzw(k) / dtn
+    #   Fortran dz is a scalar base spacing; adzw(k) is the W-face stretch ratio.
+    #   Fortran adzw(k) 1-indexed -> Python adzw[k-1] = adzw[:-1].
+    #   Cell W-face thickness = dz_ref * adzw[k-1].
+    wmax = damping_w_cu * dz_ref * adzw[:-1] / dtn   # shape (nz,)
+
+    # Soft-clip: W_new = (W + clip(W,-wmax,wmax)*tau_max) / (1+tau_max)
+    # Only applied where sponge is NOT active (taudamp==0).
+    W_inner = W[1:]   # shape (nz, ny, nx) — faces k=1..nz
+    wmax3   = wmax[:, None, None]           # (nz, 1, 1)
+    active3 = sponge_active[:, None, None]  # (nz, 1, 1)
+
+    W_clipped = jnp.clip(W_inner, -wmax3, wmax3)
+    W_damped  = (W_inner + W_clipped * tau_max) / (1.0 + tau_max)
+
+    # Only replace where sponge is NOT active
+    W_inner_new = jnp.where(active3, W_inner, W_damped)
+
+    # Reassemble: W[0] (ground BC) is never touched
+    W_new = jnp.concatenate([W[:1], W_inner_new], axis=0)
+    return W_new
+
+
+@jax.jit
 def gsam_w_sponge(
     W: jax.Array,        # (nz+1, ny, nx)
     zi: jax.Array,       # (nz+1,) interface heights (m); zi[0]=ground, zi[nz]=top
@@ -166,20 +231,24 @@ def gsam_w_sponge(
     Matches Fortran exactly:
       - Fix 5.9: nu computed using interface heights zi (not cell centres).
         Fortran: nu = (zi(k)-zi(1))/(zi(nzm)-zi(1)) for k=1..nzm.
-        JSam: nu[k] = (zi[k] - zi[1]) / (zi[nz] - zi[1]) for k=1..nz.
+        Fortran zi declared as zi(nz) 1-indexed: zi(k) -> Python zi[k-1].
+        Python metric["zi"] has shape (nz+1,); Fortran zi(nzm) = Python zi[-2].
+        JSam: nu[k-1] = (zi[k-1] - zi[0]) / (zi[-2] - zi[0]) for k=1..nzm.
       - Fix 5.10: taudamp(k) applied directly to W[k] without face averaging.
         Fortran: w(k) /= 1+taudamp(k)  for k=1..nzm.
         JSam: W[k] /= 1+taudamp[k-1]  for k=1..nz (W[0] unchanged).
     """
-    nz = zi.shape[0] - 1   # number of mass levels
+    nz = zi.shape[0] - 1   # number of mass levels (Python zi has nz+1 elements)
     # Fortran loop k=1..nzm (1-indexed): nu = (zi(k)-zi(1))/(zi(nzm)-zi(1))
-    # zi is 0..nzm in Fortran (zi(0)=ground, zi(nzm)=domain top).
-    # JSam zi shape is (nz+1,): zi[0]=ground, zi[nz]=domain top.
-    # Fortran zi(k) for k=1..nzm = JSam zi[1..nz] = zi[1:].
+    # Fortran zi is declared as zi(nz), 1-indexed; Python zi has shape (nz+1,).
+    # Fortran nzm = nz - 1.
+    # Fortran zi(k) for k=1..nzm -> Python zi[k-1] = zi[0..nzm-1] = zi[:-2].
+    # Fortran zi(1) = Python zi[0].
+    # Fortran zi(nzm) = Python zi[nzm-1] = Python zi[-2]  (NOT zi[-1]).
     # Fortran w(k) for k=1..nzm = JSam W[k] for k=1..nz.
-    zi_lo = zi[1]    # Fortran zi(1): height of first W-face above ground
-    zi_hi = zi[-1]   # Fortran zi(nzm): domain top (zi[nz])
-    nu = (zi[1:] - zi_lo) / (zi_hi - zi_lo)   # shape (nz,), for W-faces 1..nz
+    zi_lo = zi[0]    # Fortran zi(1): height of lowest interface
+    zi_hi = zi[-2]   # Fortran zi(nzm): top mass-level interface (Python index nz-1 = -2)
+    nu = (zi[:-1] - zi_lo) / (zi_hi - zi_lo)   # shape (nz,), for W-faces 1..nz
     nu_excess = jnp.clip((nu - nub) / (1.0 - nub), 0.0, 1.0)
     zzz = 100.0 * nu_excess ** 2
     tau_max = dtn / dt
