@@ -68,10 +68,10 @@ def main() -> int:
     fluxbv = jnp.asarray(rng.standard_normal((ny + 1, nx))) * 0.01
 
     U_with, V_with, _ = diffuse_damping_mom_z(
-        U, V, W, tk, metric, dt, fluxbu=fluxbu, fluxbv=fluxbv,
+        U, V, W, tk, metric, dt, dt_ref=dt, fluxbu=fluxbu, fluxbv=fluxbv,
     )
     U_without, V_without, _ = diffuse_damping_mom_z(
-        U, V, W, tk, metric, dt, fluxbu=None, fluxbv=None,
+        U, V, W, tk, metric, dt, dt_ref=dt, fluxbu=None, fluxbv=None,
     )
 
     # Because the equation is linear in the RHS shift, (U_with − U_without)
@@ -86,7 +86,7 @@ def main() -> int:
 
     # Sanity: fluxbu→0 returns same solution as without
     U_zero, _, _ = diffuse_damping_mom_z(
-        U, V, W, tk, metric, dt,
+        U, V, W, tk, metric, dt, dt_ref=dt,
         fluxbu=jnp.zeros_like(fluxbu), fluxbv=jnp.zeros_like(fluxbv),
     )
     assert jnp.allclose(U_zero, U_without, atol=1e-12)

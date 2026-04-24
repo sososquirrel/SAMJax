@@ -155,7 +155,10 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
     """
     pres_ref_mb = metric["pres"][:, None, None] / 100.0   # (nz,1,1) reference, mb
     if p_pert_pa is not None:
-        pres_mb = pres_ref_mb + p_pert_pa / 100.0          # (nz,ny,nx) full 3D, mb
+        # Clamp to 1 mb: large negative p_pert (from unbalanced init) can make
+        # pres_mb negative, reversing the sign of dqsat/d(T) and causing the
+        # Newton iteration to overshoot to extreme temperatures → NaN.
+        pres_mb = jnp.maximum(1.0, pres_ref_mb + p_pert_pa / 100.0)
     else:
         pres_mb = pres_ref_mb
     gamaz_3d = metric["gamaz"][:, None, None]
@@ -228,6 +231,11 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
         fff  = tabs_dry - tabs1 + lstarn * sat_excess + lstarp * qp
         dfff = dlstarn * sat_excess + dlstarp * qp - lstarn * dqsat - 1.0
         dtabs = -fff / dfff
+        # Defensive: replace NaN/inf (dfff≈0 or qsat overflow) with 0, and cap
+        # step magnitude so one bad iteration cannot fling tabs1 into a regime
+        # where qsatw/qsati overflow to inf and poison later iterations.
+        dtabs = jnp.where(jnp.isfinite(dtabs), dtabs, 0.0)
+        dtabs = jnp.clip(dtabs, -50.0, 50.0)
 
         # gSAM's do-while ALWAYS applies dtabs then checks convergence at top of next iter.
         # Apply step for all non-converged cells, then mark newly converged.
@@ -239,24 +247,48 @@ def satadj(TABS: jax.Array, QV: jax.Array, QC: jax.Array, QI: jax.Array,
     # Fix 4.7: preliminary estimate before Newton loop (cloud.f90:58)
     # tabs1_prelim = (tabs_dry + fac1*qp) / (1 + fac2*qp)
     # where fac1 = fac_cond + (1+b_pr)*fac_fus, fac2 = fac_fus*a_pr
-    # This is used only to select the saturation regime for the initial qsatt
-    # test; the Newton loop itself starts from tabs_guess (= previous physical
-    # TABS), matching gSAM cloud.f90 line 92: tabs1 = tabs2.
     _fac1_prelim = FAC_COND + (1.0 + b_pr) * FAC_FUS
     _fac2_prelim = FAC_FUS * a_pr
     # tabs_dry here corresponds to gSAM's tabs(i,j,k) = t - gamaz
     tabs1_prelim = (tabs_dry + _fac1_prelim * qp) / (1.0 + _fac2_prelim * qp)
 
-    # F11: when tabs_guess is provided (= physical TABS from previous satadj),
-    # use it as the Newton start, matching gSAM cloud.f90: tabs1 = tabs2.
-    # When not provided, use tabs1_prelim as initial guess (matches gSAM warm/cold
-    # path where tabs1 is computed from the preliminary estimate before the loop).
-    tabs1 = (tabs_guess if tabs_guess is not None else tabs1_prelim) + 0.0
+    # gSAM cloud.f90 lines 62-84: refine tabs1 by regime (warm/ice/mixed) and
+    # compute qsatt_prelim.  This is the condensation-test qsatt used in line 89
+    # (if q > qsatt_prelim → iterate; else skip iteration entirely).
+    _tabs_warm = tabs_dry + FAC_COND * qp
+    _tabs_ice  = tabs_dry + FAC_SUB  * qp
+    _om_prelim = a_bg * tabs1_prelim - b_bg  # (no clip — matches gSAM line 80)
+    _qsatw_prelim = qsatw(tabs1_prelim, pres_mb)
+    _qsati_prelim = qsati(tabs1_prelim, pres_mb) * rh_homo  # gSAM line 81 uses rh_homo
+    _qsatw_warm   = qsatw(_tabs_warm, pres_mb)
+    _qsati_ice    = qsati(_tabs_ice, pres_mb) * rh_homo
+    qsat_prelim = jnp.where(
+        tabs1_prelim >= params.tbgmax, _qsatw_warm,
+        jnp.where(tabs1_prelim <= params.tbgmin, _qsati_ice,
+                  _om_prelim * _qsatw_prelim + (1.0 - _om_prelim) * _qsati_prelim),
+    )
+    # Regime-refined tabs1 (used as the non-iterated value for unsaturated cells,
+    # matching gSAM: tabs(i,j,k) = tabs1 after the regime branch when q <= qsatt).
+    tabs1_regime = jnp.where(
+        tabs1_prelim >= params.tbgmax, _tabs_warm,
+        jnp.where(tabs1_prelim <= params.tbgmin, _tabs_ice, tabs1_prelim),
+    )
 
-    # 100-iteration Newton loop with convergence mask (gSAM: while |dtabs|>0.001, niter<100)
-    converged = jnp.zeros_like(tabs1, dtype=jnp.bool_)
+    # gSAM cloud.f90:89 — only iterate where saturation is possible.
+    # Saturated cells start from tabs_guess (= tabs2 in gSAM, previous physical TABS);
+    # unsaturated cells keep the regime tabs1 with zero iterations.
+    needs_iter = q > qsat_prelim
+    _tabs_guess_eff = tabs_guess if tabs_guess is not None else tabs1_prelim
+    tabs1 = jnp.where(needs_iter, _tabs_guess_eff, tabs1_regime)
+
+    # Newton loop: unsaturated cells are pre-flagged converged so they skip every step.
+    converged = ~needs_iter
     for _ in range(n_iter):
         tabs1, converged = _newton_step((tabs1, converged))
+
+    # Sanitize any NaN/inf that slipped through (e.g. from extreme p_pert cells);
+    # fall back to the regime value so downstream qsat/omp never see NaN.
+    tabs1 = jnp.where(jnp.isfinite(tabs1), tabs1, tabs1_regime)
 
     # Final condensate and phase partitioning
     om_f = jnp.clip(a_bg * tabs1 - b_bg, 0.0, 1.0)
@@ -389,7 +421,7 @@ def precip_proc(
     rho     = metric["rho"][:, None, None]     # (nz,1,1) kg/m³
     pres_ref_mb = metric["pres"][:, None, None] / 100.0   # (nz,1,1) reference, mb
     if p_pert_pa is not None:
-        pres_mb = pres_ref_mb + p_pert_pa / 100.0          # (nz,ny,nx) full 3D, mb
+        pres_mb = jnp.maximum(1.0, pres_ref_mb + p_pert_pa / 100.0)
     else:
         pres_mb = pres_ref_mb
 
@@ -1198,9 +1230,26 @@ def micro_proc(
         QC, TABS = cloud_fall(QC, TABS, metric, params, dt, landmask=landmask)
 
     # 3. Saturation adjustment (cloud() in gSAM micro_proc)
-    # Fix 4.1: use full 3D pressure (reference + perturbation) for qsat calls,
-    # matching gSAM cloud.f90 which uses pp(i,j,k) = pres_ref + pp_pert.
-    _p_pert = state.p_prev   # (nz, ny, nx) Pa perturbation pressure
+    # Exact port of gSAM pressure.f90:64-90:
+    #   p0(k) = sum_{i,j} p*rho*wgt(j,k)*terra(i,j,k) / (nsubdomains*nx*ny)
+    # where wgt(j,k) = mu(j)*ady(j)*N_total/sums(k) and
+    # sums(k) = sum(mu(j)*ady(j)*terra(i,j,k)).  With terra=1 everywhere (IRMA
+    # is over ocean, no in-atmosphere terrain), sums(k) = nx * sum_j(mu*ady) so
+    # p0(k) = rho(k) * (area-weighted zonal mean of p, weights = mu(j)*ady(j)).
+    #
+    # Then: pp(i,j,k) = min(pmax, max(pmin, (p*rho - p0)*0.01 + pres(k)))   [mb]
+    # The 0.01 converts Pa→mb; pmin/pmax clip pp to [0.85*pres_ref, 1.15*pres_ref].
+    _rho3d        = metric["rho"][:, None, None]    # (nz,1,1)
+    _pPa_raw      = state.p_prev * _rho3d            # (nz, ny, nx) Pa
+    # area-weighted per-level mean (cos(lat)*ady weight, matches gSAM wgt)
+    _area_w       = (metric["cos_lat"] * metric["ady"])           # (ny,)
+    _area_w_norm  = (_area_w / jnp.sum(_area_w))[None, :, None]   # (1, ny, 1), sum_j = 1
+    _p0_k         = jnp.sum(jnp.mean(_pPa_raw, axis=2, keepdims=True) * _area_w_norm,
+                            axis=1, keepdims=True)                # (nz, 1, 1)
+    _pres_ref_Pa  = metric["pres"][:, None, None]    # (nz,1,1) reference in Pa
+    _p_pert       = jnp.clip(_pPa_raw - _p0_k,
+                             -0.15 * _pres_ref_Pa,
+                             +0.15 * _pres_ref_Pa)
     if tabs_phys is not None:
         # F11 mode: step.py applies the F11 inverse (t → physical TABS) before
         # calling micro_proc, so TABS here is PHYSICAL temperature, not static
@@ -1314,8 +1363,17 @@ def micro_proc_with_precip(
         QC, TABS = cloud_fall(QC, TABS, metric, params, dt, landmask=landmask)
 
     # 3. Saturation adjustment
-    # Fix 4.1: use full 3D pressure for qsat calls (gSAM uses pp(i,j,k) = pres + pp_pert).
-    _p_pert = state.p_prev   # (nz, ny, nx) Pa perturbation pressure
+    # Exact port of gSAM pressure.f90:64-90.  See micro_proc for derivation.
+    _rho3d        = metric["rho"][:, None, None]
+    _pPa_raw      = state.p_prev * _rho3d
+    _area_w       = (metric["cos_lat"] * metric["ady"])
+    _area_w_norm  = (_area_w / jnp.sum(_area_w))[None, :, None]
+    _p0_k         = jnp.sum(jnp.mean(_pPa_raw, axis=2, keepdims=True) * _area_w_norm,
+                            axis=1, keepdims=True)
+    _pres_ref_Pa  = metric["pres"][:, None, None]
+    _p_pert       = jnp.clip(_pPa_raw - _p0_k,
+                             -0.15 * _pres_ref_Pa,
+                             +0.15 * _pres_ref_Pa)
     if tabs_phys is not None:
         _gamaz_3d = metric["gamaz"][:, None, None]
         TABS, QV, QC, QI = satadj(

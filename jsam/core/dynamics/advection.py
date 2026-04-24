@@ -688,11 +688,18 @@ def _mom_adv_tend(
     fwz_full = jnp.concatenate([jnp.zeros_like(fwz[:1]),
                                  fwz,
                                  jnp.zeros_like(fwz[:1])], axis=0)   # (nz+1, ny, nx)
-    # dwdt(k) -= igw*(fwz(k)-fwz(kb)); W_core[l] = W[l+1]:
-    # fwz at l=W_core level → fwz_full[l+1] (upper face), fwz_full[l] (lower face)
-    dW_z = -(fwz_full[1:nz] - fwz_full[0:nz-1]) / gw3_int
+    # gSAM: dwdt(k) -= igw(k)*(fwz(k)-fwz(kb)); fwz(k) = flux using w(k) and w(k+1).
+    # For W_core[l] = W[l+1] = gSAM face k = l+2 (1-based):
+    #   upper flux = fwz(k=l+2) = fwz[l+1] (flux between W[l+1] and W[l+2])
+    #   lower flux = fwz(kb=l+1) = fwz[l]  (flux between W[l] and W[l+1])
+    # i.e. indices are shifted by +1 relative to l: use fwz_full[l+2] - fwz_full[l+1].
+    dW_z = -(fwz_full[2:nz+1] - fwz_full[1:nz]) / gw3_int
 
     dW = dW_x + dW_y + dW_z
+    # gSAM zeros dwdt at k=1 (bottom rigid lid) = jsam W[0]; jsam's W[0] is already
+    # forced to zero by the rigid-lid BC in advance_momentum, so no extra zeroing
+    # is needed here. dW[0] applies to W_core[0] = W[1] = gSAM k=2 (first interior),
+    # which DOES receive an advection tendency in gSAM (loop runs k=2..nzm).
 
     return dU, dV, dW
 

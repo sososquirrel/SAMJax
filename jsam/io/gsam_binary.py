@@ -721,92 +721,119 @@ def apply_cloud_satadj(
     At initialisation pp(:,:,k) = pres(k) (setdata.f90:469), so reference
     pressure is used for all qsat calls.
     """
-    tbgmin = np.float64(253.16); tbgmax = np.float64(273.16)
-    tprmin = np.float64(268.16); tprmax = np.float64(283.16)
-    a_bg = np.float64(1.0) / (tbgmax - tbgmin)
+    # gSAM cloud.f90 uses Fortran REAL (float32) throughout the Newton loop.
+    F = np.float32
+    tbgmin = F(253.16); tbgmax = F(273.16)
+    tprmin = F(268.16); tprmax = F(283.16)
+    fac_cond = F(_FAC_COND); fac_fus = F(_FAC_FUS); fac_sub = F(_FAC_SUB)
+    eps      = F(0.622)
+    a_bg = F(1.0) / (tbgmax - tbgmin)
     b_bg = tbgmin * a_bg
-    a_pr = np.float64(1.0) / (tprmax - tprmin)
+    a_pr = F(1.0) / (tprmax - tprmin)
     b_pr = tprmin * a_pr
 
-    # Broadcast pres as (nzm,1,1) so all levels are processed in one vectorised pass.
-    p_mb = pres.astype(np.float64)[:, None, None]   # (nzm,1,1)
+    # Broadcast pres as (nzm,1,1); keep float32 to match gSAM.
+    p_mb = pres.astype(F)[:, None, None]
 
-    qcl = QC.astype(np.float64)
-    qci = QI.astype(np.float64)
-    qpl = QR.astype(np.float64)
-    qpi = QS.astype(np.float64)
+    qcl = QC.astype(F); qci = QI.astype(F)
+    qpl = QR.astype(F); qpi = QS.astype(F)
 
-    # t - gamaz: conserved static energy offset computed from ERA5 condensates.
-    tabs_dry = TABS.astype(np.float64) - _FAC_COND * (qcl + qpl) - _FAC_SUB * (qci + qpi)
-    # gSAM micro_init: q = qv + qcl + qci (total water vapor + condensate, includes ice).
-    q  = np.maximum(np.float64(0.0), QV.astype(np.float64) + qcl + qci)
-    qp = np.maximum(np.float64(0.0), qpl + qpi)
+    # t - gamaz: conserved static energy (post-micro_set condensates, matching gSAM micro_set line 297).
+    tabs_dry = TABS.astype(F) - fac_cond * (qcl + qpl) - fac_sub * (qci + qpi)
+    q  = np.maximum(F(0.0), QV.astype(F) + qcl + qci)
+    qp = np.maximum(F(0.0), qpl + qpi)
 
-    # rh_homo is computed ONCE from original TABS (cloud.f90 lines 48-52).
-    # It is a fixed constant during the Newton loop — not updated as tabs1 evolves.
+    # rh_homo computed once from original TABS (cloud.f90 lines 48-52), float32.
+    tabs_orig = TABS.astype(F)
     rh_homo = np.where(
-        (TABS.astype(np.float64) < np.float64(235.0)) & (qci < np.float64(1e-8)),
-        np.float64(2.583) - TABS.astype(np.float64) / np.float64(207.8),
-        np.float64(1.0),
+        (tabs_orig < F(235.0)) & (qci < F(1e-8)),
+        F(2.583) - tabs_orig / F(207.8),
+        F(1.0),
     )
 
-    tabs1     = TABS.astype(np.float64).copy()
-    converged = np.zeros_like(tabs1, dtype=bool)
+    # Inline float32 saturation functions (mirrors gSAM sat.f90 in REAL precision).
+    def _esatw32(T): return F(6.1121) * np.exp(F(17.502) * (T - F(273.16)) / (T - F(32.19)))
+    def _esati32(T): return F(6.1121) * np.exp(F(22.587) * (T - F(273.16)) / (T + F(0.7)))
+    def _qsatw32(T, p):
+        es = _esatw32(T); return eps * es / np.maximum(es, p - es)
+    def _qsati32(T, p):
+        es = _esati32(T); return eps * es / np.maximum(es, p - es)
+    def _dtqsatw32(T, p):
+        es = _esatw32(T)
+        dte = es * F(17.502) * (F(273.16) - F(32.19)) / (T - F(32.19)) ** 2
+        return eps * dte / (p - es) * (F(1.0) + es / (p - es))
+    def _dtqsati32(T, p):
+        es = _esati32(T)
+        dte = es * F(22.587) * (F(273.16) + F(0.7)) / (T + F(0.7)) ** 2
+        return eps * dte / (p - es) * (F(1.0) + es / (p - es))
+
+    # cloud.f90 lines 58-89: initial estimate to decide whether condensation is possible.
+    # fac1 = fac_cond + (1+bp)*fac_fus;  fac2 = fac_fus*ap  (cloud.f90 lines 32-33)
+    fac1 = fac_cond + (F(1.0) + b_pr) * fac_fus
+    fac2 = fac_fus * a_pr
+    tabs1_est = (tabs_dry + fac1 * qp) / (F(1.0) + fac2 * qp)
+    # Phase-dependent qsatt at the estimate (cloud.f90 lines 62-84).
+    om_est  = np.clip(a_bg * tabs1_est - b_bg, F(0.0), F(1.0))
+    qsatt_est = np.where(
+        tabs1_est >= tbgmax, _qsatw32(tabs1_est, p_mb),
+        np.where(tabs1_est <= tbgmin,
+                 _qsati32(tabs1_est, p_mb) * rh_homo,
+                 om_est * _qsatw32(tabs1_est, p_mb) + (F(1.0) - om_est) * _qsati32(tabs1_est, p_mb) * rh_homo))
+    # Only run Newton where condensation is possible (cloud.f90 line 89).
+    condensing = q > qsatt_est
+
+    # cloud.f90 line 92: "better initial guess — use previous temperature".
+    # tabs2 = ERA5 tabs (saved before line 57 overwrites tabs with t-gamaz).
+    tabs1     = tabs_orig.copy()          # tabs2 in cloud.f90
+    converged = ~condensing               # non-condensing cells already done
 
     for _ in range(100):
-        om      = np.clip(a_bg * tabs1 - b_bg, np.float64(0.0), np.float64(1.0))
-        omp     = np.clip(a_pr * tabs1 - b_pr, np.float64(0.0), np.float64(1.0))
-        lstarn  = _FAC_COND + (np.float64(1.0) - om) * _FAC_FUS
-        dlstarn = np.where((tabs1 > tbgmin) & (tabs1 < tbgmax),
-                           a_bg * _FAC_FUS, np.float64(0.0))
-        lstarp  = _FAC_COND + (np.float64(1.0) - omp) * _FAC_FUS
-        dlstarp = np.where((tabs1 > tprmin) & (tabs1 < tprmax),
-                           a_pr * _FAC_FUS, np.float64(0.0))
-        qsati_v = _np_qsati(tabs1, p_mb)
-        # In mixed-phase Newton loop gSAM does NOT apply rh_homo (cloud.f90 line 115-116)
-        qsat    = np.where(tabs1 >= tbgmax, _np_qsatw(tabs1, p_mb),
-                  np.where(tabs1 <= tbgmin, qsati_v * rh_homo,
-                           om * _np_qsatw(tabs1, p_mb) + (np.float64(1.0) - om) * qsati_v))
-        # Jacobian: rh_homo treated as constant (no drh_homo term), matching cloud.f90
-        dqsati_v = _np_dtqsati(tabs1, p_mb)
-        dqsat    = np.where(tabs1 >= tbgmax, _np_dtqsatw(tabs1, p_mb),
+        om      = np.clip(a_bg * tabs1 - b_bg, F(0.0), F(1.0))
+        omp     = np.clip(a_pr * tabs1 - b_pr, F(0.0), F(1.0))
+        lstarn  = fac_cond + (F(1.0) - om) * fac_fus
+        dlstarn = np.where((tabs1 > tbgmin) & (tabs1 < tbgmax), a_bg * fac_fus, F(0.0))
+        lstarp  = fac_cond + (F(1.0) - omp) * fac_fus
+        dlstarp = np.where((tabs1 > tprmin) & (tabs1 < tprmax), a_pr * fac_fus, F(0.0))
+        qsati_v  = _qsati32(tabs1, p_mb)
+        # Mixed-phase Newton loop has no rh_homo (cloud.f90 line 115-116).
+        qsat     = np.where(tabs1 >= tbgmax, _qsatw32(tabs1, p_mb),
+                   np.where(tabs1 <= tbgmin, qsati_v * rh_homo,
+                            om * _qsatw32(tabs1, p_mb) + (F(1.0) - om) * qsati_v))
+        dqsati_v = _dtqsati32(tabs1, p_mb)
+        dqsat    = np.where(tabs1 >= tbgmax, _dtqsatw32(tabs1, p_mb),
                    np.where(tabs1 <= tbgmin, dqsati_v * rh_homo,
-                            om * _np_dtqsatw(tabs1, p_mb) + (np.float64(1.0) - om) * dqsati_v))
+                            om * _dtqsatw32(tabs1, p_mb) + (F(1.0) - om) * dqsati_v))
         sat_excess = q - qsat
         fff        = tabs_dry - tabs1 + lstarn * sat_excess + lstarp * qp
-        dfff       = dlstarn * sat_excess + dlstarp * qp - lstarn * dqsat - np.float64(1.0)
+        dfff       = dlstarn * sat_excess + dlstarp * qp - lstarn * dqsat - F(1.0)
         dtabs      = -fff / dfff
-        # gSAM's do-while ALWAYS applies dtabs then checks convergence at top of next iter.
-        # Apply step for all non-converged cells, then mark newly converged.
-        tabs1     = np.where(converged, tabs1, tabs1 + dtabs)
-        newly_conv = np.abs(dtabs) < np.float64(0.001)
+        tabs1      = np.where(converged, tabs1, tabs1 + dtabs)
+        newly_conv = np.abs(dtabs) < F(0.001)
         converged  = converged | newly_conv
         if converged.all():
             break
 
-    om_f     = np.clip(a_bg * tabs1 - b_bg, np.float64(0.0), np.float64(1.0))
-    qsati_vf = _np_qsati(tabs1, p_mb)
-    # Use rh_homo (from original TABS) for final qsat evaluation in ice/mixed regime
-    qsat_f   = np.where(tabs1 >= tbgmax, _np_qsatw(tabs1, p_mb),
+    om_f     = np.clip(a_bg * tabs1 - b_bg, F(0.0), F(1.0))
+    qsati_vf = _qsati32(tabs1, p_mb)
+    qsat_f   = np.where(tabs1 >= tbgmax, _qsatw32(tabs1, p_mb),
                np.where(tabs1 <= tbgmin, qsati_vf * rh_homo,
-                        om_f * _np_qsatw(tabs1, p_mb) + (np.float64(1.0) - om_f) * qsati_vf))
-    qn       = np.maximum(np.float64(0.0), q - qsat_f)
+                        om_f * _qsatw32(tabs1, p_mb) + (F(1.0) - om_f) * qsati_vf))
+    # Non-condensing cells: qn=0 (cloud.f90 line 144).
+    qn = np.where(condensing, np.maximum(F(0.0), q - qsat_f), F(0.0))
 
-    # micro_diagnose: zero out qn where qn <= 0.001 * qsatt (microphysics.f90 lines 360-369)
-    qn = np.where(qn > np.float64(0.001) * qsat_f, qn, np.float64(0.0))
+    # micro_diagnose: zero out qn <= 0.001*qsatt (microphysics.f90 lines 360-369).
+    qn = np.where(qn > F(0.001) * qsat_f, qn, F(0.0))
 
-    # micro_diagnose: partition total cloud condensate into liquid and ice.
     qcl_new = qn * om_f
-    qci_new = qn * (np.float64(1.0) - om_f)
-
-    # micro_diagnose: repartition precipitation by new temperature.
-    omp_f   = np.clip((tabs1 - tprmin) / (tprmax - tprmin), np.float64(0.0), np.float64(1.0))
+    qci_new = qn * (F(1.0) - om_f)
+    omp_f   = np.clip((tabs1 - tprmin) / (tprmax - tprmin), F(0.0), F(1.0))
     qpl_new = qp * omp_f
-    qpi_new = qp * (np.float64(1.0) - omp_f)
+    qpi_new = qp * (F(1.0) - omp_f)
 
-    # diagnose() formula: TABS = t - gamaz + fac_cond*(qcl+qpl) + fac_sub*(qci+qpi).
-    # tabs_dry = t - gamaz is the conserved quantity (unchanged by cloud()).
-    tabs_out = tabs_dry + _FAC_COND * (qcl_new + qpl_new) + _FAC_SUB * (qci_new + qpi_new)
+    # diagnose(): TABS = t - gamaz + fac_cond*(qcl+qpl) + fac_sub*(qci+qpi).
+    # Use float64 for the final TABS reconstruction to avoid rounding the energy balance.
+    tabs_out = tabs_dry.astype(np.float64) + _FAC_COND * qcl_new + _FAC_COND * qpl_new \
+                                           + _FAC_SUB  * qci_new + _FAC_SUB  * qpi_new
 
     TABS[:] = tabs_out.astype(np.float32)
     QV[:]   = (q - qn).astype(np.float32)
@@ -1035,16 +1062,6 @@ def load_gsam_init(
           f"  (log-interp was [{fields['pres'][0]:.2f}..{fields['pres'][-1]:.3f}])")
     fields['pres'] = _pres_hydro.astype(np.float32)
 
-    # Save ERA5 condensates before micro_set to compute static energy t - gamaz.
-    # gSAM micro_set() stores t = tabs + gamaz - fac_cond*(qcl+qpl) - fac_sub*(qci+qpi)
-    # BEFORE repartitioning condensates.  After micro_set, gSAM calls diagnose() which
-    # resets tabs from this unchanged t using the NEW condensates:
-    #   tabs_new = t - gamaz + fac_cond*(qcl_ms+qpl_ms) + fac_sub*(qci_ms+qpi_ms)
-    # tabs_dry = t - gamaz is the conserved quantity, computed from ERA5 condensates.
-    _t_minus_gamaz = (fields['TABS'].astype(np.float64)
-                      - _FAC_COND * (fields['QC'].astype(np.float64) + fields['QR'].astype(np.float64))
-                      - _FAC_SUB  * (fields['QI'].astype(np.float64) + fields['QS'].astype(np.float64)))
-
     print("  micro_set: repartitioning QC/QI/QR/QS, clipping QV ...")
     apply_micro_set(
         fields['TABS'], fields['QV'], fields['QC'],
@@ -1052,12 +1069,14 @@ def load_gsam_init(
         fields['pres'],
     )
 
-    # diagnose(): update TABS from ERA5 static energy + new condensates (post-micro_set).
-    # This matches gSAM's diagnose() call after micro_set().
-    _tabs_after_diagnose = (_t_minus_gamaz
-                            + _FAC_COND * (fields['QC'].astype(np.float64) + fields['QR'].astype(np.float64))
-                            + _FAC_SUB  * (fields['QI'].astype(np.float64) + fields['QS'].astype(np.float64)))
-    fields['TABS'] = _tabs_after_diagnose.astype(np.float32)
+    # gSAM micro_set() sets t = tabs + gamaz - fac_cond*(qcl_ms+qpl_ms) - fac_sub*(qci_ms+qpi_ms)
+    # using the POST-repartitioned condensates.  diagnose() then sets:
+    #   tabs = t - gamaz + fac_cond*(qcl_ms+qpl_ms) + fac_sub*(qci_ms+qpi_ms) = TABS_ERA5
+    # micro_set does not modify TABS, so fields['TABS'] is still TABS_ERA5 — no reassignment needed.
+    # _t_minus_gamaz must use post-micro_set condensates to match gSAM's t.
+    _t_minus_gamaz = (fields['TABS'].astype(np.float64)
+                      - _FAC_COND * (fields['QC'].astype(np.float64) + fields['QR'].astype(np.float64))
+                      - _FAC_SUB  * (fields['QI'].astype(np.float64) + fields['QS'].astype(np.float64)))
 
     # Load terrain before satadj so we can mask below-terrain cells.
     terrain_file = os.path.join(bin_d, "terrain_1440x720_dyvar.bin")

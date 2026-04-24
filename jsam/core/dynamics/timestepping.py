@@ -302,6 +302,15 @@ def advance_momentum(
     U_adv_for_advection, V_adv_for_advection, W_adv_for_advection = advect_momentum(
         U_adv, V_adv, W_adv, metric, dt
     )
+    if int(nstep) == 1 and dW_extra is not None:
+        _W_adv_tend = (W_adv_for_advection - W) / dt
+        _tot = _W_adv_tend + dW_extra
+        print(f"[W-budget nstep=1] TOTAL_W_tend "
+              f"mean={float(jnp.mean(_tot)):+.3e} "
+              f"min={float(jnp.min(_tot)):+.3e} "
+              f"max={float(jnp.max(_tot)):+.3e} [m/s^2] "
+              f"(dt={float(dt):.3f}s → ΔW_mean={float(jnp.mean(_tot))*float(dt):+.3e} m/s)",
+              flush=True)
     mom_tends_n = MomentumTendencies(
         U=(U_adv_for_advection - U) / dt + (dU_extra if dU_extra is not None else 0.0),
         V=(V_adv_for_advection - V) / dt + (dV_extra if dV_extra is not None else 0.0),

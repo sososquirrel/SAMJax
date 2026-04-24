@@ -20,14 +20,19 @@ import jax.numpy as jnp
 from jsam.core.state import ModelState
 from jsam.core.grid.latlon import LatLonGrid, EARTH_RADIUS
 from jsam.core.physics.microphysics import G_GRAV, CP
+from jsam.core.dynamics.boundaries import bound_uv
 
 def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     """Precompute metric factors for press_rhs and press_grad."""
-    lat_rad = np.deg2rad(grid.lat)
+    lat_rad = np.deg2rad(grid.lat)               # file lat — used only for Coriolis (gSAM line 497)
     lon_rad = np.deg2rad(grid.lon)
     dlon_rad = np.deg2rad(grid.dlon)
 
-    cos_lat = np.cos(lat_rad)
+    # cos_lat = cos(y_gl) — geometric cell-center (midpoint of v-faces).
+    # gSAM setgrid.f90:224 uses mu_gl = cos(y_gl) for ALL metric factors
+    # (kurant, imu, muv, tanr).  Only Coriolis (fcory/fcorzy, line 497) uses
+    # the file lat(j) directly.
+    cos_lat = np.array(grid.cos_lat)             # (ny,) now y_gl-based
 
     dy_per_row = np.array(grid.dy_per_row)
     dy_ref     = float(grid.dy_ref)
@@ -74,9 +79,13 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     gamaz = G_GRAV * grid.z / CP
 
     OMEGA = 4.0 * np.pi / 86400.0 / 2.0
+    # Coriolis: gSAM setgrid.f90:497,501 uses sin/cos of lat(j) (file lat), NOT y_gl
     fcory  = 2.0 * OMEGA * np.sin(lat_rad)
     fcorzy = 2.0 * OMEGA * np.cos(lat_rad)
-    tanr   = np.tan(lat_rad) / EARTH_RADIUS
+    # tanr: gSAM setgrid.f90:232 uses ±sqrt(1-mu²)/mu/R, i.e. tan(y_gl)/R
+    # (mu = cos(y_gl) = our cos_lat).  Not tan(lat_file)/R.
+    lat_center_rad = np.deg2rad(np.array(grid.lat_center))
+    tanr   = np.tan(lat_center_rad) / EARTH_RADIUS
 
     m = {
         "imu": jnp.array(imu),
@@ -109,15 +118,9 @@ def build_metric(grid: LatLonGrid, polar_filter: bool = False) -> dict:
     return m
 
 
-@jax.jit
-def press_rhs(
-    U: jax.Array,
-    V: jax.Array,
-    W: jax.Array,
-    metric: dict,
-    dt: float,
-) -> jax.Array:
-    """RHS of pressure Poisson — spherical anelastic divergence."""
+def _press_rhs_core(U, V, W, metric, dt, debug_tag=None):
+    """Common body.  If ``debug_tag`` is not None, prints per-direction
+    max|div| with that tag."""
     dx      = metric["dx_lon"]
     dy      = metric["dy_lat"]
     rho     = metric["rho"]
@@ -132,14 +135,46 @@ def press_rhs(
     dz3    = dz[:, None, None]
     dy3    = dy[None, :, None]
 
-    div_u = imu[None, :, None] * (U[:, :, 1:] - U[:, :, :-1]) / dx
+    # Port of gSAM press_rhs.f90:19-43 (IRMA: dowally=True, dowallx=False):
+    #   dowally: V(:, south_pole, :) = 0
+    #   bound_uv: U[nx]=U[0], V[ny]=V[south]=0
+    V = V.at[:, 0, :].set(0.0)
+    U, V = bound_uv(U, V)
 
+    div_u = imu[None, :, None] * (U[:, :, 1:] - U[:, :, :-1]) / dx
     div_v = (cos_v[None, 1:, None] * V[:, 1:, :]
            - cos_v[None, :-1, None] * V[:, :-1, :]) / (dy3 * cos_lat[None, :, None])
-
     div_w = (rhow3[1:] * W[1:] - rhow3[:-1] * W[:-1]) / (rho3 * dz3)
 
+    if debug_tag is not None:
+        import numpy as _np
+        du = float(jnp.max(jnp.abs(div_u)))
+        dv = float(jnp.max(jnp.abs(div_v)))
+        dw = float(jnp.max(jnp.abs(div_w)))
+        # Locate the worst div_w cell
+        _dw_np = _np.array(div_w)
+        _idx = _np.unravel_index(_np.argmax(_np.abs(_dw_np)), _dw_np.shape)
+        print(f"  [press_rhs {debug_tag}] max|div_u|={du:.3e}  "
+              f"max|div_v|={dv:.3e}  max|div_w|={dw:.3e}  "
+              f"worst_dw@(k={_idx[0]},j={_idx[1]},i={_idx[2]})", flush=True)
+
     return (div_u + div_v + div_w) / dt
+
+
+_press_rhs_jit = jax.jit(_press_rhs_core, static_argnames=("debug_tag",))
+
+
+def press_rhs(U, V, W, metric, dt):
+    """RHS of pressure Poisson — spherical anelastic divergence.
+
+    If ``JSAM_PRESS_DEBUG=1``, runs an un-jitted version that prints
+    per-direction max|div| to isolate which direction dominates the
+    residual divergence.
+    """
+    import os as _os
+    if _os.environ.get("JSAM_PRESS_DEBUG", "") == "1":
+        return _press_rhs_core(U, V, W, metric, dt, debug_tag="")
+    return _press_rhs_jit(U, V, W, metric, dt, debug_tag=None)
 
 
 def _helmholtz_op(
@@ -163,9 +198,10 @@ def _helmholtz_op(
 
     nx_grid = metric["nx"]
     sin2 = jnp.sin(jnp.pi * m / nx_grid) ** 2
-    alpha_m = -4.0 * sin2 / (dlon_rad * R * cos_lat) ** 2
+    # Scalar alpha (scaled form of spherical Poisson; matches gSAM pressure_gmg).
+    alpha_m = -4.0 * sin2 / (dlon_rad * R) ** 2
 
-    zonal = alpha_m[:, None] * P
+    zonal = alpha_m * P
 
     cos_v = metric["cos_v"]
     dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])
@@ -223,13 +259,22 @@ def _build_Lz_matrix(metric: dict, nz: int) -> jax.Array:
 
 
 def _compute_alpha_m(m: int, metric: dict) -> jax.Array:
-    """Return the zonal eigenvalue α_m(j) for each latitude j."""
-    cos_lat  = metric["cos_lat"]   # (ny,) JAX
+    """Return the zonal eigenvalue α_m (scalar) for the scaled spherical form.
+
+    gSAM pressure_gmg multiplies both sides of ∇²p = RHS by cos²(lat), which
+    moves the cos²(lat) factor from the zonal term to the meridional/vertical
+    operators and the RHS.  In the scaled form, the zonal eigenvalue is simply
+    the Cartesian FFT eigenvalue:  α_m = -4 sin²(πm/nx) / (R dλ)².
+
+    Matches pressure_gmg.f90 line 245:
+        alpha = (2 − 2·cos(2π m / nx)) / dx²
+    where dx = R·dλ (constant).
+    """
     dlon_rad = metric["dlon_rad"]
     nx_grid  = metric["nx"]
     sin2 = np.sin(np.pi * m / nx_grid) ** 2
-    alpha = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS * np.array(cos_lat)) ** 2
-    return jnp.array(alpha)  # (ny,)
+    alpha = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS) ** 2  # scalar
+    return alpha  # float
 
 
 def _build_Ly_matrix(metric: dict, ny: int) -> np.ndarray:
@@ -277,10 +322,11 @@ def _build_Hm_matrix(m: int, metric: dict, ny: int, nz: int) -> np.ndarray:
     """
     L_z_np = np.array(_build_Lz_matrix(metric, nz))
     L_y_np = _build_Ly_matrix(metric, ny)
-    alpha  = np.array(_compute_alpha_m(m, metric))
+    alpha  = float(_compute_alpha_m(m, metric))  # scalar
     I_ny = np.eye(ny)
     I_nz = np.eye(nz)
-    return (np.kron(np.diag(alpha), I_nz)
+    I_full = np.eye(ny * nz)
+    return (alpha * I_full
           + np.kron(L_y_np, I_nz)
           + np.kron(I_ny, L_z_np))
 
@@ -297,9 +343,11 @@ def _make_vertical_precond(m: int, metric: dict, ny: int, nz: int):
         precond(r) — applies M^{-1} r, where r has shape (ny*nz,)
     """
     L_z = _build_Lz_matrix(metric, nz)
-    alpha = _compute_alpha_m(m, metric)
+    alpha = float(_compute_alpha_m(m, metric))  # scalar
     I_nz = jnp.eye(nz)
-    M_batch = -(alpha[:, None, None] * I_nz[None, :, :] + L_z[None, :, :])
+    # Broadcast scalar alpha across ny rows
+    alpha_rows = jnp.full((int(L_z.shape[0]) if False else 1,), alpha)  # placeholder
+    M_batch = -(alpha * I_nz[None, :, :] + L_z[None, :, :])
     M_inv = jax.vmap(jnp.linalg.inv)(M_batch)
 
     def precond(r: jax.Array) -> jax.Array:
@@ -379,9 +427,12 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     dlon_rad = float(metric_np["dlon_rad"])
     nx_grid  = int(metric_np["nx"])
 
-    # Scalar alpha — same for all j (gSAM pressure_gmg.f90: alpha = (2-2cos)*ddx)
+    # Scalar alpha — same for all j (gSAM pressure_gmg.f90:245).
+    # gmg.f90:297 subtracts alpha from every row's diagonal uniformly (no polar
+    # zeroing), so match that exactly.
     sin2         = np.sin(np.pi * m / nx_grid) ** 2
     alpha_scalar = -4.0 * sin2 / (dlon_rad * EARTH_RADIUS) ** 2  # (float)
+    alpha_per_j        = np.full(ny, alpha_scalar, dtype=np.float64)
 
     # ── L_y 'B' stencil ─────────────────────────────────────────────────────
     # Interface between j-1 and j: 'B' average of mu, times mu[j] (center)
@@ -413,8 +464,8 @@ def _build_Hm_sparse(m: int, metric_np: dict, ny: int, nz: int):
     jj, kk = np.meshgrid(j_idx, k_idx, indexing='ij')  # (ny, nz)
     row_all = (jj * nz + kk).ravel()                   # (ny*nz,)
 
-    # Diagonal: alpha + L_y_diag[j] + cos²[j]*L_z_diag_base[k]
-    diag_L_y      = alpha_scalar - (c_lo_B + c_hi_B)   # (ny,)
+    # Diagonal: alpha[j] + L_y_diag[j] + cos²[j]*L_z_diag_base[k]
+    diag_L_y      = alpha_per_j - (c_lo_B + c_hi_B)    # (ny,)
     diag_Lz_base  = -(d_lo_base + d_hi_base)            # (nz,)
     diag_vals = (diag_L_y[:, None] + cos2[:, None] * diag_Lz_base[None, :]).ravel()
 
@@ -671,11 +722,16 @@ def solve_pressure(
 
     Matches gSAM pressure_gmg (dolatlon=T, doflat=F):
       - rfft in x → nm complex modes
-      - RHS × cos²(lat) per mode (matching gSAM: ff = rhs * mu_gl²)
-      - Sparse LU in (y,z) per mode with Cartesian α × cos²(lat_j) diagonal
+      - RHS × cos²(lat) per mode (matching gSAM: ff = rhs · mu_gl²)
+      - Per-mode (y,z) solve — geometric multigrid (GMG) by default,
+        matching gSAM's own solver path.  Set ``JSAM_USE_LU_PRESSURE=1``
+        to fall back to the cached sparse-LU backend.
       - irfft in x → physical pressure
     """
-    return _solve_pressure_spherical(rhs, metric, **kwargs)
+    import os
+    if os.environ.get("JSAM_USE_LU_PRESSURE", "").strip() == "1":
+        return _solve_pressure_spherical(rhs, metric, **kwargs)
+    return _solve_pressure_spherical_gmg(rhs, metric, **kwargs)
 
 
 def _solve_pressure_spherical(
@@ -750,56 +806,236 @@ def _solve_pressure_spherical(
 
 
 # ---------------------------------------------------------------------------
+# 4b.  Spherical solver — GMG backend (matches gSAM pressure_gmg.f90 exactly)
+# ---------------------------------------------------------------------------
+
+# Cache: (ny, nz) → (matrices, Ps, Rs, alphas_list).  The hierarchy / operators
+# depend only on the grid geometry, so one build per grid serves every mode
+# and every time-step.
+_GMG_CACHE: dict = {}
+
+# Warm-start buffer, keyed by (ny, nz, nm).  For each zonal mode m we keep
+# the previous time-step's solution (real + imag halves) so the next call
+# to gmg_solve can start from there rather than zero — matches gSAM's
+# ``pfy(:,:,i)`` save array in pressure_gmg.f90.  Reset per grid.
+_PFY_CACHE: dict = {}
+
+
+def _get_gmg_infra(metric_np: dict, ny: int, nz: int, nm: int):
+    """Build (and cache) GMG hierarchy + level matrices + P/R operators.
+
+    Returns (matrices, Ps, Rs, alphas) where ``alphas[m]`` is the zonal
+    eigenvalue for Fourier mode m (negative in jsam sign convention).
+    """
+    from jsam.core.dynamics.gmg import (
+        level0_from_metric, build_grid_hierarchy,
+        build_all_level_matrices, build_all_transfer_operators, alpha_m,
+    )
+
+    key = (ny, nz, nm)
+    if key in _GMG_CACHE:
+        return _GMG_CACHE[key]
+
+    l0       = level0_from_metric(metric_np)
+    levels   = build_grid_hierarchy(l0, coarse_size=8, max_levels=20)
+    matrices = build_all_level_matrices(levels)
+    Ps, Rs   = build_all_transfer_operators(levels)
+
+    dlon_rad = float(metric_np["dlon_rad"])
+    alphas   = [alpha_m(m, dlon_rad, EARTH_RADIUS) for m in range(nm)]
+
+    print(f"  [pressure/gmg] Hierarchy: {len(levels)} levels  finest {ny}×{nz}",
+          flush=True)
+    _GMG_CACHE[key] = (matrices, Ps, Rs, alphas)
+    return _GMG_CACHE[key]
+
+
+def _solve_pressure_spherical_gmg(
+    rhs: jax.Array,    # (nz, ny, nx)
+    metric: dict,
+    tol: float = 1e-10,
+    max_v_cyc: int = 100,   # gSAM pressure_gmg.f90:199 uses v_cyc=100
+    **kwargs,
+) -> jax.Array:        # (nz, ny, nx)
+    """Spherical anelastic pressure solver using GMG per zonal mode.
+
+    Exact port of gSAM ``pressure_gmg.f90`` (dolatlon=T, doflat=F) —
+    same rfft-in-x + per-mode (y,z) solve structure as the LU backend,
+    but replaces the LU factorisation with geometric multigrid.
+
+    Algorithm:
+      1. rfft in x  → nm complex modes on the (y, z) plane
+      2. For each mode m:
+           pre-scale rhs_m *= cos²(lat)     (gSAM ff = rhs · mu²)
+           call gmg_solve for (A + α_m · I) p = rhs_m (real + imag)
+      3. irfft in x  → physical pressure
+
+    Convergence control:
+      * ``tol``         — relative residual tolerance (gSAM default 1e-10)
+      * ``max_v_cyc``   — max V-cycles per real/imag solve
+
+    Near-singular modes (small m) may stagnate before reaching ``tol``
+    — gSAM accepts this too (error_code=2).  The caller ignores the
+    error code since stagnation at √cond·ε_machine is physically harmless.
+    """
+    from jsam.core.dynamics.gmg import VCycleOpts, VCycleState, gmg_solve
+
+    rhs_np = np.array(rhs, dtype=np.float64)        # (nz, ny, nx)
+    nz_arr, ny_arr, nx = rhs_np.shape
+    nm = nx // 2 + 1
+
+    # Convert metric to plain numpy dict for the numpy/scipy GMG kernels
+    metric_np: dict = {}
+    for k, v in metric.items():
+        if isinstance(v, jax.Array):
+            metric_np[k] = np.array(v, dtype=np.float64)
+        else:
+            metric_np[k] = v
+
+    matrices, Ps, Rs, alphas = _get_gmg_infra(metric_np, ny_arr, nz_arr, nm)
+
+    cos2_ny = metric_np["cos_lat"] ** 2              # (ny,)
+
+    # ── 1. rfft in x ────────────────────────────────────────────────────────
+    rhs_x = np.fft.rfft(rhs_np, axis=2)              # (nz, ny, nm) complex
+    p_hat = np.zeros_like(rhs_x)                     # (nz, ny, nm) complex
+
+    # ── 2. Per-mode GMG (parallel over modes) ───────────────────────────────
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+    n_workers = int(os.environ.get(
+        "JSAM_LU_WORKERS", os.cpu_count() or 4
+    ))
+
+    opts_default = VCycleOpts()                       # gSAM defaults
+
+    # m=0 singular Laplacian: gSAM-exact — alpha=0 + remov_null='cycl'.
+    opts_m0 = VCycleOpts(remov_null="cycl")
+
+    # Warm-start buffer: keeps the previous call's solution per mode so
+    # gmg_solve starts from a good initial guess (matches gSAM's pfy(:,:,i)
+    # save array in pressure_gmg.f90).  Keyed by (ny, nz, nm).
+    pfy_key = (ny_arr, nz_arr, nm)
+    pfy = _PFY_CACHE.setdefault(
+        pfy_key,
+        {m: {"re": np.zeros((ny_arr, nz_arr), dtype=np.float64),
+             "im": np.zeros((ny_arr, nz_arr), dtype=np.float64)}
+         for m in range(nm)},
+    )
+
+    _press_debug = os.environ.get("JSAM_PRESS_DEBUG", "") == "1"
+    _target_modes = {0, 1, 2, 10, 100, 500, nm - 1}
+
+    def _solve_mode(m):
+        alpha = alphas[m]
+        opts  = opts_m0 if m == 0 else opts_default
+        rhs_m  = rhs_x[:, :, m] * cos2_ny[np.newaxis, :]
+        rhs_r  = np.ascontiguousarray(rhs_m.real.T)
+        rhs_i  = np.ascontiguousarray(rhs_m.imag.T)
+        # gSAM pressure_gmg.f90 passes ff directly to gmg_solve without any
+        # mean subtraction.  Arithmetic-mean subtraction would push the RHS
+        # out of range(A): the 'B' stencil is non-symmetric, so null(A^T) is
+        # not constants — the physical RHS is in range(A) via mass
+        # conservation (cos·Δy·Δz·ρ-weighted zero sum), not arithmetic-zero.
+        state = VCycleState.empty_for(matrices)
+        res_r = gmg_solve(matrices, Ps, Rs, rhs_r, alpha,
+                          tol=tol, max_v_cyc=max_v_cyc,
+                          sol=pfy[m]["re"], opts=opts, state=state)
+        res_i = gmg_solve(matrices, Ps, Rs, rhs_i, alpha,
+                          tol=tol, max_v_cyc=max_v_cyc,
+                          sol=pfy[m]["im"], opts=opts, state=state)
+        pfy[m]["re"] = res_r.sol.copy()
+        pfy[m]["im"] = res_i.sol.copy()
+        if _press_debug and m in _target_modes:
+            rhs_rmax = max(np.abs(rhs_r).max(), np.abs(rhs_i).max())
+            p_rmax   = max(np.abs(res_r.sol).max(), np.abs(res_i.sol).max())
+            print(f"    [mode m={m:4d}] alpha={alpha:+.3e}  "
+                  f"|rhs_m|={rhs_rmax:.3e}  |p_m|={p_rmax:.3e}  "
+                  f"re_iters={res_r.iter} err={res_r.error_code}  "
+                  f"im_iters={res_i.iter} err={res_i.error_code}",
+                  flush=True)
+        return m, (res_r.sol + 1j * res_i.sol).T
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for m, p_m in pool.map(_solve_mode, range(nm)):
+            p_hat[:, :, m] = p_m
+
+    # ── 3. irfft in x ───────────────────────────────────────────────────────
+    p = np.fft.irfft(p_hat, n=nx, axis=2)             # (nz, ny, nx)
+
+    if _press_debug:
+        # Separate m=0 (zonal mean) contribution from rest
+        p_m0 = np.fft.irfft(
+            p_hat * (np.arange(nm) == 0)[None, None, :], n=nx, axis=2
+        )
+        p_m_gt0 = p - p_m0
+        print(f"    [p after irfft] max|p|={np.abs(p).max():.3e}  "
+              f"max|p_m=0|={np.abs(p_m0).max():.3e}  "
+              f"max|p_m>0|={np.abs(p_m_gt0).max():.3e}  "
+              f"p.mean={p.mean():+.3e}", flush=True)
+
+    # Remove global mean (barotropic mode)
+    p -= p.mean()
+
+    return jnp.array(p)
+
+
+# ---------------------------------------------------------------------------
 # 5.  Pressure gradient application  (matches press_grad.f90)
 # ---------------------------------------------------------------------------
 
-@jax.jit
-def apply_pressure_gradient(
-    U: jax.Array,    # (nz, ny, nx+1)
-    V: jax.Array,    # (nz, ny+1, nx)
-    W: jax.Array,    # (nz+1, ny, nx)
-    p: jax.Array,    # (nz, ny, nx)
-    metric: dict,
-    dt: float,
-    igam2: float = 1.0,   # 1/gamma_RAVE² (=1 for incompressible)
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """
-    Subtract spherical pressure gradient from tentative velocities.
-
-    Consistent with the spherical press_rhs and the spherical Helmholtz
-    solver (FFT-x + sparse-LU in (y,z)):
-
-      U -= dt * imu(j) * (p(i) - p(i-1)) / dx
-      V -= dt * (p(j) - p(j-1)) / dy_v
-      W -= dt * igam2 * (p(k) - p(k-1)) / (dz_ref * adzw(k))
-    """
+def _apply_pressure_gradient_core(U, V, W, p, metric, dt, igam2, debug_tag=None):
     dx     = metric["dx_lon"]
-    dy_row = metric["dy_lat"]   # (ny,) per-row mass-cell dy
-    imu    = metric["imu"]      # (ny,)  = 1/cos(lat)
+    dy_row = metric["dy_lat"]
+    imu    = metric["imu"]
 
-    # ── Zonal: imu * dp/dλ at east faces  (spherical) ────────────────────────
     p_west = jnp.roll(p, 1, axis=2)
-    dp_dx  = imu[None, :, None] * (p - p_west) / dx             # (nz, ny, nx)
+    dp_dx  = imu[None, :, None] * (p - p_west) / dx
+
+    dy_v_int  = 0.5 * (dy_row[:-1] + dy_row[1:])
+    dp_dy_int = (p[:, 1:, :] - p[:, :-1, :]) / dy_v_int[None, :, None]
+
+    dz_ref  = metric["dz_ref"]
+    adzw    = metric["adzw"]
+    dz_face = dz_ref * adzw[1:-1]
+    dp_dz_int = (p[1:, :, :] - p[:-1, :, :]) / dz_face[:, None, None]
+
+    if debug_tag is not None:
+        import numpy as _np
+        gx = float(jnp.max(jnp.abs(dp_dx)))
+        gy = float(jnp.max(jnp.abs(dp_dy_int)))
+        gz = float(jnp.max(jnp.abs(dp_dz_int)))
+        _gz_np = _np.array(dp_dz_int)
+        _idx = _np.unravel_index(_np.argmax(_np.abs(_gz_np)), _gz_np.shape)
+        print(f"  [press_grad {debug_tag}] max|dp_dx|={gx:.3e}  "
+              f"max|dp_dy|={gy:.3e}  max|dp_dz|={gz:.3e}  "
+              f"worst_gz@(k={_idx[0]},j={_idx[1]},i={_idx[2]})  "
+              f"dt·igam2·gz={dt*igam2*gz:.3e}", flush=True)
+
     U_new = U.at[:, :, 1:-1].add(-dt * dp_dx[:, :, 1:])
     U_new = U_new.at[:, :, 0].add(-dt * dp_dx[:, :, 0])
-
-    # ── Meridional: dp/dφ at interior v-faces.
-    # Non-uniform: dy_v_face[j] = 0.5*(dy_row[j-1]+dy_row[j])
-    dy_v_int = 0.5 * (dy_row[:-1] + dy_row[1:])                 # (ny-1,)
-    dp_dy_int = (p[:, 1:, :] - p[:, :-1, :]) / dy_v_int[None, :, None]  # (nz, ny-1, nx)
     V_new = V.at[:, 1:-1, :].add(-dt * dp_dy_int)
-
-    # ── Vertical: dp/dz at w-faces — use center-to-center spacing adzw*dz_ref
-    # Matches gSAM press_grad.f90: rdz = 1./(dz*adzw(k)) where dz=dz_ref.
-    # Must be consistent with _build_Lz_matrix and _helmholtz_op which also
-    # use adzw (D8 fix).
-    dz_ref = metric["dz_ref"]                                     # scalar
-    adzw   = metric["adzw"]                                       # (nz+1,)
-    dz_face = dz_ref * adzw[1:-1]                                 # (nz-1,) center-to-center
-    dp_dz_int = (p[1:, :, :] - p[:-1, :, :]) / dz_face[:, None, None]  # (nz-1, ny, nx)
     W_new = W.at[1:-1, :, :].add(-dt * igam2 * dp_dz_int)
-
     return U_new, V_new, W_new
+
+
+_apply_pressure_gradient_jit = jax.jit(
+    _apply_pressure_gradient_core, static_argnames=("debug_tag",)
+)
+
+
+def apply_pressure_gradient(U, V, W, p, metric, dt, igam2=1.0):
+    """Subtract spherical pressure gradient from tentative velocities.
+
+    If ``JSAM_PRESS_DEBUG=1``, runs un-jitted with per-direction
+    max|dp/d*| prints.
+    """
+    import os as _os
+    if _os.environ.get("JSAM_PRESS_DEBUG", "") == "1":
+        return _apply_pressure_gradient_core(U, V, W, p, metric, dt, igam2,
+                                             debug_tag="")
+    return _apply_pressure_gradient_jit(U, V, W, p, metric, dt, igam2,
+                                        debug_tag=None)
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +1091,8 @@ def pressure_step(
     dt: float,
     n_iter: int = 1,
     at: float = 1.0,
+    rel_tol: float = 1e-6,
+    max_iter: int = 50,
 ) -> tuple["ModelState", jax.Array]:
     """
     Full pressure correction step with Richardson iteration.
@@ -862,10 +1100,19 @@ def pressure_step(
       1. Compute anelastic divergence (RHS)
       2. Solve Poisson equation for p'
       3. Subtract ∇p' from (U, V, W)
-      4. Repeat 1–3 on the residual for ``n_iter`` total iterations
+      4. Repeat 1–3 on the residual until |rhs| / |rhs_initial| < rel_tol
+         (capped at ``max_iter`` iterations)
 
-    The effective time step for the pressure gradient is ``at * dt``, matching
-    gSAM press_grad.f90 which applies ``u -= dt3(na) * at * ∇p``.
+    The 'B' Helmholtz stencil in solve_pressure is close to but not exactly the
+    consistent discretisation of press_rhs + press_grad, so a single LU solve
+    leaves ~4% residual divergence.  Richardson iteration with the LU as
+    preconditioner converges (slowly — factor ~0.5–0.8 per iter), but is needed
+    to reach gSAM's pressure_gmg tolerance (eps=1e-10 at nstep≤3).
+
+    The ``n_iter`` argument is a hard floor — the loop runs at least n_iter
+    iterations even if tolerance is reached earlier.  Use ``rel_tol`` /
+    ``max_iter`` for adaptive convergence (default: iterate until residual
+    drops 6 orders of magnitude or 50 iters, whichever first).
 
     PRESSURE HISTORY MANAGEMENT (differs from gSAM):
       - gSAM: Manages pressure in rotating buffer p(:,:,:,na/nb/nc)
@@ -877,14 +1124,52 @@ def pressure_step(
                           state.TABS.shape[2]))
 
     dt_eff = at * dt
-    for _iter in range(n_iter):
+    import os as _os_diag
+    _debug = _os_diag.environ.get("JSAM_PRESS_DEBUG") == "1"
+    _rhs0_abs = None
+    _iter = 0
+    while True:
         rhs = press_rhs(U_cur, V_cur, W_cur, metric, dt_eff)
+        _rhs_abs = float(jnp.max(jnp.abs(rhs)))
+        _rhs_rms = float(jnp.sqrt(jnp.mean(rhs ** 2)))
+        if _rhs0_abs is None:
+            _rhs0_abs = _rhs_abs
+            _rhs0_rms = _rhs_rms
+        if _debug:
+            _W_before = float(jnp.max(jnp.abs(W_cur)))
+            _W_bot = float(jnp.max(jnp.abs(W_cur[0, :, :])))
+            _W_top = float(jnp.max(jnp.abs(W_cur[-1, :, :])))
+            _U_cyc = float(jnp.max(jnp.abs(U_cur[:, :, -1] - U_cur[:, :, 0])))
+            _V_sp  = float(jnp.max(jnp.abs(V_cur[:, 0, :])))
+            _V_np  = float(jnp.max(jnp.abs(V_cur[:, -1, :])))
+            print(f"  [press diag] W[0]_max={_W_bot:.3e}  W[-1]_max={_W_top:.3e}  "
+                  f"|U[nx]-U[0]|_max={_U_cyc:.3e}  V[south]_max={_V_sp:.3e}  V[north]_max={_V_np:.3e}",
+                  flush=True)
+        # Stop conditions: (a) reached max_iter, OR (b) reached n_iter floor AND
+        # residual is below tolerance.
+        _converged = (_rhs_abs / max(_rhs0_abs, 1e-30)) < rel_tol
+        if _iter >= max_iter or (_iter >= n_iter and _converged):
+            if _debug:
+                print(f"  [pressure] STOP iter={_iter} |rhs|={_rhs_abs:.3e} "
+                      f"rel={_rhs_abs/max(_rhs0_abs,1e-30):.3e} "
+                      f"rms_rel={_rhs_rms/max(_rhs0_rms,1e-30):.3e} "
+                      f"|W|={_W_before:.3f}", flush=True)
+            break
         p_inc = solve_pressure(rhs, metric)
+        if _debug:
+            _p_abs = float(jnp.max(jnp.abs(p_inc)))
+            _p_rms = float(jnp.sqrt(jnp.mean(p_inc ** 2)))
+            print(f"  [pressure iter={_iter}] |rhs_in|={_rhs_abs:.3e} "
+                  f"(rms={_rhs_rms:.3e})  |p|={_p_abs:.3e} (rms={_p_rms:.3e})  "
+                  f"rel={_rhs_abs/max(_rhs0_abs,1e-30):.3e} "
+                  f"rms_rel={_rhs_rms/max(_rhs0_rms,1e-30):.3e}  "
+                  f"|W|_before={_W_before:.3f}", flush=True)
         p_total = p_total + p_inc
         U_cur, V_cur, W_cur = apply_pressure_gradient(
             U_cur, V_cur, W_cur, p_inc, metric, dt_eff,
         )
         U_cur = U_cur.at[:, :, -1].set(U_cur[:, :, 0])
+        _iter += 1
 
     # gSAM pressure.f90 clips pp (physical pressure for output) but NOT p (the
     # velocity-correction pressure stored here).  No clip applied — matches gSAM.

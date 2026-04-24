@@ -223,33 +223,40 @@ class DebugDumper:
 
         fields = (U_full, V_full, W_full, TABS_full, QC_full, QV_full, QI_full)
 
-        # Global reductions on device — 21 scalars in one go to minimise H2D sync.
-        stats = jnp.stack([jnp.stack([jnp.min(F), jnp.max(F), jnp.sum(F)])
-                           for F in fields])  # (7, 3)
-
-        # Slice IRMA box on device, stack into (7, nz, nj, ni) for bit-compatible
-        # memory order (i fastest, then j, then k, then field-slow — matches
-        # Fortran (ni, nj, nzm, 7) in gSAM debug_dump.f90).
-        # All fields now have consistent shape (nz, ny, nx) after the slicing above.
-        boxes = jnp.stack([
-            F[:, self._j_lo:self._j_hi, self._i_lo:self._i_hi] for F in fields
-        ])
-
-        # Host transfer — one jax.device_get batches both arrays.
-        stats_np, boxes_np = jax.device_get((stats, boxes))
+        # Stream fields one at a time to avoid a large batched allocation.
+        # A single jnp.stack over 7 full global-shape fields can require
+        # multiple GB of transient device memory (the previous implementation
+        # OOM'd here at ~585 MB).  Computing per-field stats + per-field IRMA
+        # subbox slice keeps peak device memory bounded to one field.
         nstep_val = int(force_nstep) if force_nstep is not None else int(state.nstep)
 
-        # --- binary record ---
+        # --- binary record header ---
         np.array([nstep_val, stage_id], dtype="<i4").tofile(self._fbin)
-        # float32, C-contiguous (7, nz, nj, ni) → memory order matches
-        # Fortran-order (ni, nj, nzm, 7) that gSAM writes.
-        boxes_np.astype("<f4", copy=False).tofile(self._fbin)
+
+        fmin  = np.empty(NFIELDS, dtype=np.float32)
+        fmax  = np.empty(NFIELDS, dtype=np.float32)
+        fsum  = np.empty(NFIELDS, dtype=np.float64)
+        for i, F in enumerate(fields):
+            # Per-field reductions (3 scalars) + IRMA subbox — one host
+            # transfer per field.  Using python float/np scalars (not a
+            # large stacked array) keeps device memory low.
+            _fmin = jnp.min(F)
+            _fmax = jnp.max(F)
+            _fsum = jnp.sum(F)
+            _box  = F[:, self._j_lo:self._j_hi, self._i_lo:self._i_hi]
+            _fmin_np, _fmax_np, _fsum_np, _box_np = jax.device_get(
+                (_fmin, _fmax, _fsum, _box)
+            )
+            fmin[i] = float(_fmin_np)
+            fmax[i] = float(_fmax_np)
+            fsum[i] = float(_fsum_np)
+            _box_np.astype("<f4", copy=False).tofile(self._fbin)
+            # Let the device intermediate be freed before the next field.
+            del _fmin, _fmax, _fsum, _box, _box_np
         self._fbin.flush()
 
         # --- CSV row ---
-        fmin  = stats_np[:, 0]
-        fmax  = stats_np[:, 1]
-        fmean = stats_np[:, 2] / self._global_denom
+        fmean = fsum / float(self._global_denom)
         cols  = [f"{nstep_val}", f"{stage_id}",
                  STAGE_NAMES.get(stage_id, f"stage_{stage_id}"),
                  f"{float(dtn):.9e}"]

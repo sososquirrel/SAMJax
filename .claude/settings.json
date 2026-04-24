@@ -3,18 +3,12 @@
     "allow": [
       "Bash(git commit -m ' *)",
       "Bash(qstat)",
-      "Bash(tee /tmp/test_era5_init.log)",
-      "Bash(xargs cat *)",
-      "Bash(awk '{print $5}')",
-      "Bash(awk -F',' 'NR>1 && $1==1 {print $1,$2,$3}' /glade/derecho/scratch/sabramian/jsam_IRMA_debug500/debug/globals.csv)",
-      "Bash(awk -F',' 'NR>1 && $1==1 {print $1,$2,$3}' /glade/derecho/scratch/sabramian/gSAM_IRMA_500timesteps_DEBUG/debug/globals.csv)",
-      "Bash(python3 -m py_compile jsam/core/physics/sgs.py)",
-      "Bash(sacct -j 3191590 -o jobid,state,exitcode)",
-      "Bash(tee /tmp/qsub_result.txt)",
-      "Bash(cat /glade/derecho/scratch/sabramian/tmp/*.o*)",
-      "Bash(awk '{print $5, $9}')",
-      "Bash(awk -F/ '{depth=NF-10; for\\(i=0;i<depth;i++\\) printf \"  \"; print $NF \" \\(\" substr\\($0, index\\($0, $NF-3\\)\\) \"\\)\"}')",
-      "Bash(awk '{printf \"%-8s %s\\\\n\", $5, $9}')",
+      "Bash(tee)",
+      "Bash(xargs)",
+      "Bash(awk)",
+      "Bash(python3)",
+      "Bash(sacct)",
+      "Bash(cat)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:api.github.com)",
@@ -29,14 +23,41 @@
       "Bash([ -f \"$log\" ])",
       "Bash(conda run *)",
       "Bash(sort -t/ -k7)",
-      "Bash(awk -F',' '{print $1}' /glade/derecho/scratch/sabramian/jsam_IRMA_debug500_20260418_093804/debug/globals.csv)"
+      "Read(//glade/u/home/sabramian/SAMJax/**)",
+      "Bash(JAX_ENABLE_X64=1 /glade/u/home/sabramian/.conda/envs/jsam/bin/python scripts/tests/pressure_consistency.py --m 3 --nx 128 --ny 720 --nz 74 --topk 25)",
+      "Bash(JAX_ENABLE_X64=1 /glade/u/home/sabramian/.conda/envs/jsam/bin/python scripts/tests/pressure_consistency.py --modes 1,5,50,720 --nx 1440 --ny 720 --nz 74 --topk 10)",
+      "Bash(JAX_ENABLE_X64=1 /glade/u/home/sabramian/.conda/envs/jsam/bin/python scripts/tests/pressure_consistency.py --modes 1,5,50,720 --nx 1440 --ny 720 --nz 74 --topk 5)",
+      "Bash(awk -F',' '{printf \"jsam diag:   W=[%.3f, %.3f]  U=[%.3f, %.3f]  V=[%.3f, %.3f]\\\\n\",$11,$12,$5,$6,$8,$9}')",
+      "Bash(JAX_ENABLE_X64=1 /glade/u/home/sabramian/.conda/envs/jsam/bin/python scripts/tests/pressure_consistency.py --modes 3 --nx 256 --ny 128 --nz 32)",
+      "Bash(awk -F, '$1==1 && $2==18' /glade/derecho/scratch/sabramian/jsam_IRMA_debug500_20260419_115058/debug/globals.csv)",
+      "Bash(JAX_ENABLE_X64=1 /glade/u/home/sabramian/.conda/envs/jsam/bin/python scripts/tests/pressure_consistency.py --modes 3 --nx 1440 --ny 720 --nz 74)",
+      "Bash(mkdir -p /glade/u/home/sabramian/.claude/skills)",
+      "Bash(mv /glade/u/home/sabramian/SAMJax/autoresearch_base /glade/u/home/sabramian/.claude/skills/autoresearch)",
+      "Bash(mv /glade/u/home/sabramian/.claude/skills/autoresearch/.claude/state /glade/u/home/sabramian/.claude/skills/autoresearch/state)",
+      "Bash(mv /glade/u/home/sabramian/.claude/skills/autoresearch/.claude/references /glade/u/home/sabramian/.claude/skills/autoresearch/references)",
+      "Bash(rmdir /glade/u/home/sabramian/.claude/skills/autoresearch/.claude)",
+      "Edit(~/.claude/skills/autoresearch/**)"
     ],
     "additionalDirectories": [
       "/glade/derecho/scratch/sabramian",
       "/tmp",
       "/glade/work/sabramian/jsam_lu_cache",
       "/glade/work/sabramian/jsam_init_cache",
-      "/glade/u/home/sabramian/.claude/commands"
+      "/glade/u/home/sabramian/.claude/commands",
+      "/glade/u/home/sabramian/.claude/skills/autoresearch"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": false,
+  "enabledMcpjsonServers": [],
+  "deniedMcpServers": [
+    {
+      "serverName": "claude_ai_Gmail"
+    },
+    {
+      "serverName": "claude_ai_Google_Calendar"
+    },
+    {
+      "serverName": "claude_ai_Google_Drive"
+    }
+  ]
 }

@@ -1118,12 +1118,12 @@ def diffuse_damping_mom_z(
     W:  jax.Array,       # (nz+1, ny, nx)
     tk: jax.Array,       # (nz, ny, nx) eddy viscosity
     metric: dict,
-    dt: float,
+    dt: float,           # actual adaptive substep (gSAM dtn)
+    dt_ref: float,       # reference/config dt (gSAM module dt); used for tau_max=1/dt_ref
     damping_u_cu: float = 0.25,
     damping_w_cu: float = 0.3,
     fluxbu: jax.Array | None = None,   # (ny, nx+1) surface U flux (m/s * m/s)
     fluxbv: jax.Array | None = None,   # (ny+1, nx) surface V flux
-    dtn: float | None = None,          # AB effective timestep (at*dt); None → use dt
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Implicit vertical SGS diffusion + all damping for U, V, W.
@@ -1153,9 +1153,11 @@ def diffuse_damping_mom_z(
     dx   = metric["dx_lon"]      # scalar
     pres = metric["pres"]        # (nz,) Pa
 
-    # gSAM damping.f90: tau_max = dtn/dt = at (AB coefficient, dimensionless)
-    _dtn = dtn if dtn is not None else dt
-    tau_max = _dtn / dt
+    # gSAM diffuse_damping_mom_z.f90:36 — tau_max = 1/dt_reference (units 1/s).
+    # Thresholds (umax, wmax) and the tridiag scaling then use `dt` (adaptive
+    # substep = gSAM dtn); the product `dt * tau_max = dt_substep/dt_ref` is
+    # dimensionless and matches gSAM `dtn*tau_max`.
+    tau_max = 1.0 / dt_ref
 
     # Interior w-face arrays (faces 1..nz-1 in 0-indexed = gSAM faces 2..nzm).
     # adzw_int[f] = adzw[f+1] = (z[f+1]-z[f])/dz_ref  (center-to-center spacing ratio)
@@ -1179,7 +1181,7 @@ def diffuse_damping_mom_z(
     # Polar + upper-level damping coefficients for U
     mu = cos_lat                                            # (ny,)
     tauy = tau_max * (1.0 - mu ** 2) ** 200                # (ny,)
-    umax_polar = damping_u_cu * dx * mu / _dtn             # (ny,) gSAM: cu*dx*mu/dtn
+    umax_polar = damping_u_cu * dx * mu / dt               # (ny,) gSAM: cu*dx*mu/dtn (actual substep)
     umax_3d = umax_polar[None, :, None]                    # (1, ny, 1)
 
     # pres < 70 hPa → use tau_max; else tauy
@@ -1241,7 +1243,7 @@ def diffuse_damping_mom_z(
     )  # (ny+1,)
     # Use mass-cell-averaged tau and umax (not v-face cos)
     tauy_mass = tau_max * (1.0 - cos_lat ** 2) ** 200    # (ny,)
-    umax_mass = damping_u_cu * dx * cos_lat / _dtn       # (ny,) gSAM: cu*dx*mu/dtn
+    umax_mass = damping_u_cu * dx * cos_lat / dt         # (ny,) gSAM: cu*dx*mu/dtn (actual substep)
     tauy_v = jnp.pad(
         0.5 * (tauy_mass[:-1] + tauy_mass[1:]),
         (1, 1), constant_values=tau_max,
@@ -1295,8 +1297,8 @@ def diffuse_damping_mom_z(
     tauz_w = 0.5 * (tauz_c[:-1] + tauz_c[1:])  # (nz-1,)
 
     # W CFL limiter (dodamping_w): only below sponge (tauz_w == 0)
-    # gSAM: wmax = damping_w_cu * dz * adzw(k) / dtn
-    wmax_w = damping_w_cu * dz_ref * adzw_int / _dtn  # (nz-1,)
+    # gSAM: wmax = damping_w_cu * dz * adzw(k) / dtn (actual substep)
+    wmax_w = damping_w_cu * dz_ref * adzw_int / dt  # (nz-1,)
     W_int = W[1:-1]  # (nz-1, ny, nx) interior w-faces
 
     below_sponge = (tauz_w == 0.0)[:, None, None]

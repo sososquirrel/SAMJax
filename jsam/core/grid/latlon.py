@@ -88,9 +88,24 @@ class LatLonGrid(Grid):
         return np.diff(self.zi)
 
     @property
+    def lat_center(self) -> np.ndarray:
+        """Geometric cell-center latitude (deg), shape (ny,) — matches gSAM y_gl.
+
+        gSAM setgrid.f90:200-224: scalar cell center is the midpoint of its two
+        v-faces (with latv_gl(1)=-90, latv_gl(ny+1)=+90 for global).  This is
+        NOT the `lat(j)` value read from the dyvar grid file — at the polar
+        row the two differ by ~0.05° (e.g. file lat[0]=-89.40° vs
+        lat_center[0]=-89.45°), which changes cos_lat by ~9% and cascades into
+        CFL, substepping, and AB3 coefficients.  gSAM uses y_gl for metric
+        factors (mu_gl, tanr) but keeps `lat(j)` for Coriolis (setgrid.f90:497).
+        """
+        lv = self.lat_v
+        return 0.5 * (lv[:-1] + lv[1:])
+
+    @property
     def cos_lat(self) -> np.ndarray:
-        """cos(lat) weights, shape (ny,)."""
-        return np.cos(np.deg2rad(self.lat))
+        """cos(y_gl) weights, shape (ny,) — matches gSAM mu_gl."""
+        return np.cos(np.deg2rad(self.lat_center))
 
     @property
     def area_weights(self) -> np.ndarray:

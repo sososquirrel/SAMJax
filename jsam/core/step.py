@@ -102,6 +102,8 @@ class StepConfig:
                                                     # None → skip SLM (ocean only)
     g:             float = 9.79764  # gSAM consts.f90 ggr
     epsv:          float = 0.61
+    dt_ref:        float = 10.0   # reference/config dt (s); gSAM module `dt`, used for
+                                  # tau_max=1/dt_ref in diffuse_damping_mom_z tridiag
     damping_u_cu:  float = 0.3    # U/V polar velocity limiter (gSAM damping_u_cu)
     damping_w_cu:  float = 0.3    # W Courant-number damping threshold (gSAM damping_w_cu)
     dodamping_w:      bool  = False  # gSAM dodamping_w: CFL-based W soft-clip below sponge
@@ -257,10 +259,12 @@ def _buoyancy_W(
     b_int = betu * b[1:] + betd * b[:-1]   # (nz-1, ny, nx)
 
     ny, nx = state.TABS.shape[1], state.TABS.shape[2]
+    # gSAM buoyancy loop: do k=2,nzm (1-based) → jsam W[1..nzm-1] (0-based).
+    # b_int[l] = buoyancy for W face l+1 (0-based) = gSAM face k=l+2 (1-based).
     b_w = jnp.concatenate([
-        jnp.zeros((1, ny, nx)),
-        b_int,
-        jnp.zeros((1, ny, nx)),
+        jnp.zeros((1, ny, nx)),   # W[0] = gSAM k=1 (rigid lid)
+        b_int,                    # W[1..nz-1] = gSAM k=2..nzm
+        jnp.zeros((1, ny, nx)),   # W[nz] = gSAM k=nz (rigid lid)
     ], axis=0)   # (nz+1, ny, nx)
 
     # Fix A (terraw): apply mask at W-face level, mirroring gSAM's
@@ -556,6 +560,13 @@ def step(
                                metric["dz"], config.g, config.epsv,
                                qn0=forcing.qn0, qp0=forcing.qp0,
                                terraw=metric.get("terraw", None))
+        # DEBUG: W-tendency budget summary for step-1 verification.
+        if int(state.nstep) == 1:
+            _b = _dW_buo
+            print(f"[W-budget nstep=1] buoyancy "
+                  f"mean={float(jnp.mean(_b)):+.3e} "
+                  f"min={float(jnp.min(_b)):+.3e} "
+                  f"max={float(jnp.max(_b)):+.3e} [m/s^2]", flush=True)
         dW_extra = dW_extra + _dW_buo
 
         # Fix B: gSAM buoyancy.f90 energy conservation (lines 35, 58-60).
@@ -590,6 +601,9 @@ def step(
     _dU_cor_mass, _dV_cor, _dW_cor = coriolis_tend(
         state.U, state.V, state.W, metric,
     )
+    if int(state.nstep) == 1:
+        print(f"[W-budget nstep=1] coriolis "
+              f"mean={float(jnp.mean(_dW_cor)):+.3e} [m/s^2]", flush=True)
     dU_extra = dU_extra.at[:, :, :nx_s].add(_dU_cor_mass)
     dU_extra = dU_extra.at[:, :, nx_s].add(_dU_cor_mass[:, :, 0])
     dV_extra = dV_extra + _dV_cor
@@ -617,6 +631,13 @@ def step(
         )
         # DO NOT add to dU_extra — horizontal SGS is Euler-stepped (dudtd), not AB-stepped
 
+    # gSAM advect_mom.f90 uses the CURRENT state velocity (u(i,j,k), v(i,j,k),
+    # w(i,j,k)) for momentum advection — no AB extrapolation.  Only
+    # advect_all_scalars.f90 uses the AB-extrapolated (a1*u + a2*u_prev)
+    # advective velocity.  Previously jsam was passing the AB-extrapolated
+    # U_adv_for_advection here too, which caused ~17% drop in U_max per
+    # substep during variable-dtn substepping (jsam step 1 icycle 2 shifted
+    # U_max 113 → 93 while gSAM stayed at 113).
     state, mom_tends_n = advance_momentum(
         state, mom_tends_nm1, mom_tends_nm2, metric, dt,
         dU_extra=dU_extra,
@@ -624,9 +645,7 @@ def step(
         dW_extra=dW_extra,
         dt_prev=dt_prev,
         dt_pprev=dt_pprev,
-        U_adv=U_adv_for_advection,
-        V_adv=V_adv_for_advection,
-        W_adv=W_adv_for_advection,
+        # U_adv/V_adv/W_adv=None → advance_momentum falls back to state.U/V/W
     )
     del mom_tends_nm1, mom_tends_nm2
 
@@ -676,10 +695,10 @@ def step(
 
         _U_imp, _V_imp, _W_imp = diffuse_damping_mom_z(
             state.U, state.V, state.W, _tk, metric, dt,
+            dt_ref=config.dt_ref,
             damping_u_cu=config.damping_u_cu,
             damping_w_cu=config.damping_w_cu,
             fluxbu=_fluxbu, fluxbv=_fluxbv,
-            dtn=_at_ab * dt,   # gSAM: tau_max = dtn/dt = at
         )
         state = ModelState(
             U=_U_imp, V=_V_imp, W=_W_imp,
@@ -702,62 +721,14 @@ def step(
 
     _stage_dump(state, 12, dt, force_nstep=_dump_nstep)
 
-    # gSAM damping.f90 — called after adamsB, before pressure, matching gSAM main.f90.
-    # Three independent branches in gSAM order: dodamping (W sponge), dodamping_w (W CFL),
-    # dodamping_poles (polar U/V).  All share tau_max = dtn/dt = _at_ab.
-    _dtn = _at_ab * dt
-    _W_dam = state.W
-    _U_dam = state.U
-    _V_dam = state.V
-    if config.w_sponge_max > 0.0:
-        _W_dam = gsam_w_sponge(
-            _W_dam, metric["zi"],
-            nub=config.w_sponge_nub,
-            taudamp_max=config.w_sponge_max,
-            dtn=_dtn,
-            dt=dt,
-        )
-    if config.dodamping_w:
-        _W_dam = gsam_w_courant_damping(
-            _W_dam, metric,
-            dtn=_dtn,
-            damping_w_cu=config.damping_w_cu,
-            tau_max=_at_ab,
-            nub=config.w_sponge_nub,
-        )
-    if config.dodamping_poles:
-        _U_dam, _V_dam = pole_damping(
-            _U_dam, _V_dam,
-            metric["lat_rad"],
-            metric["dx_lon"],
-            metric["dy_lat"],
-            dt,
-            cu=config.damping_u_cu,
-            pres=metric["pres"],
-            p_upper=7000.0,
-            dtn=_dtn,
-        )
-    state = ModelState(
-        U=_U_dam, V=_V_dam, W=_W_dam,
-        TABS=state.TABS, QV=state.QV, QC=state.QC,
-        QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
-        TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
-        nstep=state.nstep, time=state.time,
+    # gSAM main.f90 for IRMA (doimplicitdiff=.true.): no damping call between
+    # adamsB and pressure.  All damping (SGS diff + pole + W CFL + upper-level)
+    # is packed into the stage-11 diffuse_damping_mom_z tridiag.  So we go
+    # directly from adamsB to pressure_step.
+    state, p_new = pressure_step(
+        state, grid, metric, dt, at=_at_ab,
+        n_iter=1, rel_tol=1e-4, max_iter=1,
     )
-    del _W_dam, _U_dam, _V_dam
-
-    if polar_filter_masks is not None:
-        mask_u, mask_v = polar_filter_masks
-        U_f, V_f = spectral_polar_filter(state.U, state.V, mask_u, mask_v)
-        state = ModelState(
-            U=U_f, V=V_f, W=state.W,
-            TABS=state.TABS, QV=state.QV, QC=state.QC,
-            QI=state.QI, QR=state.QR, QS=state.QS, QG=state.QG,
-            TKE=state.TKE, p_prev=state.p_prev, p_pprev=state.p_pprev,
-            nstep=state.nstep, time=state.time,
-        )
-
-    state, p_new = pressure_step(state, grid, metric, dt, at=_at_ab)
 
     # gSAM stores the raw solver output p(na) with no normalization.
     # adamsB.f90: u -= dt * bt * grad(p(nb))  — uses raw p, coefficient is dt (not at*dt).
@@ -999,6 +970,7 @@ def step(
     #     creating an exponentially growing W instability.
     # ------------------------------------------------------------------
     if forcing.tabs0 is not None:
+        # gSAM diagnose.f90 uses mu(j)*ady(j) area weighting.  Match it.
         _cos_lat = metric["cos_lat"]
         _ady     = metric["ady"]
         _wgt = (_cos_lat * _ady) / jnp.sum(_cos_lat * _ady)
@@ -1024,6 +996,10 @@ def step(
             sst=forcing.sst,
             o3vmr_rrtmg=forcing.o3vmr_rrtmg,
             qrad_rrtmg=forcing.qrad_rrtmg,
+            slm_static=forcing.slm_static,
+            slm_state=forcing.slm_state,
+            slm_rad=forcing.slm_rad,
+            precip_ref=forcing.precip_ref,
         )
 
     state = ModelState(

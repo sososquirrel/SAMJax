@@ -10,7 +10,8 @@
 set -euo pipefail
 
 RUN_ID=$(date +%Y%m%d_%H%M%S)
-LOGFILE=/glade/u/home/sabramian/SAMJax/outputs/run_${RUN_ID}.log
+LOGFILE=/glade/u/home/sabramian/SAMJax/outputs/OUTPUT_LOG.log
+mkdir -p "$(dirname "$LOGFILE")"
 exec > "$LOGFILE" 2>&1
 
 unset XLA_FLAGS
@@ -30,10 +31,22 @@ cd "$SAMJAX"
 export JAX_PLATFORMS=cuda
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export JSAM_LU_WORKERS=7
-export JAX_COMPILATION_CACHE_DIR=/glade/work/sabramian/jsam_jax_cache
+export JSAM_PRESS_DEBUG=1
+export JSAM_KURANT_DEBUG=1
+export JAX_ENABLE_X64=1
+# JAX persistent compilation cache DISABLED — see KEY_FINDINGS.md:51-52
+# (cache was suspected of serving stale code across edits). Unset any inherited value.
+unset JAX_COMPILATION_CACHE_DIR
+export JAX_COMPILATION_CACHE_MAX_SIZE=0
 export JSAM_LU_CACHE_DIR=/glade/work/sabramian/jsam_lu_cache
 export JSAM_INIT_CACHE_DIR=/glade/work/sabramian/jsam_init_cache
-mkdir -p "$JAX_COMPILATION_CACHE_DIR" "$JSAM_LU_CACHE_DIR" "$JSAM_INIT_CACHE_DIR"
+mkdir -p "$JSAM_LU_CACHE_DIR" "$JSAM_INIT_CACHE_DIR"
+
+# Force a full recompile: clear Python bytecode under the repo, and
+# disable writing new .pyc files during this run (PYTHONDONTWRITEBYTECODE).
+export PYTHONDONTWRITEBYTECODE=1
+find "$SAMJAX" -type f -name '*.pyc' -delete 2>/dev/null || true
+find "$SAMJAX" -type d -name __pycache__ -empty -delete 2>/dev/null || true
 
 echo "=== jsam IRMA debug500 (Casper A100): $(date) ==="
 echo "Host: $(hostname)"
@@ -45,15 +58,15 @@ $PYTHON -u scripts/run.py \
     --gsam-root           "$GSAM_ROOT" \
     --start-time          "2017-09-05T00:00:00" \
     --dt                  10.0 \
-    --cfl-max             0.7 \
+    --cfl-max             0.720447 \
     --ncycle-max          4 \
     \
     `# ── SST indexing ─────────────────────────────────────────────────` \
     --sst-file-start      "2017-09-04T00:00:00" \
     --sst-interval-hours  6 \
     \
-    `# ── Time integration ─────────────────────────────────────────────` \
-    --nsteps              3 \
+    `# ── Time integration (matches gSAM prm_debug500 nstop=500, nsave3D=500) ─` \
+    --nsteps              2 \
     --output-interval     1 \
     \
     `# ── Output ───────────────────────────────────────────────────────` \
